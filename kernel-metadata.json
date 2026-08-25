@@ -1,0 +1,16 @@
+{
+  "id": "yakuninvladimirui/arc-prize-2026-lcld-v10",
+  "title": "ARC-AGI-3 LCLD Agent V10.0 (Qwen 3.8B + Brusentsov Logic)",
+  "code_file": "arc-prize-2026-lcld-v10.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "dataset_sources": [
+    "driessmit1/arc3-vllm-h100-wheelhouse-v3"
+  ],
+  "model_sources": [],
+  "internet_enabled": false,
+  "docker_image": "ghcr.io/kaggle/kaggle-python:latest",
+  "accelerator": "GPU_T4x2"
+}
