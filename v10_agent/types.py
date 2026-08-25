@@ -289,3 +289,64 @@ class BranchSignature:
     """
     action_sequence: tuple
     outcome_hash: str
+
+
+@dataclass(frozen=True)
+class ObjectSpec:
+    """
+    Object specification for EnvironmentSpecification.
+    
+    Ref: Spec 3.2 - EnvironmentSpecification
+    
+    Attributes:
+        type_id: Unique identifier for object type
+        description: Human-readable description
+        attributes: Dictionary of attribute names to values
+    """
+    type_id: str
+    description: str
+    attributes: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RelationSpec:
+    """
+    Relation specification for EnvironmentSpecification.
+    
+    Ref: Spec 3.2 - EnvironmentSpecification
+    
+    Attributes:
+        type_id: Unique identifier for relation type
+        description: Human-readable description
+        arity: Number of objects involved in the relation
+    """
+    type_id: str
+    description: str
+    arity: int = 2
+
+
+@dataclass(frozen=True)
+class EnvironmentSpecification:
+    """
+    Complete environment specification output by Explorer.
+    
+    Ref: Spec 3.2 - EnvironmentSpecification (Explorer output)
+    Ref: Spec 8.2 - Coder Prompt Construction
+    
+    Contains factual information about objects, relations, and action surface.
+    NO goal information (ISO-1 invariant).
+    
+    Attributes:
+        grid_width: Width of the game grid
+        grid_height: Height of the game grid
+        object_specs: List of object type specifications
+        relation_specs: List of relation type specifications
+        action_surface_type: Type of action surface (e.g., \"grid\", \"graph\")
+        allowed_actions: List of allowed action IDs
+    """
+    grid_width: int
+    grid_height: int
+    object_specs: List[ObjectSpec] = field(default_factory=list)
+    relation_specs: List[RelationSpec] = field(default_factory=list)
+    action_surface_type: str = "grid"
+    allowed_actions: List[str] = field(default_factory=list)
