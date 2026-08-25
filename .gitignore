@@ -7,31 +7,29 @@ __pycache__/
 .Python
 *.so
 *.egg-info/
-.eggs/
+build/
+dist/
+*.dist-info/
 
 # Virtual environments
 venv/
 .venv/
-env/
-ENV/
-.ENV/
+.env
+.env.local
+.env.*
 
 # Testing
 .coverage
-coverage/
 htmlcov/
 .pytest_cache/
 .mypy_cache/
-.hypothesis/
 
-# Distribution / packaging
-dist/
-build/
-*.egg
-*.tar.gz
-*.whl
-pip-log.txt
-pip-delete-this-directory.txt
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
@@ -40,12 +38,6 @@ pip-delete-this-directory.txt
 *.swo
 *.tmp
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Environment variables
-.env
-.env.local
-*.env.*
+# Coverage
+coverage/
 ```
