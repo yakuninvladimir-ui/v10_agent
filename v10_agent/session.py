@@ -615,25 +615,317 @@ class GameSession:
             "args": first_step.get("args", {})
         }
     
-    def observe_action_result(self, after_observation: Dict[str, Any]) -> None:
+    def _extract_propositions_from_observation(
+        self,
+        observation: Dict[str, Any],
+        snapshot_hash: str,
+    ) -> List["AtomicProposition"]:
         """
-        Process the result of an executed action.
+        Extract AtomicPropositions from raw grid observation.
+        
+        This is a stub implementation that extracts basic propositions.
+        Full implementation would use SnapshotBuilder to extract all
+        registered proposition families per Spec 3.3.
+        
+        Args:
+            observation: Raw grid observation dict with 'grid' key
+            snapshot_hash: Hash of the snapshot for PropositionSet context
+            
+        Returns:
+            List of AtomicProposition instances representing observed state
+        
+        Ref: Spec 3.3 - Atomic proposition families (normative)
+        """
+        from .types import AtomicProposition
+        
+        propositions: List[AtomicProposition] = []
+        grid = observation.get("grid", [])
+        
+        if not grid:
+            return propositions
+        
+        # Extract grid dimensions as positional context
+        height = len(grid)
+        width = len(grid[0]) if height > 0 else 0
+        
+        # Stub proposition: grid dimensions (attribute_delta family)
+        propositions.append(
+            AtomicProposition(
+                family="attribute_delta",
+                data={
+                    "attribute": "grid_dimensions",
+                    "object_id": "grid_main",
+                    "delta_width": width,
+                    "delta_height": height,
+                },
+                objects=("grid_main",),
+                relations=(),
+            )
+        )
+        
+        # Count non-zero cells as a simple metric_sign proposition
+        non_zero_count = sum(1 for row in grid for cell in row if cell != 0)
+        propositions.append(
+            AtomicProposition(
+                family="metric_sign",
+                data={
+                    "metric": "non_zero_cells",
+                    "sign": 1 if non_zero_count > 0 else 0,
+                    "count": non_zero_count,
+                },
+                objects=("grid_main",),
+                relations=(),
+            )
+        )
+        
+        # Stub terminal flag (assume non-terminal unless grid is empty)
+        propositions.append(
+            AtomicProposition(
+                family="terminal_flag",
+                data={"is_terminal": False, "reason": "active_level"},
+                objects=("grid_main",),
+                relations=(),
+            )
+        )
+        
+        logger.debug(
+            f"Extracted {len(propositions)} atomic propositions from observation",
+            extra={"snapshot_hash": snapshot_hash, "grid_size": f"{width}x{height}"}
+        )
+        
+        return propositions
+    
+    def observe_action_result(
+        self,
+        after_observation: Dict[str, Any],
+        expected_propositions: Optional[List["AtomicProposition"]] = None,
+        action_sequence: Optional[tuple] = None,
+        sandbox_exception: Optional[Exception] = None,
+    ) -> None:
+        """
+        Process the result of an executed action with double-loop learning.
+        
+        This method implements the core of the double-loop learning architecture:
+        - Inner loop: Hypothesis testing via LayeredVerifier
+        - Outer loop: Memory contour updates for cross-level learning
         
         Flow:
-        1. Build PropositionSets (expected vs observed)
-        2. Call LayeredVerifier (implies_brusentsov)
-        3. Route result to appropriate memory:
-           - SandboxException -> SyntaxErrorMemory (triggers Coder retry)
-           - FALSE (NULL) -> EpistemicMemory (triggers Solver retry)
-           - IRRELEVANT (OMIT) -> EpistemicMemory (live branch)
-           - TRUE (FOLLOW) -> Continue current branch
-           
+        1. IF sandbox_exception occurred:
+           - Create SyntaxErrorRecord and add to SyntaxErrorMemory
+           - Trigger Coder retry path (handled by caller)
+        
+        2. IF no exception:
+           a. Build PropositionSet from observed state (after_observation)
+           b. Build PropositionSet from expected effects (expected_propositions)
+           c. Call LayeredVerifier.verify_transition()
+           d. Route judgment to EpistemicMemory:
+              - FOLLOW (TRUE): Continue current trajectory branch
+              - NULL (FALSE): Record severed branch signature
+              - OMIT (IRRELEVANT): Record live omit branch for potential pivot
+        
+        ISO Invariants Enforced:
+        - ISO-3: Memory contours remain strictly disjoint
+        - SyntaxErrorMemory receives only error summaries (no Python tracebacks visible to Solver)
+        - EpistemicMemory receives only Brusentsov judgments (no source code)
+        
         Args:
             after_observation: Grid state after action execution
+            expected_propositions: Expected AtomicPropositions from DSL function's EffectDeclaration
+            action_sequence: Sequence of action IDs for branch signature tracking
+            sandbox_exception: Exception raised during sandbox execution (if any)
+        
+        Returns:
+            None (side effects: updates memory contours)
+        
+        Ref: Spec 5 - LayeredVerifier Contract
+        Ref: Spec 3.5 - Memory Contours (EpistemicMemory, SyntaxErrorMemory)
+        Ref: Spec 3.1 - Brusentsov Ternary Logic
         """
-        # Stub implementation - full logic in production
-        logger.debug(f"Observing action result: {after_observation}")
-        pass
+        import time
+        
+        # =========================================================================
+        # Path A: Sandbox Exception -> SyntaxErrorMemory
+        # =========================================================================
+        if sandbox_exception is not None:
+            logger.info(
+                f"Sandbox exception detected, recording to SyntaxErrorMemory",
+                extra={
+                    "level_id": self.current_level_id,
+                    "step": self.step_count,
+                    "exception_type": type(sandbox_exception).__name__,
+                }
+            )
+            
+            if self.syntax_error_memory is None:
+                # Lazy initialization on first error
+                from .memory_contours import SyntaxErrorMemory
+                object.__setattr__(self, 'syntax_error_memory', SyntaxErrorMemory())
+            
+            # Create prompt/source hashes for error record
+            # (In full impl, these would come from Coder's last generation)
+            prompt_hash = hashlib.sha256(b"stub_prompt").hexdigest()
+            source_hash = hashlib.sha256(b"stub_source").hexdigest()
+            
+            # Capture traceback string (NEVER passed to Solver - ISO-2)
+            import traceback
+            traceback_str = traceback.format_exception(type(sandbox_exception), sandbox_exception, sandbox_exception.__traceback__)
+            traceback_text = "".join(traceback_str)
+            
+            # Add to SyntaxErrorMemory (max 5 entries, FIFO eviction)
+            self.syntax_error_memory.add_error(
+                level_id=self.current_level_id or "unknown",
+                prompt_hash=prompt_hash,
+                source_hash=source_hash,
+                traceback=traceback_text,
+                static_diagnostics=[f"SandboxException: {type(sandbox_exception).__name__}"],
+                timestamp=int(time.time()),
+            )
+            
+            logger.info(
+                f"SyntaxErrorMemory now contains {self.syntax_error_memory.error_count} errors",
+                extra={"level_id": self.current_level_id}
+            )
+            return  # Early return - no verification possible with exception
+        
+        # =========================================================================
+        # Path B: Normal Execution -> LayeredVerifier -> EpistemicMemory
+        # =========================================================================
+        
+        # Initialize memory contours if not already created
+        if self.env_spec_memory is None:
+            from .memory_contours import EnvironmentSpecMemory, EnvironmentSpecification
+            from .types import PropositionSet
+            initial_spec = EnvironmentSpecification(
+                spec_id=f"spec_{self.current_level_id or 'init'}",
+                initial_propositions=PropositionSet.create(snapshot_hash="init"),
+            )
+            object.__setattr__(self, 'env_spec_memory', EnvironmentSpecMemory(current_spec=initial_spec))
+        
+        if self.epistemic_memory is None:
+            from .memory_contours import EpistemicMemory
+            object.__setattr__(self, 'epistemic_memory', EpistemicMemory())
+        
+        # -------------------------------------------------------------------------
+        # Step 1: Build Observed PropositionSet from after_observation
+        # -------------------------------------------------------------------------
+        grid = after_observation.get("grid", [])
+        grid_str = str(grid)
+        observed_hash = hashlib.sha256(grid_str.encode()).hexdigest()
+        
+        # Extract atomic propositions from observed grid state
+        # (Full impl would use SnapshotBuilder to extract all proposition families)
+        observed_propositions = self._extract_propositions_from_observation(
+            after_observation, observed_hash
+        )
+        
+        from .types import PropositionSet
+        observed_set = PropositionSet.create(
+            snapshot_hash=observed_hash,
+            propositions=observed_propositions,
+            timestamp=self.step_count,
+        )
+        
+        # -------------------------------------------------------------------------
+        # Step 2: Build Expected PropositionSet from DSL function's EffectDeclaration
+        # -------------------------------------------------------------------------
+        if expected_propositions is None:
+            # No expected propositions provided - create empty set
+            # This represents an exploratory action with no specific prediction
+            expected_set = PropositionSet.create(
+                snapshot_hash=observed_hash,  # Same snapshot context
+                propositions=[],
+                timestamp=self.step_count,
+            )
+            logger.debug(
+                "No expected propositions provided; using empty expected set",
+                extra={"step": self.step_count}
+            )
+        else:
+            expected_set = PropositionSet.create(
+                snapshot_hash=observed_hash,
+                propositions=expected_propositions,
+                timestamp=self.step_count,
+            )
+        
+        # -------------------------------------------------------------------------
+        # Step 3: Call LayeredVerifier.verify_transition()
+        # -------------------------------------------------------------------------
+        from .judge import LayeredVerifier
+        verifier = LayeredVerifier()
+        
+        verification_result = verifier.verify_transition(
+            expected=expected_set,
+            observed=observed_set,
+            action_sequence=action_sequence,
+        )
+        
+        # Log verification result for audit
+        logger.info(
+            f"LayeredVerifier judgment: {verification_result.judgment.verdict_name}",
+            extra={
+                "judgment": verification_result.judgment.value,
+                "verdict": verification_result.judgment.verdict_name,
+                "reasoning_length": len(verification_result.reasoning),
+                "level_id": self.current_level_id,
+                "step": self.step_count,
+            }
+        )
+        logger.debug(
+            f"Verification reasoning: {verification_result.reasoning}",
+            extra={"level_id": self.current_level_id}
+        )
+        
+        # -------------------------------------------------------------------------
+        # Step 4: Route judgment to EpistemicMemory
+        # -------------------------------------------------------------------------
+        from .types import BrusentsovJudgment
+        
+        # Create BrusentsovJudgment record for EpistemicMemory
+        judgment_record = verifier.create_judgment_record(
+            verification_result,
+            timestamp=float(time.time()),
+        )
+        
+        # Add judgment to EpistemicMemory (automatically tracks live/severed branches)
+        self.epistemic_memory.add_judgment(judgment_record)
+        
+        # Log memory contour state
+        logger.info(
+            f"EpistemicMemory updated: {self.epistemic_memory.judgment_count} judgments, "
+            f"{self.epistemic_memory.live_omit_count} live OMIT branches, "
+            f"{self.epistemic_memory.severed_null_count} severed NULL branches",
+            extra={
+                "level_id": self.current_level_id,
+                "judgment_type": judgment_record.judgment_type,
+            }
+        )
+        
+        # -------------------------------------------------------------------------
+        # Step 5: Branch effect handling (for caller's decision making)
+        # -------------------------------------------------------------------------
+        # The caller should check EpistemicMemory to determine next action:
+        # - FOLLOW: Continue current trajectory
+        # - NULL: Sever branch, trigger Solver retry with new candidate
+        # - OMIT: Keep branch alive, may pivot later
+        
+        # Log actionable insight based on judgment
+        if verification_result.judgment.is_null():
+            logger.warning(
+                "NULL judgment: Physical contradiction detected. "
+                "Current trajectory branch must be severed.",
+                extra={"level_id": self.current_level_id, "step": self.step_count}
+            )
+        elif verification_result.judgment.is_omit():
+            logger.info(
+                "OMIT judgment: Expected effects absent but no contradiction. "
+                "Branch remains live for potential pivot.",
+                extra={"level_id": self.current_level_id, "step": self.step_count}
+            )
+        else:  # FOLLOW
+            logger.info(
+                "FOLLOW judgment: Trajectory validated. Continue current branch.",
+                extra={"level_id": self.current_level_id, "step": self.step_count}
+            )
     
     def reset_level(self, level_id: str) -> None:
         """Reset session state for a new level."""
