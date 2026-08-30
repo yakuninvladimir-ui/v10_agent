@@ -197,6 +197,9 @@ def _contradicts(expected: "AtomicProposition", observed: "AtomicProposition") -
     - attribute_delta: Same attribute with incompatible delta values
     - relation_existence: Same relation with existence vs absence
     - terminal_flag: Conflicting terminal state claims
+    - positional_delta: Same object with incompatible row/column/centroid sign deltas
+    - action_surface: Same action with incompatible availability claims
+    - affordance_flag: Same affordance type with conflicting controllability claims
     
     This is an internal helper function. The actual implementation must
     be extended for each registered atomic proposition family.
@@ -267,6 +270,51 @@ def _contradicts(expected: "AtomicProposition", observed: "AtomicProposition") -
         if e_terminal is not None and o_terminal is not None and e_terminal != o_terminal:
             return True
     
+    elif expected.family == "positional_delta":
+        # Contradiction if same object has incompatible positional deltas
+        e_obj_id = expected.data.get("object_id")
+        o_obj_id = observed.data.get("object_id")
+        if e_obj_id == o_obj_id:
+            # Check row delta sign contradiction
+            e_row_sign = expected.data.get("row_sign")
+            o_row_sign = observed.data.get("row_sign")
+            if e_row_sign is not None and o_row_sign is not None and e_row_sign != o_row_sign:
+                return True
+            # Check column delta sign contradiction
+            e_col_sign = expected.data.get("col_sign")
+            o_col_sign = observed.data.get("col_sign")
+            if e_col_sign is not None and o_col_sign is not None and e_col_sign != o_col_sign:
+                return True
+            # Check centroid delta sign contradiction
+            e_centroid_row = expected.data.get("centroid_row_sign")
+            o_centroid_row = observed.data.get("centroid_row_sign")
+            if e_centroid_row is not None and o_centroid_row is not None and e_centroid_row != o_centroid_row:
+                return True
+            e_centroid_col = expected.data.get("centroid_col_sign")
+            o_centroid_col = observed.data.get("centroid_col_sign")
+            if e_centroid_col is not None and o_centroid_col is not None and e_centroid_col != o_centroid_col:
+                return True
+    
+    elif expected.family == "action_surface":
+        # Contradiction if same action has incompatible availability claims
+        e_action = expected.data.get("action")
+        o_action = observed.data.get("action")
+        if e_action == o_action:
+            e_available = expected.data.get("available")
+            o_available = observed.data.get("available")
+            if e_available is not None and o_available is not None and e_available != o_available:
+                return True
+    
+    elif expected.family == "affordance_flag":
+        # Contradiction if same affordance has conflicting controllability claims
+        e_affordance = expected.data.get("affordance_type")
+        o_affordance = observed.data.get("affordance_type")
+        if e_affordance == o_affordance:
+            e_controllable = expected.data.get("controllable")
+            o_controllable = observed.data.get("controllable")
+            if e_controllable is not None and o_controllable is not None and e_controllable != o_controllable:
+                return True
+    
     # No contradiction detected
     return False
 
@@ -288,6 +336,9 @@ def _is_necessarily_contained(prop: "AtomicProposition", observed_set: frozenset
     - attribute_delta: Same attribute with matching delta
     - relation_existence: Same relation with matching existence claim
     - terminal_flag: Matching terminal state claim
+    - positional_delta: Same object with matching row/column/centroid signs
+    - action_surface: Same action with matching availability
+    - affordance_flag: Same affordance type with matching controllability
     
     Args:
         prop: The atomic proposition to check for containment
@@ -348,6 +399,52 @@ def _prop_matches(expected: "AtomicProposition", observed: "AtomicProposition") 
     
     elif expected.family == "terminal_flag":
         return expected.data.get("is_terminal") == observed.data.get("is_terminal")
+    
+    elif expected.family == "positional_delta":
+        # Match if same object and all specified positional signs match
+        if expected.data.get("object_id") != observed.data.get("object_id"):
+            return False
+        # Check row_sign if specified in expected
+        e_row_sign = expected.data.get("row_sign")
+        o_row_sign = observed.data.get("row_sign")
+        if e_row_sign is not None and e_row_sign != o_row_sign:
+            return False
+        # Check col_sign if specified in expected
+        e_col_sign = expected.data.get("col_sign")
+        o_col_sign = observed.data.get("col_sign")
+        if e_col_sign is not None and e_col_sign != o_col_sign:
+            return False
+        # Check centroid_row_sign if specified in expected
+        e_centroid_row = expected.data.get("centroid_row_sign")
+        o_centroid_row = observed.data.get("centroid_row_sign")
+        if e_centroid_row is not None and e_centroid_row != o_centroid_row:
+            return False
+        # Check centroid_col_sign if specified in expected
+        e_centroid_col = expected.data.get("centroid_col_sign")
+        o_centroid_col = observed.data.get("centroid_col_sign")
+        if e_centroid_col is not None and e_centroid_col != o_centroid_col:
+            return False
+        return True
+    
+    elif expected.family == "action_surface":
+        # Match if same action and availability matches
+        if expected.data.get("action") != observed.data.get("action"):
+            return False
+        e_available = expected.data.get("available")
+        o_available = observed.data.get("available")
+        if e_available is not None and e_available != o_available:
+            return False
+        return True
+    
+    elif expected.family == "affordance_flag":
+        # Match if same affordance type and controllability matches
+        if expected.data.get("affordance_type") != observed.data.get("affordance_type"):
+            return False
+        e_controllable = expected.data.get("controllable")
+        o_controllable = observed.data.get("controllable")
+        if e_controllable is not None and e_controllable != o_controllable:
+            return False
+        return True
     
     # Default: exact match required
     return expected.data == observed.data
