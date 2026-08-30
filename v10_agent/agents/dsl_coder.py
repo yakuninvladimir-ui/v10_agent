@@ -140,20 +140,50 @@ class DSLCoder:
         """
         Stub LLM generation for offline testing.
         In production, this calls vLLM with Qwen 3.8B model.
+        
+        Generates function_manifest based on api_manifest from prompt context.
         """
-        # Return valid JSON with full function manifest for testing
-        return json.dumps({
-            "source_code": "def stub_function(x, y): return {'effect': 'probe', 'x': x, 'y': y}",
-            "function_names": ["stub_function"],
-            "function_manifest": {
-                "stub_function": {
-                    "signature": "stub_function(x, y)",
-                    "docstring": "Stub probe function for testing",
+        # Extract function names from prompt (they appear in "Function: <name>" lines)
+        import re
+        func_matches = re.findall(r"Function: (\w+)", prompt)
+        
+        if func_matches:
+            # Build manifest from functions mentioned in prompt
+            function_manifest = {}
+            for func_name in func_matches:
+                function_manifest[func_name] = {
+                    "signature": f"{func_name}(x, y)",
+                    "docstring": f"DSL function {func_name} for grid operations",
                     "parameters": {"x": "int", "y": "int"},
                     "return_type": "EffectDeclaration"
                 }
-            }
-        })
+            
+            # Generate source code stubs for all functions
+            source_lines = []
+            for func_name in func_matches:
+                source_lines.append(f"def {func_name}(x, y):")
+                source_lines.append(f"    return {{'effect': '{func_name}', 'x': x, 'y': y}}")
+                source_lines.append("")
+            
+            return json.dumps({
+                "source_code": "\n".join(source_lines),
+                "function_names": func_matches,
+                "function_manifest": function_manifest
+            })
+        else:
+            # Fallback to default stub
+            return json.dumps({
+                "source_code": "def stub_function(x, y): return {'effect': 'probe', 'x': x, 'y': y}",
+                "function_names": ["stub_function"],
+                "function_manifest": {
+                    "stub_function": {
+                        "signature": "stub_function(x, y)",
+                        "docstring": "Stub probe function for testing",
+                        "parameters": {"x": "int", "y": "int"},
+                        "return_type": "EffectDeclaration"
+                    }
+                }
+            })
     
     def _parse_response(self, raw_response: str) -> Dict[str, Any]:
         """
