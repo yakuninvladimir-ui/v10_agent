@@ -17,8 +17,8 @@ import json
 import time
 import logging
 from enum import Enum, auto
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List, Literal
+from dataclasses import dataclass, field, fields
+from typing import Optional, Dict, Any, List, Literal, Final
 
 import requests
 from requests.exceptions import RequestException, Timeout, ConnectionError
@@ -95,29 +95,49 @@ ROLE_CONFIGS: Dict[AgentRole, RoleConfig] = {
 # Response Types
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class ParsedResponse:
     """
     Parsed response from vLLM with isolated thinking traces.
     
-    CRITICAL: The payload field contains ONLY clean JSON with NO thinking traces.
+    CRITICAL SECURITY INVARIANT:
     The reasoning_trace field is for logging/audit ONLY and must NEVER be passed
-    to agents or included in memory contours.
+    to agents or included in memory contours. Violation breaks ISO-1...ISO-5.
+    
+    Type safety: This class is frozen (immutable). The _reasoning_trace field is
+    private by convention - access via .reasoning_trace property which exists ONLY
+    for GameSession._log_reasoning_trace(). DO NOT pass this value to agents.
     
     Ref: ISO-1...ISO-5 Isolation Invariants
     
     Attributes:
         status: Response status ("OK", "PARSE_ERROR", "TIMEOUT")
         payload: Clean JSON dict (NO thinking traces) - safe for agents
-        reasoning_trace: Raw thinking content (LOGGING ONLY) - NEVER expose to agents
+        _reasoning_trace: Raw thinking content (LOGGING ONLY) - NEVER expose to agents
         usage: Token usage statistics
         error_message: Error description if status != "OK"
     """
     status: Literal["OK", "PARSE_ERROR", "TIMEOUT", "CONNECTION_ERROR"]
     payload: Optional[Dict[str, Any]]
-    reasoning_trace: Optional[str]
+    _reasoning_trace: Optional[str]  # Private field - use .reasoning_trace property for logging only
     usage: Dict[str, int]
     error_message: Optional[str] = None
+    
+    @property
+    def reasoning_trace(self) -> Optional[str]:
+        """
+        Accessor for reasoning trace - FOR LOGGING PURPOSES ONLY.
+        
+        WARNING: This property exists solely for GameSession._log_reasoning_trace().
+        DO NOT pass this value to any agent (Explorer, Coder, Solver).
+        Doing so violates ISO-1...ISO-5 invariants:
+          - ISO-1: Explorer has no goal information
+          - ISO-2: Coder cannot see traceback from Solver
+          - ISO-3: Solver never sees Python source code
+        
+        Static type checkers (mypy) can flag misuse if configured.
+        """
+        return self._reasoning_trace
     
     @classmethod
     def ok(cls, payload: Dict[str, Any], reasoning_trace: Optional[str], 
@@ -126,7 +146,7 @@ class ParsedResponse:
         return cls(
             status="OK",
             payload=payload,
-            reasoning_trace=reasoning_trace,
+            _reasoning_trace=reasoning_trace,
             usage=usage,
             error_message=None
         )
@@ -137,7 +157,7 @@ class ParsedResponse:
         return cls(
             status="PARSE_ERROR",
             payload=None,
-            reasoning_trace=None,
+            _reasoning_trace=None,
             usage={"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0},
             error_message=f"JSON parse failed: {error}",
         )
@@ -148,7 +168,7 @@ class ParsedResponse:
         return cls(
             status="TIMEOUT",
             payload=None,
-            reasoning_trace=None,
+            _reasoning_trace=None,
             usage={"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0},
             error_message=f"Request timeout: {error}",
         )
@@ -159,7 +179,7 @@ class ParsedResponse:
         return cls(
             status="CONNECTION_ERROR",
             payload=None,
-            reasoning_trace=None,
+            _reasoning_trace=None,
             usage={"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0},
             error_message=f"Connection failed: {error}",
         )
@@ -447,7 +467,7 @@ class VLLMClient:
         
         return ParsedResponse.ok(
             payload=payload,
-            reasoning_trace=reasoning_trace,
+            _reasoning_trace=reasoning_trace,
             usage=usage
         )
 
