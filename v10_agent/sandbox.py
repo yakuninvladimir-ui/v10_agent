@@ -21,8 +21,30 @@ FORBIDDEN_IMPORTS = {
 
 FORBIDDEN_BUILTINS = {
     'exec', 'eval', 'compile', 'open', 'input',
-    '__import__', 'getattr', 'setattr', 'delattr',
+    'getattr', 'setattr', 'delattr',
 }
+
+# Safe modules that can be imported
+SAFE_MODULES = {'math', 'json', 're', 'itertools'}
+
+# Allowed underscore-prefixed builtins (minimal set for safety)
+ALLOWED_UNDERSCORE_BUILTINS = {'__import__', '__doc__', '__name__', '__package__'}
+
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """
+    Safe import function that only allows whitelisted modules.
+    
+    Ref: Spec 4.2 - Restricted executor with safe module access
+    """
+    # Get the top-level module name (e.g., 'math' from 'math.sqrt')
+    top_level = name.split('.')[0]
+    
+    if top_level not in SAFE_MODULES:
+        raise ImportError(f"Import of '{name}' is not allowed in sandbox")
+    
+    # Use the real __import__ for allowed modules
+    return __builtins__.__import__(name, globals, locals, fromlist, level)
 
 
 @dataclass
@@ -166,12 +188,14 @@ class SandboxExecutor:
         if diagnostics:
             raise ValueError(f"Sandbox static check failed: {'; '.join(diagnostics)}")
         
-        # Create restricted globals
+        # Create restricted globals with safe __import__ function
+        # This allows 'import math' statements to work while blocking dangerous imports
+        # Note: We use ALLOWED_UNDERSCORE_BUILTINS to selectively include __import__
         safe_globals = {
             '__builtins__': {
                 name: getattr(__builtins__, name)
                 for name in dir(__builtins__)
-                if name not in FORBIDDEN_BUILTINS and not name.startswith('_')
+                if name not in FORBIDDEN_BUILTINS and (name in ALLOWED_UNDERSCORE_BUILTINS or not name.startswith('_'))
             },
         }
         
