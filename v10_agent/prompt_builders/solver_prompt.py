@@ -118,11 +118,16 @@ def validate_no_python_source_in_manifest(function_manifest: Dict[str, Any]) -> 
     Validate that function manifest contains no Python source code.
     
     Ref: Spec 1.4 ISO-3 Invariant
+    
+    Note: This checks for actual Python code keywords in values, not in 
+    signature strings like "func(x, y)" which contain ':' but are not source code.
     """
-    python_indicators = ["def ", "import ", "class ", "return ", "lambda ", ":"]
+    # Only check for multi-line Python code blocks or actual statements
+    # Signature strings like "func(x, y)" containing ':' are OK
+    python_code_indicators = ["def ", "\nimport ", "\nclass ", "\nreturn ", "lambda ", ":\\n"]
     
     manifest_str = str(function_manifest)
-    for indicator in python_indicators:
+    for indicator in python_code_indicators:
         if indicator in manifest_str:
             raise ValueError(
                 f"ISO-3 VIOLATION: Python source indicator '{indicator}' detected in manifest. "

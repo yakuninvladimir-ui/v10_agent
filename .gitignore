@@ -1,1 +1,52 @@
-Nothing needs to be added to the .gitignore file based on the provided changes. The added and modified files are all source code files (.py) which should not be ignored.
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build and distribution artifacts
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Dependencies cache
+.pip/
+.wheel/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# Coverage reports
+.coverage
+htmlcov/
+.coverage.*
+
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.local
+*.env.*
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+```

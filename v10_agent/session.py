@@ -18,6 +18,7 @@ It goes ONLY to logging for audit purposes. This prevents:
 """
 
 import logging
+import hashlib
 from typing import Any, Optional, Dict, List
 from dataclasses import dataclass, field
 
@@ -270,28 +271,78 @@ class GameSession:
         Returns:
             Explorer payload (probes, env_spec) or None on error
         """
-        # Build Explorer prompt (ISO-1 compliant - no goal info)
-        from .prompt_builders.explorer_prompt import build_explorer_prompt
+        try:
+            # Build PlanningSet snapshot from raw observation
+            planning_set = self._build_planning_set_from_observation(observation)
+            
+            # Create annotated frame placeholder (full impl would render PNG)
+            annotated_frame = self._create_annotated_frame(observation)
+            
+            # Call Explorer agent with proper interface
+            explorer_response = self.explorer.act(
+                planning_set=planning_set,
+                annotated_frame=annotated_frame,
+                action_history=self.action_history[-10:],  # Last 10 actions
+                probe_history=None,  # Full impl would pass probe history
+            )
+            
+            return explorer_response
+            
+        except Exception as e:
+            logger.exception(f"Explorer agent failed: {e}")
+            return None
+    
+    def _build_planning_set_from_observation(self, observation: Dict) -> "PlanningSet":
+        """
+        Build PlanningSet snapshot from raw observation.
         
-        # For now, use stub prompt builder
-        messages = [{"role": "user", "content": f"Analyze: {observation}"}]
-        json_schema = {
-            "type": "object",
-            "properties": {
-                "probes": {"type": "array"},
-                "reasoning": {"type": "string"}
-            },
-            "required": ["probes", "reasoning"]
-        }
+        Args:
+            observation: Raw grid observation dict
+            
+        Returns:
+            PlanningSet instance for Explorer agent
+        """
+        from .planning_set import PlanningSet
         
-        # CRITICAL: _call_llm_with_isolation returns ONLY payload
-        payload = self._call_llm_with_isolation(
-            role=AgentRole.EXPLORER,
-            messages=messages,
-            json_schema=json_schema
+        # Extract grid and compute hash
+        grid = observation.get("grid", [])
+        grid_str = str(grid)
+        grid_hash = hashlib.sha256(grid_str.encode()).hexdigest()
+        
+        # Generate snapshot ID
+        snapshot_id = f"snapshot_{self.current_level_id}_{self.step_count}" if self.current_level_id else f"snapshot_{self.step_count}"
+        
+        # Stub object/relation/action IDs as frozensets (required by PlanningSet)
+        object_ids = frozenset(["obj_0", "obj_1"])  # Default stub objects
+        relation_ids = frozenset(["rel_0"])  # Default stub relations
+        allowed_action_ids = frozenset(["ACTION1", "ACTION6"])  # Default actions
+        
+        # Identity mapping for object aliases (I6 bijection requirement)
+        from frozendict import frozendict
+        object_real_to_alias = frozendict({oid: oid for oid in object_ids})
+        
+        return PlanningSet(
+            snapshot_id=snapshot_id,
+            grid_hash=grid_hash,
+            object_ids=object_ids,
+            relation_ids=relation_ids,
+            allowed_action_ids=allowed_action_ids,
+            object_real_to_alias=object_real_to_alias,
         )
+    
+    def _create_annotated_frame(self, observation: Dict) -> str:
+        """
+        Create annotated frame representation for Explorer.
         
-        return payload
+        Args:
+            observation: Raw grid observation dict
+            
+        Returns:
+            Annotated frame string (base64 PNG or text representation)
+        """
+        # Stub implementation - returns text representation
+        # Full impl would render PNG with object/relation overlays
+        return f"Grid observation at step {self.step_count}: {str(observation)[:200]}..."
     
     def _run_coder(self, explorer_payload: Dict) -> Optional[Dict]:
         """
@@ -301,41 +352,98 @@ class GameSession:
         Ref: ISO-4 - Coder sees syntax errors but NOT Solver's Python traceback
         
         Args:
-            explorer_payload: Clean Explorer output (env_spec)
+            explorer_payload: Clean Explorer output (probes, reasoning)
             
         Returns:
             Coder payload (source_code, function_names) or None on error
         """
-        # Build Coder prompt (ISO-2 compliant - no goal info, no full traceback)
-        from .prompt_builders.coder_prompt import build_coder_prompt
+        try:
+            # Build EnvironmentSpecification from explorer payload
+            env_spec = self._build_environment_spec(explorer_payload)
+            
+            # Build API manifest (proper dict structure, not list)
+            # Extract function names from probes or use default DSL functions
+            probe_list = explorer_payload.get("probes", [])
+            api_manifest = {
+                "functions": {
+                    f"probe_{i}": {
+                        "signature": f"probe_{i}(x, y)",
+                        "docstring": f"Probe action at coordinates",
+                        "parameters": {"x": "int", "y": "int"},
+                        "return_type": "EffectDeclaration"
+                    }
+                    for i in range(len(probe_list))
+                } if probe_list else {
+                    "default_probe": {
+                        "signature": "default_probe(x, y)",
+                        "docstring": "Default probe action",
+                        "parameters": {"x": "int", "y": "int"},
+                        "return_type": "EffectDeclaration"
+                    }
+                }
+            }
+            
+            # Get error summaries from SyntaxErrorMemory (NOT full tracebacks)
+            error_summaries = []
+            if self.syntax_error_memory:
+                error_summaries = self.syntax_error_memory.get_recent_summaries(limit=5)
+            
+            # Convert to SyntaxErrorRecord format for Coder
+            from .types import SyntaxErrorRecord
+            recent_errors: Optional[List[SyntaxErrorRecord]] = None
+            if error_summaries:
+                recent_errors = [
+                    SyntaxErrorRecord(
+                        level_id=self.current_level_id or "unknown",
+                        prompt_hash=f"hash_{i}",
+                        source_hash=f"src_{i}",
+                        summary=err.get("summary", str(err)),
+                        timestamp=i
+                    )
+                    for i, err in enumerate(error_summaries)
+                ]
+            
+            # Call Coder agent with proper interface
+            coder_response = self.coder.act(
+                environment_spec=env_spec,
+                api_manifest=api_manifest,
+                recent_errors=recent_errors,
+            )
+            
+            return coder_response
+            
+        except Exception as e:
+            logger.exception(f"Coder agent failed: {e}")
+            return None
+    
+    def _build_environment_spec(self, explorer_payload: Dict) -> "EnvironmentSpecification":
+        """
+        Build EnvironmentSpecification from Explorer payload.
         
-        # Get error summaries from SyntaxErrorMemory (NOT full tracebacks)
-        error_summaries = []
-        if self.syntax_error_memory:
-            error_summaries = self.syntax_error_memory.get_recent_summaries(limit=5)
+        Args:
+            explorer_payload: Raw Explorer output dict
+            
+        Returns:
+            EnvironmentSpecification instance for Coder agent
+        """
+        from .types import EnvironmentSpecification, ObjectSpec, RelationSpec
         
-        messages = [{
-            "role": "user", 
-            "content": f"Implement DSL functions. Env spec: {explorer_payload}. Errors: {error_summaries}"
-        }]
+        # Extract from explorer payload (stub implementation)
+        grid_width = explorer_payload.get("grid_width", 10)
+        grid_height = explorer_payload.get("grid_height", 10)
         
-        json_schema = {
-            "type": "object",
-            "properties": {
-                "source_code": {"type": "string"},
-                "function_names": {"type": "array", "items": {"type": "string"}}
-            },
-            "required": ["source_code", "function_names"]
-        }
+        # Stub object/relation specs (full impl extracts from probes)
+        object_specs: List[ObjectSpec] = []
+        relation_specs: List[RelationSpec] = []
         
-        # CRITICAL: Returns ONLY payload, no reasoning_trace
-        payload = self._call_llm_with_isolation(
-            role=AgentRole.CODER,
-            messages=messages,
-            json_schema=json_schema
+        return EnvironmentSpecification(
+            grid_width=grid_width,
+            grid_height=grid_height,
+            object_specs=object_specs,
+            relation_specs=relation_specs,
+            action_surface_type="grid",
+            allowed_actions=["ACTION1", "ACTION6"],
         )
-        
-        return payload
     
     def _run_coder_with_retry(self, explorer_payload: Dict) -> Optional[Dict]:
         """
@@ -378,54 +486,56 @@ class GameSession:
         Ref: ISO-4 - Solver sees function manifest, NOT implementation
         
         Args:
-            coder_payload: Clean Coder output (function_manifest)
+            coder_payload: Clean Coder output (source_code, function_names, function_manifest)
             
         Returns:
             Solver payload (candidates) or None on error
         """
-        # Build Solver prompt (ISO-3 compliant - manifest only, no source)
-        from .prompt_builders.solver_prompt import build_solver_prompt
-        
-        # Extract function manifest (names only, NOT source code)
-        function_manifest = {
-            "functions": coder_payload.get("function_names", [])
-        }
-        
-        # Get epistemic summary (Brusentsov judgments from previous steps)
-        epistemic_summary = None
-        if self.epistemic_memory:
-            epistemic_summary = self.epistemic_memory.get_summary()
-        
-        messages = [{
-            "role": "user",
-            "content": f"Generate trajectory. Manifest: {function_manifest}. History: {epistemic_summary}"
-        }]
-        
-        json_schema = {
-            "type": "object",
-            "properties": {
-                "candidates": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "steps": {"type": "array"},
-                            "confidence": {"type": "number"}
+        try:
+            # Build function manifest from coder payload
+            # ISO-3: Extract only manifest with signatures/docstrings, never pass source_code to Solver
+            # Priority: Use function_manifest from CoderResponse if available, otherwise build from function_names
+            if "function_manifest" in coder_payload and coder_payload["function_manifest"]:
+                function_manifest = {"functions": coder_payload["function_manifest"]}
+            else:
+                # Fallback: build minimal manifest from function_names list
+                function_manifest = {
+                    "functions": {
+                        name: {
+                            "signature": f"{name}()",
+                            "docstring": f"DSL function {name}",
+                            "parameters": {},
+                            "return_type": "EffectDeclaration"
                         }
+                        for name in coder_payload.get("function_names", [])
                     }
                 }
-            },
-            "required": ["candidates"]
-        }
-        
-        # CRITICAL: Returns ONLY payload, no reasoning_trace
-        payload = self._call_llm_with_isolation(
-            role=AgentRole.SOLVER,
-            messages=messages,
-            json_schema=json_schema
-        )
-        
-        return payload
+            
+            # Get epistemic summary (Brusentsov judgments from previous steps)
+            epistemic_summary = None
+            if self.epistemic_memory:
+                epistemic_summary = self.epistemic_memory.get_summary()
+            
+            # Get live/omit branches from EpistemicMemory
+            live_omit_branches = None
+            severed_null_signatures = None
+            if self.epistemic_memory:
+                live_omit_branches = self.epistemic_memory.get_live_omit_branches(limit=5)
+                severed_null_signatures = self.epistemic_memory.get_severed_null_signatures(limit=5)
+            
+            # Call Solver agent with proper interface
+            solver_response = self.solver.act(
+                function_manifest=function_manifest,
+                epistemic_summary=epistemic_summary,
+                live_omit_branches=live_omit_branches,
+                severed_null_signatures=severed_null_signatures,
+            )
+            
+            return solver_response
+            
+        except Exception as e:
+            logger.exception(f"Solver agent failed: {e}")
+            return None
     
     def _run_solver_with_retry(self, coder_payload: Dict) -> Optional[Dict]:
         """
