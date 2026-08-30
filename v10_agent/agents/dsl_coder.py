@@ -18,6 +18,10 @@ class CoderResponse(BaseModel):
     """
     source_code: str = Field(..., description="Python source code implementing DSL functions")
     function_names: List[str] = Field(..., description="List of implemented function names")
+    function_manifest: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Full function manifest with signatures, docstrings, parameters, and return types"
+    )
     
     class Config:
         extra = "forbid"  # Strict JSON schema validation
@@ -75,20 +79,59 @@ class DSLCoder:
             ]
             self.syntax_error_count = len(recent_errors)
         
-        # Build ISO-2 compliant prompt
-        prompt = build_coder_prompt(
+        # Build ISO-2 compliant prompt using prompt builder
+        from ..prompt_builders.coder_prompt import build_coder_prompt
+        
+        prompt_text = build_coder_prompt(
             environment_spec=environment_spec,
             api_manifest=api_manifest,
             syntax_error_count=self.syntax_error_count,
             recent_errors=error_summaries,
         )
         
-        # Call vLLM (stub interface)
+        # Build JSON schema for Coder response (includes function_manifest)
+        json_schema = {
+            "type": "object",
+            "properties": {
+                "source_code": {"type": "string"},
+                "function_names": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "function_manifest": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "signature": {"type": "string"},
+                            "docstring": {"type": "string"},
+                            "parameters": {"type": "object"},
+                            "return_type": {"type": "string"}
+                        },
+                        "required": ["signature", "docstring", "parameters", "return_type"]
+                    }
+                }
+            },
+            "required": ["source_code", "function_names", "function_manifest"],
+            "additionalProperties": False
+        }
+        
+        # Call vLLM with proper interface
         if self.llm_client:
-            raw_response = self.llm_client.generate(prompt)
+            from ..llm_client import AgentRole
+            messages = [{"role": "user", "content": prompt_text}]
+            response = self.llm_client.generate(
+                role=AgentRole.CODER,
+                messages=messages,
+                json_schema=json_schema
+            )
+            if response.status == "OK" and response.payload:
+                raw_response = json.dumps(response.payload)
+            else:
+                raise ValueError(f"Coder LLM call failed: {response.status} - {response.error_message}")
         else:
             # Stub for offline testing
-            raw_response = self._stub_generate(prompt)
+            raw_response = self._stub_generate(prompt_text)
         
         # Parse and validate JSON response
         return self._parse_response(raw_response)
@@ -98,10 +141,18 @@ class DSLCoder:
         Stub LLM generation for offline testing.
         In production, this calls vLLM with Qwen 3.8B model.
         """
-        # Return minimal valid JSON for testing
+        # Return valid JSON with full function manifest for testing
         return json.dumps({
-            "source_code": "def stub_function(): pass",
-            "function_names": ["stub_function"]
+            "source_code": "def stub_function(x, y): return {'effect': 'probe', 'x': x, 'y': y}",
+            "function_names": ["stub_function"],
+            "function_manifest": {
+                "stub_function": {
+                    "signature": "stub_function(x, y)",
+                    "docstring": "Stub probe function for testing",
+                    "parameters": {"x": "int", "y": "int"},
+                    "return_type": "EffectDeclaration"
+                }
+            }
         })
     
     def _parse_response(self, raw_response: str) -> Dict[str, Any]:

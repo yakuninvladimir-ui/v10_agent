@@ -77,20 +77,62 @@ class SolverAgent:
         # ISO-3 Check: Validate no Python source in manifest
         validate_no_python_source_in_manifest(function_manifest)
         
-        # Build ISO-3 compliant prompt
-        prompt = build_solver_prompt(
+        # Build ISO-3 compliant prompt using prompt builder
+        from ..prompt_builders.solver_prompt import build_solver_prompt
+        
+        prompt_text = build_solver_prompt(
             function_manifest=function_manifest,
             epistemic_summary=epistemic_summary,
             live_omit_branches=live_omit_branches,
             severed_null_signatures=severed_null_signatures,
         )
         
-        # Call vLLM (stub interface)
+        # Build JSON schema for Solver response
+        json_schema = {
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "steps": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "function": {"type": "string"},
+                                        "args": {"type": "object"}
+                                    },
+                                    "required": ["function", "args"]
+                                }
+                            },
+                            "confidence": {"type": "number"}
+                        },
+                        "required": ["steps", "confidence"]
+                    }
+                }
+            },
+            "required": ["candidates"],
+            "additionalProperties": False
+        }
+        
+        # Call vLLM with proper interface
         if self.llm_client:
-            raw_response = self.llm_client.generate(prompt)
+            from ..llm_client import AgentRole
+            messages = [{"role": "user", "content": prompt_text}]
+            response = self.llm_client.generate(
+                role=AgentRole.SOLVER,
+                messages=messages,
+                json_schema=json_schema
+            )
+            if response.status == "OK" and response.payload:
+                raw_response = json.dumps(response.payload)
+            else:
+                raise ValueError(f"Solver LLM call failed: {response.status} - {response.error_message}")
         else:
             # Stub for offline testing
-            raw_response = self._stub_generate(prompt)
+            raw_response = self._stub_generate(prompt_text)
         
         # Parse and validate JSON response
         return self._parse_response(raw_response)

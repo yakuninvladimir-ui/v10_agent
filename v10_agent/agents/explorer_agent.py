@@ -63,20 +63,54 @@ class ExplorerAgent:
             ValueError: If JSON parsing fails or schema validation fails
             ISO1ViolationError: If goal leakage is detected
         """
-        # Build ISO-1 compliant prompt
-        prompt = build_explorer_prompt(
+        # Build ISO-1 compliant prompt using prompt builder
+        from ..prompt_builders.explorer_prompt import build_explorer_prompt
+        
+        prompt_text = build_explorer_prompt(
             planning_set=planning_set,
             annotated_frame=annotated_frame,
             action_history=action_history,
             probe_history=probe_history,
         )
         
-        # Call vLLM (stub interface)
+        # Build JSON schema for Explorer response
+        json_schema = {
+            "type": "object",
+            "properties": {
+                "probes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"},
+                            "confidence": {"type": "number"}
+                        },
+                        "required": ["x", "y", "confidence"]
+                    }
+                },
+                "reasoning": {"type": "string"}
+            },
+            "required": ["probes", "reasoning"],
+            "additionalProperties": False
+        }
+        
+        # Call vLLM with proper interface
         if self.llm_client:
-            raw_response = self.llm_client.generate(prompt)
+            from ..llm_client import AgentRole
+            messages = [{"role": "user", "content": prompt_text}]
+            response = self.llm_client.generate(
+                role=AgentRole.EXPLORER,
+                messages=messages,
+                json_schema=json_schema
+            )
+            if response.status == "OK" and response.payload:
+                raw_response = json.dumps(response.payload)
+            else:
+                raise ValueError(f"Explorer LLM call failed: {response.status} - {response.error_message}")
         else:
             # Stub for offline testing
-            raw_response = self._stub_generate(prompt)
+            raw_response = self._stub_generate(prompt_text)
         
         # Parse and validate JSON response
         return self._parse_response(raw_response)

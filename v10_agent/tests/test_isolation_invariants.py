@@ -244,7 +244,12 @@ class TestISOMemoryContourDisjoint:
             source_hash="hash2",
             traceback="test error",
         )
-        syntax_memory.add_error(error)
+        syntax_memory.add_error(
+            prompt_hash="hash1",
+            source_hash="hash2",
+            traceback="test error",
+            level_id="level1",
+        )
         
         judgment = BrusentsovJudgment(
             judgment_type="FOLLOW",

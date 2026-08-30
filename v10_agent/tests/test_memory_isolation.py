@@ -298,14 +298,8 @@ class TestEnvironmentSpecMemory:
         memory = EnvironmentSpecMemory()
         
         probe = ProbeRecord(
+            probe_id="test_probe",
             action_id="test_action",
-            pre_state=PropositionSet(propositions=frozenset()),
-            post_state=PropositionSet(propositions=frozenset()),
-            effect=EffectDeclaration(
-                function_name="test_func",
-                arguments={},
-                result_type="test_result",
-            ),
             confidence=0.9,
         )
         
@@ -316,8 +310,10 @@ class TestEnvironmentSpecMemory:
         """Test that probe history respects the FIFO limit."""
         # Create a spec first
         spec = EnvironmentSpecification(
-            spec_id="test_spec",
-            initial_propositions=PropositionSet(propositions=frozenset()),
+            grid_width=10,
+            grid_height=10,
+            object_specs=[],
+            relation_specs=[],
         )
         
         memory = EnvironmentSpecMemory()
@@ -326,14 +322,8 @@ class TestEnvironmentSpecMemory:
         # Add more than 1000 probes (the limit)
         for i in range(1005):
             probe = ProbeRecord(
+                probe_id=f"probe_{i}",
                 action_id=f"action_{i}",
-                pre_state=PropositionSet(propositions=frozenset()),
-                post_state=PropositionSet(propositions=frozenset()),
-                effect=EffectDeclaration(
-                    function_name="test_func",
-                    arguments={},
-                    result_type="test_result",
-                ),
                 confidence=0.9,
             )
             memory.add_probe(probe)
