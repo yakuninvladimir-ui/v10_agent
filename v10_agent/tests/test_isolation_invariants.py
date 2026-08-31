@@ -225,7 +225,7 @@ class TestISOMemoryContourDisjoint:
         )
         
         env_memory = EnvironmentSpecMemory()
-        env_memory.set_specification(env_spec)
+        env_memory = env_memory.set_specification(env_spec)
         
         syntax_memory = SyntaxErrorMemory()
         epistemic_memory = EpistemicMemory()
@@ -236,7 +236,7 @@ class TestISOMemoryContourDisjoint:
             action_id="ACTION1",
             confidence=0.9,
         )
-        env_memory.add_probe(probe)
+        env_memory = env_memory.add_probe(probe)
         
         error = SyntaxErrorRecord(
             level_id="level1",
@@ -244,7 +244,7 @@ class TestISOMemoryContourDisjoint:
             source_hash="hash2",
             traceback="test error",
         )
-        syntax_memory.add_error(
+        syntax_memory = syntax_memory.add_error(
             prompt_hash="hash1",
             source_hash="hash2",
             traceback="test error",
@@ -259,7 +259,7 @@ class TestISOMemoryContourDisjoint:
             ),
             reasoning="Test reasoning",
         )
-        epistemic_memory.add_judgment(judgment)
+        epistemic_memory = epistemic_memory.add_judgment(judgment)
         
         # Verify isolation
         assert len(list(env_memory.get_probe_history())) == 1
@@ -311,6 +311,26 @@ class TestISO4SandboxIsolation:
         diagnostics = executor.static_check(malicious_code, {})
         
         assert any("forbidden builtin" in d.lower() or "eval" in d for d in diagnostics)
+
+    def test_sandbox_ast_validation_blocks_dunder_and_forbidden_nodes(self):
+        """Verify AST visitor blocks dunder attributes, imports, globals, nonlocals."""
+        from v10_agent.sandbox import SandboxExecutor
+        executor = SandboxExecutor()
+
+        with pytest.raises(ValueError, match="Import statements are forbidden"):
+            executor.validate_ast("import math")
+
+        with pytest.raises(ValueError, match="ImportFrom statements are forbidden"):
+            executor.validate_ast("from math import sqrt")
+
+        with pytest.raises(ValueError, match="Global declarations are forbidden"):
+            executor.validate_ast("def foo(): global x")
+
+        with pytest.raises(ValueError, match="Nonlocal declarations are forbidden"):
+            executor.validate_ast("def foo():\n  x=1\n  def bar(): nonlocal x")
+
+        with pytest.raises(ValueError, match="Accessing dunder attribute '__class__' is forbidden"):
+            executor.validate_ast("x = ().__class__.__bases__")
 
 
 class TestISO5PlanningSetBinding:
