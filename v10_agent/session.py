@@ -97,6 +97,9 @@ class GameSession:
         self.syntax_error_memory: Optional[SyntaxErrorMemory] = None
         self.epistemic_memory: Optional[EpistemicMemory] = None
         
+        from .action_boundary import ActionBoundary
+        self.action_boundary = ActionBoundary()
+
         # State tracking
         self.current_level_id: Optional[str] = None
         self.step_count: int = 0
@@ -250,9 +253,12 @@ class GameSession:
                     return self._symbolic_fallback(raw_observation)
             
             # Step 4: Select best candidate and extract first action
-            # (Full implementation would use PolicyEngine here)
             selected_action = self._select_action_from_candidates(solver_payload)
             
+            # 7. emit pending action through ActionBoundary (one step only)
+            if selected_action:
+                self.action_boundary.execute_action(selected_action["action"], selected_action.get("args", {}))
+
             return selected_action
             
         except Exception as e:
@@ -583,32 +589,24 @@ class GameSession:
             Minimal probe action
         """
         logger.warning("Using symbolic fallback")
-        return {"action": "PROBE", "args": {"x": 0, "y": 0}}
+        from .fallback_symbolic import get_symbolic_action
+        return get_symbolic_action(observation)
     
     def _select_action_from_candidates(self, solver_payload: Dict) -> Optional[Dict[str, Any]]:
         """
-        Select best action from Solver candidates.
-        
-        Full implementation would use PolicyEngine with confidence scoring.
-        
-        Args:
-            solver_payload: Solver output with candidates
-            
-        Returns:
-            First action of best candidate, or None
+        Select best action from Solver candidates using PolicyEngine.
         """
-        candidates = solver_payload.get("candidates", [])
-        if not candidates:
+        from .policy import PolicyEngine
+        engine = PolicyEngine()
+        best = engine.select_best_candidate(solver_payload)
+        
+        if not best:
             return None
-        
-        # Simple selection: highest confidence
-        best = max(candidates, key=lambda c: c.get("confidence", 0.0))
+
         steps = best.get("steps", [])
-        
         if not steps:
             return None
-        
-        # Return first step only (execute_one_step_at_a_time invariant)
+
         first_step = steps[0]
         return {
             "action": first_step.get("function", "PROBE"),
