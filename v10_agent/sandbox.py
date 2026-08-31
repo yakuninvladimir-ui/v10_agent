@@ -90,6 +90,37 @@ class SandboxAPI:
         })
 
 
+class SandboxASTVisitor(ast.NodeVisitor):
+    """
+    AST Visitor to strictly enforce Sandbox security rules before code execution.
+    Conforms to Task Item 4: Disallow ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal,
+    and any ast.Attribute where attr starts with '__'.
+    """
+    def __init__(self):
+        self.errors: List[str] = []
+
+    def visit_Import(self, node: ast.Import):
+        self.errors.append("AST Security Error: Import statements are forbidden in sandbox")
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        self.errors.append("AST Security Error: ImportFrom statements are forbidden in sandbox")
+        self.generic_visit(node)
+
+    def visit_Global(self, node: ast.Global):
+        self.errors.append("AST Security Error: Global declarations are forbidden in sandbox")
+        self.generic_visit(node)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal):
+        self.errors.append("AST Security Error: Nonlocal declarations are forbidden in sandbox")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute):
+        if node.attr.startswith("__"):
+            self.errors.append(f"AST Security Error: Accessing dunder attribute '{node.attr}' is forbidden")
+        self.generic_visit(node)
+
+
 class SandboxExecutor:
     """
     Secure sandbox for executing Coder-generated DSL functions.
@@ -102,6 +133,21 @@ class SandboxExecutor:
         self.allowed_functions: Dict[str, Callable] = {}
         self.error_count = 0
     
+    def validate_ast(self, source: str) -> None:
+        """
+        Validate Python source code via AST visitor before exec().
+        Raises ValueError if security invariants are violated.
+        """
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as e:
+            raise ValueError(f"AST parse error: {e}")
+
+        visitor = SandboxASTVisitor()
+        visitor.visit(tree)
+        if visitor.errors:
+            raise ValueError(f"Sandbox AST validation failed: {'; '.join(visitor.errors)}")
+
     def static_check(self, source: str, manifest: Dict[str, Any]) -> List[str]:
         """
         Perform static analysis on source code before execution.
@@ -213,6 +259,9 @@ class SandboxExecutor:
                 _declare_action=declare_action,
             )
         
+        # Mandatory AST validation before exec()
+        self.validate_ast(source)
+
         # Execute source in sandbox
         try:
             exec(source, safe_globals)

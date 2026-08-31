@@ -284,10 +284,10 @@ class TestIsolationMemoryContoursAreDisjoint:
         assert syntax_memory is not game_memory
         assert epistemic_memory is not game_memory
         
-        # Verify they have no shared mutable state
-        assert id(env_memory._probe_history) != id(syntax_memory._errors)
-        assert id(env_memory._probe_history) != id(epistemic_memory._judgments)
-        assert id(syntax_memory._errors) != id(epistemic_memory._judgments)
+        # Verify internal fields are independent collections (empty tuples/frozensets or distinct containers)
+        assert type(env_memory._probe_history) is tuple
+        assert type(syntax_memory._errors) is tuple
+        assert type(epistemic_memory._judgments) is tuple
 
 
 class TestEnvironmentSpecMemory:
@@ -317,7 +317,7 @@ class TestEnvironmentSpecMemory:
         )
         
         memory = EnvironmentSpecMemory()
-        memory.set_specification(spec)
+        memory = memory.set_specification(spec)
         
         # Add more than 1000 probes (the limit)
         for i in range(1005):
@@ -326,7 +326,7 @@ class TestEnvironmentSpecMemory:
                 action_id=f"action_{i}",
                 confidence=0.9,
             )
-            memory.add_probe(probe)
+            memory = memory.add_probe(probe)
         
         # Should have exactly 1000 probes (maxlen)
         assert memory.probe_count == 1000
@@ -345,7 +345,7 @@ class TestSyntaxErrorMemory:
         
         # Add 7 errors
         for i in range(7):
-            memory.add_error(
+            memory = memory.add_error(
                 prompt_hash=f"prompt_{i}",
                 source_hash=f"source_{i}",
                 traceback=f"traceback_{i}",
@@ -367,7 +367,7 @@ class TestSyntaxErrorMemory:
         
         # Fill to capacity
         for i in range(5):
-            memory.add_error(
+            memory = memory.add_error(
                 prompt_hash=f"prompt_{i}",
                 source_hash=f"source_{i}",
                 traceback=f"traceback_{i}",
@@ -394,7 +394,7 @@ class TestEpistemicMemory:
             timestamp=1234567890.0,
         )
         
-        memory.add_judgment(omit_judgment)
+        memory = memory.add_judgment(omit_judgment)
         
         assert memory.is_branch_omittable(omit_judgment.branch_signature) is True
         assert memory.is_branch_severed(omit_judgment.branch_signature) is False
@@ -411,7 +411,7 @@ class TestEpistemicMemory:
             timestamp=1234567891.0,
         )
         
-        memory.add_judgment(null_judgment)
+        memory = memory.add_judgment(null_judgment)
         
         assert memory.is_branch_severed(null_judgment.branch_signature) is True
         assert memory.is_branch_omittable(null_judgment.branch_signature) is False

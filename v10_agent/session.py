@@ -772,7 +772,7 @@ class GameSession:
             traceback_text = "".join(traceback_str)
             
             # Add to SyntaxErrorMemory (max 5 entries, FIFO eviction)
-            self.syntax_error_memory.add_error(
+            self.syntax_error_memory = self.syntax_error_memory.add_error(
                 level_id=self.current_level_id or "unknown",
                 prompt_hash=prompt_hash,
                 source_hash=source_hash,
@@ -887,7 +887,7 @@ class GameSession:
         )
         
         # Add judgment to EpistemicMemory (automatically tracks live/severed branches)
-        self.epistemic_memory.add_judgment(judgment_record)
+        self.epistemic_memory = self.epistemic_memory.add_judgment(judgment_record)
         
         # Log memory contour state
         logger.info(

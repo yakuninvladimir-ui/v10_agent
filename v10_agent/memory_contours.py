@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Sequence
-from collections import deque
+from typing import Any, Sequence, Optional, List, Dict
 
 from .types import (
     PropositionSet,
@@ -26,37 +25,8 @@ from .types import (
     SyntaxErrorRecord,
     BrusentsovJudgment,
     BranchSignature,
+    EnvironmentSpecification,
 )
-
-
-@dataclass
-class EnvironmentSpecification:
-    """
-    Environment specification for a task level.
-    
-    Ref: Spec 3.5.1 - EnvironmentSpecMemory
-    
-    Contains the canonical description of the environment including:
-    - Initial state propositions
-    - Goal conditions (if any)
-    - Available DSL actions
-    - Constraints and invariants
-    """
-    
-    # Unique identifier for this environment spec
-    spec_id: str
-    
-    # Initial state propositions
-    initial_propositions: PropositionSet
-    
-    # Goal propositions (may be empty for exploration tasks)
-    goal_propositions: PropositionSet | None = None
-    
-    # Available DSL action IDs
-    available_actions: frozenset[str] = field(default_factory=frozenset)
-    
-    # Additional constraints as free-form metadata
-    constraints: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -68,7 +38,7 @@ class EnvironmentSpecMemory:
     
     This memory contour stores:
     - Current EnvironmentSpecification
-    - History of probe actions and their results
+    - History of probe actions and their results (max 1000 entries)
     
     ISO-3 Compliance: This class has NO methods to access SyntaxErrorMemory or
     EpistemicMemory contents. It is completely isolated.
@@ -77,22 +47,29 @@ class EnvironmentSpecMemory:
     # Current environment specification
     current_spec: EnvironmentSpecification | None = None
     
-    # History of probe records (FIFO queue)
-    _probe_history: deque[ProbeRecord] = field(default_factory=lambda: deque(maxlen=1000))
-    
-    def add_probe(self, record: ProbeRecord) -> None:
+    # History of probe records (tuple for immutability, maxlen 1000)
+    _probe_history: tuple[ProbeRecord, ...] = field(default_factory=tuple)
+    MAX_PROBES: int = 1000
+
+    def add_probe(self, record: ProbeRecord) -> EnvironmentSpecMemory:
         """
-        Add a probe record to the history.
+        Add a probe record to the history and return a new EnvironmentSpecMemory instance.
         
         Args:
             record: The probe record to add
             
+        Returns:
+            New EnvironmentSpecMemory instance with updated probe history
+
         Raises:
             ValueError: If no EnvironmentSpecification is set
         """
         if self.current_spec is None:
             raise ValueError("Cannot add probe without EnvironmentSpecification")
-        self._probe_history.append(record)
+        new_history = self._probe_history + (record,)
+        if len(new_history) > self.MAX_PROBES:
+            new_history = new_history[-self.MAX_PROBES:]
+        return EnvironmentSpecMemory(current_spec=self.current_spec, _probe_history=new_history)
     
     def get_probe_history(self) -> Sequence[ProbeRecord]:
         """
@@ -101,7 +78,7 @@ class EnvironmentSpecMemory:
         Returns:
             Sequence of probe records in chronological order
         """
-        return tuple(self._probe_history)
+        return self._probe_history
     
     def get_recent_probes(self, count: int) -> Sequence[ProbeRecord]:
         """
@@ -113,21 +90,23 @@ class EnvironmentSpecMemory:
         Returns:
             Sequence of up to `count` most recent probe records
         """
-        history_list = list(self._probe_history)
-        return tuple(history_list[-count:] if len(history_list) > count else history_list)
+        return self._probe_history[-count:] if len(self._probe_history) > count else self._probe_history
     
-    def set_specification(self, spec: EnvironmentSpecification) -> None:
+    def set_specification(self, spec: EnvironmentSpecification) -> EnvironmentSpecMemory:
         """
-        Set the current environment specification.
+        Set the current environment specification and return a new EnvironmentSpecMemory instance.
         
         Args:
             spec: The environment specification to set
+
+        Returns:
+            New EnvironmentSpecMemory instance with updated specification
         """
-        object.__setattr__(self, 'current_spec', spec)
+        return EnvironmentSpecMemory(current_spec=spec, _probe_history=self._probe_history)
     
-    def clear_probes(self) -> None:
-        """Clear all probe history."""
-        self._probe_history.clear()
+    def clear_probes(self) -> EnvironmentSpecMemory:
+        """Clear all probe history and return a new EnvironmentSpecMemory instance."""
+        return EnvironmentSpecMemory(current_spec=self.current_spec, _probe_history=())
     
     @property
     def probe_count(self) -> int:
@@ -152,8 +131,8 @@ class SyntaxErrorMemory:
     # Maximum capacity as per Spec 2.1
     MAX_ENTRIES: int = 5
     
-    # Internal storage (mutable for implementation, but interface is read-only)
-    _errors: list[SyntaxErrorRecord] = field(default_factory=list)
+    # Internal storage (tuple for immutability)
+    _errors: tuple[SyntaxErrorRecord, ...] = field(default_factory=tuple)
     
     def add_error(
         self,
@@ -163,9 +142,9 @@ class SyntaxErrorMemory:
         level_id: str = "unknown",
         static_diagnostics: list[str] | None = None,
         timestamp: int = 0,
-    ) -> None:
+    ) -> SyntaxErrorMemory:
         """
-        Add a syntax error record.
+        Add a syntax error record and return a new SyntaxErrorMemory instance.
         
         Args:
             prompt_hash: Hash of the prompt that caused the error
@@ -175,6 +154,9 @@ class SyntaxErrorMemory:
             static_diagnostics: Optional static analysis diagnostics
             timestamp: Error occurrence timestamp
             
+        Returns:
+            New SyntaxErrorMemory instance with updated errors
+
         Note:
             If capacity is exceeded, the oldest error is removed (FIFO).
         """
@@ -187,11 +169,11 @@ class SyntaxErrorMemory:
             timestamp=timestamp,
         )
         
-        self._errors.append(record)
-        
-        # Enforce maximum capacity (FIFO removal)
-        if len(self._errors) > self.MAX_ENTRIES:
-            self._errors.pop(0)  # Remove oldest
+        new_errors = self._errors + (record,)
+        if len(new_errors) > self.MAX_ENTRIES:
+            new_errors = new_errors[-self.MAX_ENTRIES:]
+
+        return SyntaxErrorMemory(_errors=new_errors)
     
     def get_errors(self) -> Sequence[SyntaxErrorRecord]:
         """
@@ -200,7 +182,7 @@ class SyntaxErrorMemory:
         Returns:
             Sequence of syntax error records in chronological order
         """
-        return tuple(self._errors)
+        return self._errors
     
     def get_recent_errors(self, count: int) -> Sequence[SyntaxErrorRecord]:
         """
@@ -212,11 +194,31 @@ class SyntaxErrorMemory:
         Returns:
             Sequence of up to `count` most recent error records
         """
-        return tuple(self._errors[-count:] if len(self._errors) > count else self._errors)
+        return self._errors[-count:] if len(self._errors) > count else self._errors
+
+    def get_recent_summaries(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get recent error summaries for Coder feedback.
+
+        Args:
+            limit: Maximum number of error summaries to return
+
+        Returns:
+            List of dicts with summary and level_id keys
+        """
+        recent = self.get_recent_errors(limit)
+        result = []
+        for record in recent:
+            summary_text = getattr(record, 'summary', None) or record.traceback or ""
+            result.append({
+                "summary": summary_text[:200],
+                "level_id": record.level_id
+            })
+        return result
     
-    def clear(self) -> None:
-        """Clear all syntax error records."""
-        self._errors.clear()
+    def clear(self) -> SyntaxErrorMemory:
+        """Clear all syntax error records and return a new SyntaxErrorMemory instance."""
+        return SyntaxErrorMemory(_errors=())
     
     @property
     def error_count(self) -> int:
@@ -244,29 +246,35 @@ class EpistemicMemory:
     SyntaxErrorMemory contents. It is completely isolated.
     """
     
-    # Internal storage for judgments (mutable for implementation)
-    _judgments: list[BrusentsovJudgment] = field(default_factory=list)
+    # Internal storage (immutable collections)
+    _judgments: tuple[BrusentsovJudgment, ...] = field(default_factory=tuple)
+    _live_omit_branches: frozenset[BranchSignature] = field(default_factory=frozenset)
+    _severed_null_signatures: frozenset[BranchSignature] = field(default_factory=frozenset)
     
-    # Live OMIT branches (branches that can be safely omitted)
-    _live_omit_branches: set[BranchSignature] = field(default_factory=set)
-    
-    # Severed NULL branch signatures (branches that caused contradictions)
-    _severed_null_signatures: set[BranchSignature] = field(default_factory=set)
-    
-    def add_judgment(self, judgment: BrusentsovJudgment) -> None:
+    def add_judgment(self, judgment: BrusentsovJudgment) -> EpistemicMemory:
         """
-        Add a Brusentsov judgment.
+        Add a Brusentsov judgment and return a new EpistemicMemory instance.
         
         Args:
             judgment: The judgment to add
+
+        Returns:
+            New EpistemicMemory instance with updated state
         """
-        self._judgments.append(judgment)
+        new_judgments = self._judgments + (judgment,)
+        new_live_omit = set(self._live_omit_branches)
+        new_severed_null = set(self._severed_null_signatures)
         
-        # Update live/severed branches based on judgment type
         if judgment.judgment_type == "OMIT":
-            self._live_omit_branches.add(judgment.branch_signature)
+            new_live_omit.add(judgment.branch_signature)
         elif judgment.judgment_type == "NULL":
-            self._severed_null_signatures.add(judgment.branch_signature)
+            new_severed_null.add(judgment.branch_signature)
+
+        return EpistemicMemory(
+            _judgments=new_judgments,
+            _live_omit_branches=frozenset(new_live_omit),
+            _severed_null_signatures=frozenset(new_severed_null)
+        )
     
     def get_judgments(self) -> Sequence[BrusentsovJudgment]:
         """
@@ -275,25 +283,48 @@ class EpistemicMemory:
         Returns:
             Sequence of judgments in chronological order
         """
-        return tuple(self._judgments)
-    
-    def get_live_omit_branches(self) -> frozenset[BranchSignature]:
+        return self._judgments
+
+    def get_summary(self) -> Dict[str, Any]:
         """
-        Get all live OMIT branches.
+        Get aggregated epistemic summary for Solver.
+
+        Returns:
+            Dict containing counts of judgments, live OMIT, and severed NULL branches
+        """
+        return {
+            "judgment_count": self.judgment_count,
+            "live_omit_count": self.live_omit_count,
+            "severed_null_count": self.severed_null_count,
+        }
+    
+    def get_live_omit_branches(self, limit: Optional[int] = None) -> frozenset[BranchSignature]:
+        """
+        Get live OMIT branches.
         
+        Args:
+            limit: Optional maximum number of branches to return
+
         Returns:
             FrozenSet of branch signatures that can be omitted
         """
-        return frozenset(self._live_omit_branches)
+        if limit is None:
+            return self._live_omit_branches
+        return frozenset(list(self._live_omit_branches)[:limit])
     
-    def get_severed_null_signatures(self) -> frozenset[BranchSignature]:
+    def get_severed_null_signatures(self, limit: Optional[int] = None) -> frozenset[BranchSignature]:
         """
-        Get all severed NULL branch signatures.
+        Get severed NULL branch signatures.
         
+        Args:
+            limit: Optional maximum number of signatures to return
+
         Returns:
             FrozenSet of branch signatures that caused contradictions
         """
-        return frozenset(self._severed_null_signatures)
+        if limit is None:
+            return self._severed_null_signatures
+        return frozenset(list(self._severed_null_signatures)[:limit])
     
     def is_branch_omittable(self, signature: BranchSignature) -> bool:
         """
@@ -319,20 +350,27 @@ class EpistemicMemory:
         """
         return signature in self._severed_null_signatures
     
-    def prune_omit_branch(self, signature: BranchSignature) -> None:
+    def prune_omit_branch(self, signature: BranchSignature) -> EpistemicMemory:
         """
-        Remove a branch from live OMIT branches.
+        Remove a branch from live OMIT branches and return a new EpistemicMemory instance.
         
         Args:
             signature: The branch signature to remove
+
+        Returns:
+            New EpistemicMemory instance without the pruned branch
         """
-        self._live_omit_branches.discard(signature)
+        new_live_omit = set(self._live_omit_branches)
+        new_live_omit.discard(signature)
+        return EpistemicMemory(
+            _judgments=self._judgments,
+            _live_omit_branches=frozenset(new_live_omit),
+            _severed_null_signatures=self._severed_null_signatures
+        )
     
-    def clear(self) -> None:
-        """Clear all epistemic memory."""
-        self._judgments.clear()
-        self._live_omit_branches.clear()
-        self._severed_null_signatures.clear()
+    def clear(self) -> EpistemicMemory:
+        """Clear all epistemic memory and return a new EpistemicMemory instance."""
+        return EpistemicMemory()
     
     @property
     def judgment_count(self) -> int:

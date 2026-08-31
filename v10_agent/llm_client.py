@@ -467,7 +467,7 @@ class VLLMClient:
         
         return ParsedResponse.ok(
             payload=payload,
-            _reasoning_trace=reasoning_trace,
+            reasoning_trace=reasoning_trace,
             usage=usage
         )
 
