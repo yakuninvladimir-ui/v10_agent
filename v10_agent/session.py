@@ -93,9 +93,13 @@ class GameSession:
         self.solver = SolverAgent(llm_client=self.llm_client)
         
         # Memory contours (strictly isolated per ISO-3)
-        self.env_spec_memory: Optional[EnvironmentSpecMemory] = None
-        self.syntax_error_memory: Optional[SyntaxErrorMemory] = None
-        self.epistemic_memory: Optional[EpistemicMemory] = None
+        self.env_spec_memory: EnvironmentSpecMemory = EnvironmentSpecMemory()
+        self.syntax_error_memory: SyntaxErrorMemory = SyntaxErrorMemory()
+        self.epistemic_memory: EpistemicMemory = EpistemicMemory()
+
+        # State Machine tracking
+        self.active_manifest: Optional[Dict[str, Any]] = None
+        self.active_trajectory: List[Dict[str, Any]] = []
         
         # State tracking
         self.current_level_id: Optional[str] = None
@@ -192,16 +196,15 @@ class GameSession:
     
     def act(self, raw_observation: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Execute one step of the agent loop.
+        Execute one step of the agent loop using State Machine orchestration.
         
         Flow:
-        1. Prepare PlanningSet snapshot
-        2. Explorer (if environment unknown) -> receives ONLY payload
-        3. Coder (if manifest needed) -> receives ONLY payload
-        4. Solver (generate candidates) -> receives ONLY payload
-        5. Select candidate via PolicyEngine
-        6. Verify arguments via VerificationBinder
-        7. Execute ONE step via ActionBoundary
+        1. If active_trajectory has pending steps, pop next step and return it directly.
+        2. Otherwise:
+           a. Run Explorer if environment specification is missing.
+           b. Run Coder ONLY if active_manifest is None.
+           c. Run Solver ONLY if active_manifest is present but active_trajectory is empty.
+           d. Populate active_trajectory with steps and return first step.
         
         ISO Invariant Enforcement:
         - Explorer receives NO goal info (ISO-1)
@@ -215,45 +218,67 @@ class GameSession:
             Action to execute, or None if no valid action found
         """
         try:
-            # Step 1: Explorer phase (if needed)
-            explorer_payload = self._run_explorer(raw_observation)
+            self.step_count += 1
+
+            # 1. State Machine: If we have pre-generated steps in active_trajectory, pop and return next step
+            if self.active_trajectory:
+                logger.info("Executing step from active_trajectory (no LLM call needed)")
+                return self.active_trajectory.pop(0)
             
+            # 2. Explorer phase (if environment specification is missing)
+            explorer_payload = self._run_explorer(raw_observation)
             if explorer_payload is None:
-                # Explorer failed - use fallback or previous env spec
                 logger.warning("Explorer failed, using fallback")
                 explorer_payload = self._explorer_fallback(raw_observation)
             
-            # Step 2: Coder phase (generate/update DSL functions)
-            coder_payload = self._run_coder(explorer_payload)
-            
-            if coder_payload is None:
-                # Coder failed - trigger double-loop retry
-                logger.warning("Coder failed, triggering retry loop")
-                coder_payload = self._run_coder_with_retry(explorer_payload)
+            # 3. Coder phase: Run ONLY if active_manifest is None
+            if self.active_manifest is None:
+                logger.info("Active manifest is None, invoking Coder")
+                coder_payload = self._run_coder(explorer_payload)
                 
                 if coder_payload is None:
-                    # Exhausted retries - force symbolic fallback
-                    logger.error("Coder exhausted retries, forcing fallback")
-                    return self._symbolic_fallback(raw_observation)
+                    logger.warning("Coder failed, triggering retry loop")
+                    coder_payload = self._run_coder_with_retry(explorer_payload)
+
+                    if coder_payload is None:
+                        logger.error("Coder exhausted retries, forcing fallback")
+                        return self._symbolic_fallback(raw_observation)
+
+                self.active_manifest = coder_payload
             
-            # Step 3: Solver phase (generate trajectory candidates)
-            solver_payload = self._run_solver(coder_payload)
-            
-            if solver_payload is None:
-                # Solver failed - retry or fallback
-                logger.warning("Solver failed, attempting retry")
-                solver_payload = self._run_solver_with_retry(coder_payload)
+            # 4. Solver phase: Run ONLY if active_manifest is present and active_trajectory is empty
+            if self.active_manifest is not None and not self.active_trajectory:
+                logger.info("Active trajectory empty, invoking Solver with active_manifest")
+                solver_payload = self._run_solver(self.active_manifest)
                 
                 if solver_payload is None:
-                    # Exhausted retries - symbolic fallback
-                    logger.error("Solver exhausted retries, forcing fallback")
-                    return self._symbolic_fallback(raw_observation)
+                    logger.warning("Solver failed, attempting retry")
+                    solver_payload = self._run_solver_with_retry(self.active_manifest)
+
+                    if solver_payload is None:
+                        logger.error("Solver exhausted retries, forcing fallback")
+                        return self._symbolic_fallback(raw_observation)
+
+                # Extract candidate steps and populate active_trajectory
+                candidates = solver_payload.get("candidates", [])
+                if candidates:
+                    best_candidate = max(candidates, key=lambda c: c.get("confidence", 0.0))
+                    steps = best_candidate.get("steps", [])
+                    if steps:
+                        # Convert steps into action dicts
+                        self.active_trajectory = [
+                            {
+                                "action": step.get("function", "PROBE"),
+                                "args": step.get("args", {})
+                            }
+                            for step in steps
+                        ]
+
+            # 5. Extract first step from active_trajectory
+            if self.active_trajectory:
+                return self.active_trajectory.pop(0)
             
-            # Step 4: Select best candidate and extract first action
-            # (Full implementation would use PolicyEngine here)
-            selected_action = self._select_action_from_candidates(solver_payload)
-            
-            return selected_action
+            return self._symbolic_fallback(raw_observation)
             
         except Exception as e:
             logger.exception(f"Unexpected error in act(): {e}")
@@ -756,13 +781,11 @@ class GameSession:
                 }
             )
             
-            if self.syntax_error_memory is None:
-                # Lazy initialization on first error
-                from .memory_contours import SyntaxErrorMemory
-                object.__setattr__(self, 'syntax_error_memory', SyntaxErrorMemory())
+            # Clear active manifest and active trajectory so Coder/Solver rerun on next act()
+            self.active_manifest = None
+            self.active_trajectory = []
             
             # Create prompt/source hashes for error record
-            # (In full impl, these would come from Coder's last generation)
             prompt_hash = hashlib.sha256(b"stub_prompt").hexdigest()
             source_hash = hashlib.sha256(b"stub_source").hexdigest()
             
@@ -791,19 +814,15 @@ class GameSession:
         # Path B: Normal Execution -> LayeredVerifier -> EpistemicMemory
         # =========================================================================
         
-        # Initialize memory contours if not already created
-        if self.env_spec_memory is None:
-            from .memory_contours import EnvironmentSpecMemory, EnvironmentSpecification
+        # Ensure initial specification is set in env_spec_memory if not present
+        if self.env_spec_memory.current_spec is None:
+            from .memory_contours import EnvironmentSpecification
             from .types import PropositionSet
             initial_spec = EnvironmentSpecification(
-                spec_id=f"spec_{self.current_level_id or 'init'}",
-                initial_propositions=PropositionSet.create(snapshot_hash="init"),
+                grid_width=10,
+                grid_height=10,
             )
-            object.__setattr__(self, 'env_spec_memory', EnvironmentSpecMemory(current_spec=initial_spec))
-        
-        if self.epistemic_memory is None:
-            from .memory_contours import EpistemicMemory
-            object.__setattr__(self, 'epistemic_memory', EpistemicMemory())
+            self.env_spec_memory = self.env_spec_memory.set_specification(initial_spec)
         
         # -------------------------------------------------------------------------
         # Step 1: Build Observed PropositionSet from after_observation
@@ -908,13 +927,15 @@ class GameSession:
         # - NULL: Sever branch, trigger Solver retry with new candidate
         # - OMIT: Keep branch alive, may pivot later
         
-        # Log actionable insight based on judgment
+        # Log actionable insight based on judgment & react via State Machine
         if verification_result.judgment.is_null():
             logger.warning(
                 "NULL judgment: Physical contradiction detected. "
-                "Current trajectory branch must be severed.",
+                "Severing trajectory branch and clearing active_trajectory and active_manifest.",
                 extra={"level_id": self.current_level_id, "step": self.step_count}
             )
+            self.active_trajectory = []
+            self.active_manifest = None
         elif verification_result.judgment.is_omit():
             logger.info(
                 "OMIT judgment: Expected effects absent but no contradiction. "
@@ -939,9 +960,11 @@ class GameSession:
     
     def reset_game(self) -> None:
         """Clear all memory contours for new game."""
-        self.env_spec_memory = None
-        self.syntax_error_memory = None
-        self.epistemic_memory = None
+        self.env_spec_memory = EnvironmentSpecMemory()
+        self.syntax_error_memory = SyntaxErrorMemory()
+        self.epistemic_memory = EpistemicMemory()
+        self.active_manifest = None
+        self.active_trajectory = []
         self.current_level_id = None
         self.step_count = 0
         self.action_history = []
