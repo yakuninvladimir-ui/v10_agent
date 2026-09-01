@@ -4,11 +4,11 @@ Orchestrates the main execution loop with strict isolation invariants.
 Ref: Spec 5 (Execution Loop), Spec 6 (Error Handling)
 
 ISO Invariants enforced:
-- ISO-1: Explorer has no goal information
-- ISO-2: Coder cannot see traceback from Solver
-- ISO-3: Memory contours are strictly disjoint
-- ISO-4: Solver never sees Python source code
-- ISO-5: PlanningSet bijection maintained
+- ISO-1: Traceback/SyntaxError never appears in any prompt/memory visible to Solver
+- ISO-2: Level goal/epistemic logic never appears in Coder prompts or SyntaxErrorMemory
+- ISO-3: Explorer writes only to EnvSpecMemory, Coder to SyntaxErrorMemory, Solver to EpistemicMemory
+- ISO-4: GameSession routes all feedback and reads all three contours
+- ISO-5: PlanningSet object/relation ids are the sole shared vocabulary
 
 CRITICAL: reasoning_trace from LLM responses is NEVER passed to agents.
 It goes ONLY to logging for audit purposes. This prevents:
@@ -300,15 +300,10 @@ class GameSession:
     
     def _build_planning_set_from_observation(self, observation: Dict) -> "PlanningSet":
         """
-        Build PlanningSet snapshot from raw observation.
-        
-        Args:
-            observation: Raw grid observation dict
-            
-        Returns:
-            PlanningSet instance for Explorer agent
+        Build PlanningSet snapshot from raw observation using ARGALite.
         """
         from .planning_set import PlanningSet
+        from .arga_lite import ARGALite
         
         # Extract grid and compute hash
         grid = observation.get("grid", [])
@@ -318,12 +313,13 @@ class GameSession:
         # Generate snapshot ID
         snapshot_id = f"snapshot_{self.current_level_id}_{self.step_count}" if self.current_level_id else f"snapshot_{self.step_count}"
         
-        # Stub object/relation/action IDs as frozensets (required by PlanningSet)
-        object_ids = frozenset(["obj_0", "obj_1"])  # Default stub objects
-        relation_ids = frozenset(["rel_0"])  # Default stub relations
-        allowed_action_ids = frozenset(["ACTION1", "ACTION6"])  # Default actions
+        arga = ARGALite()
+        parsed = arga.parse_grid(grid)
+
+        object_ids = frozenset(obj["id"] for obj in parsed.get("objects", []))
+        relation_ids = frozenset()
+        allowed_action_ids = frozenset(["ACTION1", "ACTION6", "probe", "move_toward_metric", "click_centroid", "reset", "undo"])
         
-        # Identity mapping for object aliases (I6 bijection requirement)
         from frozendict import frozendict
         object_real_to_alias = frozendict({oid: oid for oid in object_ids})
         
@@ -338,17 +334,10 @@ class GameSession:
     
     def _create_annotated_frame(self, observation: Dict) -> str:
         """
-        Create annotated frame representation for Explorer.
-        
-        Args:
-            observation: Raw grid observation dict
-            
-        Returns:
-            Annotated frame string (base64 PNG or text representation)
+        Create annotated frame representation for Explorer using frame_media.
         """
-        # Stub implementation - returns text representation
-        # Full impl would render PNG with object/relation overlays
-        return f"Grid observation at step {self.step_count}: {str(observation)[:200]}..."
+        from .frame_media import create_annotated_frame
+        return create_annotated_frame(observation)
     
     def _run_coder(self, explorer_payload: Dict) -> Optional[Dict]:
         """
@@ -619,78 +608,25 @@ class GameSession:
         snapshot_hash: str,
     ) -> List["AtomicProposition"]:
         """
-        Extract AtomicPropositions from raw grid observation.
-        
-        This is a stub implementation that extracts basic propositions.
-        Full implementation would use SnapshotBuilder to extract all
-        registered proposition families per Spec 3.3.
-        
-        Args:
-            observation: Raw grid observation dict with 'grid' key
-            snapshot_hash: Hash of the snapshot for PropositionSet context
-            
-        Returns:
-            List of AtomicProposition instances representing observed state
-        
-        Ref: Spec 3.3 - Atomic proposition families (normative)
+        Extract AtomicPropositions from raw grid observation using SnapshotBuilder.
         """
-        from .types import AtomicProposition
+        from .arga_lite import ARGALite, SnapshotBuilder
         
-        propositions: List[AtomicProposition] = []
+        arga = ARGALite()
+        builder = SnapshotBuilder(arga)
+        
+        propositions = builder.extract_propositions(observation, snapshot_hash)
+        
+        # Extract grid dimensions as additional context
         grid = observation.get("grid", [])
-        
-        if not grid:
-            return propositions
-        
-        # Extract grid dimensions as positional context
-        height = len(grid)
-        width = len(grid[0]) if height > 0 else 0
-        
-        # Stub proposition: grid dimensions (attribute_delta family)
-        propositions.append(
-            AtomicProposition(
-                family="attribute_delta",
-                data={
-                    "attribute": "grid_dimensions",
-                    "object_id": "grid_main",
-                    "delta_width": width,
-                    "delta_height": height,
-                },
-                objects=("grid_main",),
-                relations=(),
+        if grid:
+            height = len(grid)
+            width = len(grid[0]) if height > 0 else 0
+            logger.debug(
+                f"Extracted {len(propositions)} atomic propositions from observation",
+                extra={"snapshot_hash": snapshot_hash, "grid_size": f"{width}x{height}"}
             )
-        )
-        
-        # Count non-zero cells as a simple metric_sign proposition
-        non_zero_count = sum(1 for row in grid for cell in row if cell != 0)
-        propositions.append(
-            AtomicProposition(
-                family="metric_sign",
-                data={
-                    "metric": "non_zero_cells",
-                    "sign": 1 if non_zero_count > 0 else 0,
-                    "count": non_zero_count,
-                },
-                objects=("grid_main",),
-                relations=(),
-            )
-        )
-        
-        # Stub terminal flag (assume non-terminal unless grid is empty)
-        propositions.append(
-            AtomicProposition(
-                family="terminal_flag",
-                data={"is_terminal": False, "reason": "active_level"},
-                objects=("grid_main",),
-                relations=(),
-            )
-        )
-        
-        logger.debug(
-            f"Extracted {len(propositions)} atomic propositions from observation",
-            extra={"snapshot_hash": snapshot_hash, "grid_size": f"{width}x{height}"}
-        )
-        
+
         return propositions
     
     def observe_action_result(

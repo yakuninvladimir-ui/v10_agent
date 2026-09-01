@@ -199,6 +199,30 @@ class SandboxExecutor:
         
         return diagnostics
     
+    def _execute_in_process(self, source, safe_globals, function_name, args, kwargs, result_queue):
+        import resource
+        import sys
+
+        # Enforce memory limits (e.g. 256MB)
+        # Note: Set resource limit before exec
+        MB = 1024 * 1024
+        try:
+            # Setting virtual memory limit
+            resource.setrlimit(resource.RLIMIT_AS, (256 * MB, 256 * MB))
+        except Exception:
+            pass # Fails on some OS/environments
+
+        try:
+            exec(source, safe_globals)
+            if function_name not in safe_globals:
+                result_queue.put(('error', ValueError(f"Function '{function_name}' not found in source")))
+                return
+            func = safe_globals[function_name]
+            result = func(*args, **kwargs)
+            result_queue.put(('success', result))
+        except Exception as e:
+            result_queue.put(('error', e))
+
     def call(
         self,
         source: str,
@@ -209,21 +233,7 @@ class SandboxExecutor:
     ) -> Any:
         """
         Execute a function from source code in restricted sandbox.
-        
-        Args:
-            source: Python source code
-            function_name: Name of function to call
-            args: Positional arguments
-            kwargs: Keyword arguments
-            planning_set: Current PlanningSet for context
-        
-        Returns:
-            Function return value (typically EffectDeclaration)
-        
-        Raises:
-            Exception: Captured and converted to SyntaxErrorRecord
-        
-        Ref: Spec 4.2 - Restricted executor
+        Ref: Spec 4.2 - Restricted executor (process isolated with resource limits)
         """
         kwargs = kwargs or {}
         
@@ -234,9 +244,7 @@ class SandboxExecutor:
         if diagnostics:
             raise ValueError(f"Sandbox static check failed: {'; '.join(diagnostics)}")
         
-        # Create restricted globals with safe __import__ function
-        # This allows 'import math' statements to work while blocking dangerous imports
-        # Note: We use ALLOWED_UNDERSCORE_BUILTINS to selectively include __import__
+        # Create restricted globals
         safe_globals = {
             '__builtins__': {
                 name: getattr(__builtins__, name)
@@ -245,7 +253,6 @@ class SandboxExecutor:
             },
         }
         
-        # Create sandbox API if planning_set provided
         if planning_set:
             def declare_action(data):
                 return EffectDeclaration(
@@ -253,35 +260,42 @@ class SandboxExecutor:
                     arguments=data['arguments'],
                     expected_propositions=data.get('expected_propositions', []),
                 )
-            
             safe_globals['sandbox_api'] = SandboxAPI(
                 planning_set=planning_set,
                 _declare_action=declare_action,
             )
         
-        # Mandatory AST validation before exec()
         self.validate_ast(source)
 
-        # Execute source in sandbox
-        try:
-            exec(source, safe_globals)
-        except Exception as e:
+        import multiprocessing
+        ctx = multiprocessing.get_context("spawn")
+        result_queue = ctx.Queue()
+        
+        p = ctx.Process(
+            target=self._execute_in_process,
+            args=(source, safe_globals, function_name, args, kwargs, result_queue)
+        )
+        
+        p.start()
+        # Enforce CPU timeout limit of 5.0 seconds
+        p.join(timeout=5.0)
+        
+        if p.is_alive():
+            p.terminate()
+            p.join()
             self.error_count += 1
-            raise
-        
-        # Get function from executed namespace
-        if function_name not in safe_globals:
-            raise ValueError(f"Function '{function_name}' not found in source")
-        
-        func = safe_globals[function_name]
-        
-        # Call function
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            self.error_count += 1
-            raise
-    
+            raise TimeoutError(f"Sandbox execution timed out after 5.0 seconds")
+
+        if not result_queue.empty():
+            status, value = result_queue.get()
+            if status == 'error':
+                self.error_count += 1
+                raise value
+            return value
+
+        self.error_count += 1
+        raise RuntimeError("Sandbox process terminated unexpectedly")
+
     def create_error_record(
         self,
         source: str,

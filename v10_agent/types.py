@@ -232,7 +232,7 @@ class SyntaxErrorRecord:
     Ref: Spec 4 - Sandbox & Validation Pipeline
     
     Contains prompt/source hashes and traceback for Coder feedback.
-    Never visible to Solver (ISO-1 invariant).
+    Never visible to Solver (ISO-1 invariant - traceback never reaches Solver).
     
     Attributes:
         level_id: Level where the error occurred
