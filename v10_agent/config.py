@@ -113,8 +113,8 @@ class V10Config:
     reset_on_game_over: bool = True
     game_wall_clock_limit_seconds: float = 5000.0
     competition_wall_clock_limit_seconds: float = 30600.0
-    concurrency: int = 5
-    vllm_max_num_seqs: int = 5
+    concurrency: int = 4
+    vllm_max_num_seqs: int = 4
     vllm_startup_timeout_seconds: int = 900
 
     @property
@@ -280,8 +280,8 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         reset_on_game_over=_bool_from_env("ARC_RESET_ON_GAME_OVER", True),
         game_wall_clock_limit_seconds=_float_from_env("LCLD_GAME_WALL_CLOCK_LIMIT_SECONDS", 5000.0),
         competition_wall_clock_limit_seconds=_float_from_env("LCLD_COMPETITION_WALL_CLOCK_LIMIT_SECONDS", 30600.0),
-        concurrency=_int_from_env("LCLD_GAME_CONCURRENCY", 5),
-        vllm_max_num_seqs=_int_from_env("LCLD_VLLM_MAX_NUM_SEQS", 5),
+        concurrency=_int_from_env("LCLD_GAME_CONCURRENCY", 4),
+        vllm_max_num_seqs=_int_from_env("LCLD_VLLM_MAX_NUM_SEQS", 4),
         vllm_startup_timeout_seconds=_int_from_env("VLLM_STARTUP_TIMEOUT_SECONDS", 900),
     )
     if overrides:

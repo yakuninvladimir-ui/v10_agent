@@ -251,7 +251,7 @@ def run_direct_game(
 
 def run_concurrent_arcade_games(
     arcade: Any,
-    concurrency: int = 5,
+    concurrency: int = 4,
     config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Execute games yielded by Arcade gateway concurrently up to concurrency limit."""

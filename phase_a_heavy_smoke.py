@@ -7,7 +7,7 @@ Reproduces deep combat diagnostics in Phase A Save Version log:
 4. Executes diagnostic probes:
    - Probe 1: Text decoding with reasoning channel validation.
    - Probe 2: Multimodal vision (ARC grid PNG sent as base64 image).
-   - Probe 3: 5 concurrent workers matching VLLM_MAX_NUM_SEQS = 5.
+   - Probe 3: 4 concurrent workers matching VLLM_MAX_NUM_SEQS = 4.
 5. Emits vLLM server log tail (last 30KB) to stdout for public debuggability.
 6. Cleanly stops vLLM server so Phase A exits 0 and writes submission.parquet.
 """
@@ -30,7 +30,7 @@ VLLM_HOST = "127.0.0.1"
 VLLM_PORT = 1234
 VLLM_BASE_URL = f"http://{VLLM_HOST}:{VLLM_PORT}/v1"
 VLLM_HEALTH_URL = f"http://{VLLM_HOST}:{VLLM_PORT}/health"
-VLLM_MAX_NUM_SEQS = 5
+VLLM_MAX_NUM_SEQS = 4
 VLLM_STARTUP_TIMEOUT_SECONDS = 900
 HEAVY_SMOKE_REQ_TIMEOUT = 600
 
@@ -570,7 +570,7 @@ def run_phase_a_smoke_pipeline() -> dict[str, Any]:
         print(f"[HEAVY-SMOKE] Probe 2 result: {json.dumps({k: v for k, v in p2_res.items() if k != 'content'}, indent=2)}", flush=True)
         summary["probe2"] = p2_res
 
-        # --- Probe 3: Concurrency test (5 workers in parallel) ---
+        # --- Probe 3: Concurrency test (4 workers in parallel) ---
         print(f"\n[HEAVY-SMOKE] Executing Probe 3: Parallelism ({VLLM_MAX_NUM_SEQS} concurrent requests)...", flush=True)
         concurrent_payload = {
             "model": model_id,
