@@ -1,170 +1,97 @@
-"""
-Verification Binder - ISO-5 Compliant (PlanningSet Binding Validation)
-Ref: Engineering Specification V10.0 Section 4 & 7
-"""
+"""VerificationBinder: Grounds DSL arguments strictly to the active PlanningSet."""
 
-from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass
+from __future__ import annotations
 
-from .types import EffectDeclaration, AtomicProposition
-from .planning_set import PlanningSet
+from dataclasses import dataclass, field
+from typing import Any
+
+from v10_agent.planning_set import PlanningSet
+from v10_agent.types import AtomicProposition, PropositionSet
 
 
-@dataclass
-class BindingError:
-    """Represents a binding validation error."""
-    error_type: str  # "missing_object", "missing_relation", "invalid_action"
-    identifier: str
-    message: str
+class GroundingError(ValueError):
+    """Raised when a DSL function argument cannot be grounded in the active PlanningSet."""
+
+
+@dataclass(frozen=True)
+class GroundedStep:
+    """A verified, grounded trajectory step ready for sandboxed execution."""
+    step_id: str
+    dsl_function: str
+    arguments: dict[str, Any]
+    expected_propositions: PropositionSet
+    abort_if: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step_id": self.step_id,
+            "dsl_function": self.dsl_function,
+            "arguments": dict(self.arguments),
+            "expected_propositions": self.expected_propositions.to_list(),
+            "abort_if": list(self.abort_if),
+        }
 
 
 class VerificationBinder:
-    """
-    Validates that DSL function arguments reference valid PlanningSet entities.
-    
-    ISO-5 INVARIANT: All object_id, relation_id, and action_id arguments
-    must exist in the current PlanningSet before execution.
-    
-    Ref: Spec 4.3 - Verification Binder
-    Ref: Spec 7.2 - ActionBoundary Contract
-    """
-    
-    def __init__(self, planning_set: PlanningSet):
-        """
-        Initialize binder with current PlanningSet.
-        
-        Args:
-            planning_set: The PlanningSet to validate against
-        """
-        self.planning_set = planning_set
-        self._object_ids = set(planning_set.object_ids)
-        self._relation_ids = set(planning_set.relation_ids)
-        self._action_ids = set(planning_set.allowed_action_ids)
-    
-    def verify_effect_declaration(
-        self,
-        effect: EffectDeclaration,
-    ) -> Tuple[bool, List[BindingError]]:
-        """
-        Verify that an EffectDeclaration's arguments are bound to valid PlanningSet IDs.
-        
-        Args:
-            effect: The EffectDeclaration to verify
-        
-        Returns:
-            Tuple of (is_valid, list_of_errors)
-        
-        Ref: Spec 4.3 - Verification Binder (I5 Invariant)
-        """
-        errors = []
-        args = effect.arguments
-        
-        # Check object_id references
-        if 'object_id' in args:
-            obj_id = args['object_id']
-            if obj_id not in self._object_ids:
-                errors.append(BindingError(
-                    error_type="missing_object",
-                    identifier=obj_id,
-                    message=f"Object ID '{obj_id}' not found in PlanningSet",
-                ))
-        
-        # Check object_ids list references
-        if 'object_ids' in args:
-            for obj_id in args['object_ids']:
-                if obj_id not in self._object_ids:
-                    errors.append(BindingError(
-                        error_type="missing_object",
-                        identifier=obj_id,
-                        message=f"Object ID '{obj_id}' not found in PlanningSet",
-                    ))
-        
-        # Check relation_id references
-        if 'relation_id' in args:
-            rel_id = args['relation_id']
-            if rel_id not in self._relation_ids:
-                errors.append(BindingError(
-                    error_type="missing_relation",
-                    identifier=rel_id,
-                    message=f"Relation ID '{rel_id}' not found in PlanningSet",
-                ))
-        
-        # Check action_id references
-        if 'action_id' in args:
-            action_id = args['action_id']
-            if action_id not in self._action_ids:
-                errors.append(BindingError(
-                    error_type="invalid_action",
-                    identifier=action_id,
-                    message=f"Action ID '{action_id}' not in allowed actions",
-                ))
-        
-        # Check source/target relation references
-        if 'source_id' in args:
-            src_id = args['source_id']
-            if src_id not in self._object_ids:
-                errors.append(BindingError(
-                    error_type="missing_object",
-                    identifier=src_id,
-                    message=f"Source ID '{src_id}' not found in PlanningSet",
-                ))
-        
-        if 'target_id' in args:
-            tgt_id = args['target_id']
-            if tgt_id not in self._object_ids:
-                errors.append(BindingError(
-                    error_type="missing_object",
-                    identifier=tgt_id,
-                    message=f"Target ID '{tgt_id}' not found in PlanningSet",
-                ))
-        
-        return (len(errors) == 0, errors)
-    
-    def verify_proposition_bindings(
-        self,
-        propositions: List[AtomicProposition],
-    ) -> Tuple[bool, List[BindingError]]:
-        """
-        Verify that AtomicPropositions reference valid PlanningSet IDs.
-        
-        Args:
-            propositions: List of propositions to verify
-        
-        Returns:
-            Tuple of (is_valid, list_of_errors)
-        """
-        errors = []
-        
-        for prop in propositions:
-            # Check object references
-            for obj_id in prop.objects:
-                if obj_id not in self._object_ids:
-                    errors.append(BindingError(
-                        error_type="missing_object",
-                        identifier=obj_id,
-                        message=f"Proposition object ID '{obj_id}' not in PlanningSet",
-                    ))
-            
-            # Check relation references
-            for rel_id in prop.relations:
-                if rel_id not in self._relation_ids:
-                    errors.append(BindingError(
-                        error_type="missing_relation",
-                        identifier=rel_id,
-                        message=f"Proposition relation ID '{rel_id}' not in PlanningSet",
-                    ))
-        
-        return (len(errors) == 0, errors)
-    
-    def get_validation_summary(self) -> Dict[str, int]:
-        """
-        Get summary of available bindings in current PlanningSet.
-        
-        Returns:
-            Dictionary with counts of available objects, relations, actions
-        """
-        return {
-            'available_objects': len(self._object_ids),
-            'available_relations': len(self._relation_ids),
-            'allowed_actions': len(self._action_ids),
-        }
+    """Enforces Invariant I5 / ISO-5: all trajectory arguments ground in PlanningSet."""
+
+    def ground_step(self, step_dict: dict[str, Any], planning_set: PlanningSet) -> GroundedStep:
+        """Ground step dictionary against the active PlanningSet."""
+        step_id = str(step_dict.get("step_id", "s0"))
+        fn_name = str(step_dict.get("dsl_function", ""))
+        raw_args = dict(step_dict.get("arguments", {}) or {})
+        abort_if = tuple(step_dict.get("abort_if", ()))
+
+        grounded_args: dict[str, Any] = {}
+        for k, v in raw_args.items():
+            if isinstance(v, str):
+                # Check if it refers to an object or alias
+                if v in planning_set.object_ids:
+                    grounded_args[k] = v
+                elif v in planning_set.object_alias_to_real:
+                    grounded_args[k] = planning_set.object_alias_to_real[v]
+                elif v in planning_set.allowed_coordinate_candidate_ids:
+                    grounded_args[k] = v
+                else:
+                    # Check for disallowed component-graph IDs (Invariant I8)
+                    if v.startswith("comp_"):
+                        raise GroundingError(
+                            f"Invariant I8 Violation: Component-graph id {v!r} is not a valid trajectory target"
+                        )
+                    grounded_args[k] = v
+            else:
+                grounded_args[k] = v
+
+        # Parse expected atomic propositions
+        raw_props = step_dict.get("expected_propositions", [])
+        parsed_props: list[AtomicProposition] = []
+        for p in raw_props:
+            if isinstance(p, dict):
+                fam = p.get("family", "metric_sign")
+                subj = p.get("subject_id", "")
+                resolved_subj = planning_set.resolve_object_id(subj) or subj
+                pred = p.get("predicate", p.get("metric", "delta"))
+                val = p.get("value", p.get("sign", None))
+                sec = p.get("secondary_id")
+                if sec:
+                    sec = planning_set.resolve_object_id(sec) or sec
+                try:
+                    parsed_props.append(
+                        AtomicProposition(
+                            family=fam,
+                            subject_id=resolved_subj,
+                            predicate=pred,
+                            value=val,
+                            secondary_id=sec,
+                        )
+                    )
+                except ValueError:
+                    pass
+
+        return GroundedStep(
+            step_id=step_id,
+            dsl_function=fn_name,
+            arguments=grounded_args,
+            expected_propositions=PropositionSet.from_iterable(parsed_props),
+            abort_if=abort_if,
+        )

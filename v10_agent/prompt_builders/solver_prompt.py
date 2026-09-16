@@ -1,135 +1,443 @@
+"""Solver Prompt Builder (Call 3 Family).
+
+Constructs prompts strictly quarantined from Python source code, syntax errors, and tracebacks.
 """
-Solver Prompt Builder - ISO-3 Compliant (Solver never sees Python source)
-Ref: Engineering Specification V10.0 Section 8.3
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from v10_agent.memory_contours import EpistemicMemory
+from v10_agent.planning_set import PlanningSet
+
+SOLVER_SYSTEM_PROMPT = """\
+You are an expert puzzle solver for 2D grid environments.
+Think step by step and perform thorough geometric, topological, and invariant analysis of the visual grid and object affordances before proposing trajectories.
+Given the current state, available DSL functions, and past failed attempts, your task is to deduce the underlying geometric/topological invariants and propose solution trajectories.
+
+RULES:
+1. Base your reasoning ONLY on the provided empirical facts, object relations, and past trial feedback.
+2. All object arguments MUST strictly use IDs from the provided `planning_objects`. Do not invent IDs.
+3. Check `past_failed_sequences` and `structured_failures`. DO NOT repeat them. Formulate alternative hypotheses.
+4. Respect grid boundaries and object freedom of motion limits.
+5. Provide up to 3 distinct candidate trajectories.
+
+TERNARY EVALUATION SEMANTICS:
+Your trajectories will be evaluated step-by-step using Brusentsov ternary logic:
+- TRUE (FOLLOW): Step achieved expected physical effect -> trajectory continues.
+- IRRELEVANT (OMIT): No contradiction, but expected effect not observed -> trajectory paused.
+- FALSE (NULL): Physical contradiction detected (wall, collision, boundary blockage) -> trajectory permanently terminated.
+
+Design trajectories that minimize FALSE outcomes. Prefer safe, incremental steps.
+
+OUTPUT FORMAT:
+You must structure your response using the following XML tags:
+
+<invariant_analysis>
+1. What is the likely goal of this level? (Cover targets / reach position / sort / align / ...)
+2. Which confirmed invariants apply here? (list from game model)
+3. What is NEW or DIFFERENT about this level vs previous ones?
+4. Strategy for this level:
+</invariant_analysis>
+
+<trajectory_1>
+[Sequence of DSL function calls, e.g.:
+ action1() EXPECT: dy=-3, dx=0
+ action6(x=5, y=10)
+ action2()
+Optional `EXPECT: prop=val` clauses allow the Brusentsov judge to verify step consequences.]
+</trajectory_1>
+
+<trajectory_2>
+[Alternative sequence of DSL function calls]
+</trajectory_2>
+
+<trajectory_3>
+[Optional third sequence]
+</trajectory_3>
 """
 
-from typing import Dict, Any, List, Optional
-from ..types import BrusentsovJudgment, BranchSignature
+
+def _build_phase_instruction(level_index: int, total_levels: int = 6) -> str:
+    """Build progressive strategic instructions adapting to game learning phases."""
+    if level_index <= 1:
+        return (
+            "CURRENT PHASE: EXPLORATION PHASE (Level index <= 1)\n"
+            "This is an early level. The game mechanics are not yet confirmed.\n"
+            "Prioritize SHORT diverse trajectories to test hypotheses. "
+            "Try different actions and directions to discover the fundamental rules."
+        )
+    elif level_index <= 3:
+        return (
+            "CURRENT PHASE: CONFIRMATION PHASE (Level index 2-3)\n"
+            "You have partial knowledge of this game's mechanics.\n"
+            "Apply confirmed invariants. Use shorter, more targeted trajectories. "
+            "If a confirmed pattern doesn't work, flag it as potentially falsified."
+        )
+    else:
+        return (
+            "CURRENT PHASE: EXPLOITATION PHASE (Level index >= 4)\n"
+            "The game model is mostly confirmed.\n"
+            "Execute optimal trajectories based on confirmed invariants. "
+            "Minimize unnecessary exploration. Trust confirmed physics."
+        )
 
 
-def build_solver_prompt(
-    function_manifest: Dict[str, Any],
-    epistemic_summary: Optional[Dict[str, Any]] = None,
-    live_omit_branches: Optional[List[BranchSignature]] = None,
-    severed_null_signatures: Optional[List[BranchSignature]] = None,
-) -> str:
-    """
-    Build prompt for Solver Agent.
-    
-    ISO-3 INVARIANT: This prompt MUST explicitly state that Solver never sees Python source.
-    Solver only sees: JSON Function Manifest, docstrings, and EpistemicMemory summary.
-    
-    Args:
-        function_manifest: JSON Function Manifest with DSL functions (Ref: Spec 3.4)
-        epistemic_summary: Summary of previous Brusentsov judgments (Ref: Spec 3.5.3)
-        live_omit_branches: Branches marked as OMIT (can be continued) (Ref: Spec 5.2)
-        severed_null_signatures: Branches marked as NULL (contradicted, severed) (Ref: Spec 5.2)
-    
-    Returns:
-        Formatted prompt string for vLLM/Qwen model
-    """
-    prompt_parts = [
-        "=" * 60,
-        "ARC-AGI-3 SOLVER AGENT - TRAJECTORY PLANNING",
-        "=" * 60,
-        "",
-        "CRITICAL CONSTRAINT: You never see Python source code.",
-        "You only see function manifests (JSON) and their docstrings.",
-        "Your task is to compose function calls into trajectory candidates.",
-        "",
-        "-" * 60,
-        "FUNCTION MANIFEST (Available DSL Functions)",
-        "-" * 60,
-        "Use these functions to build action sequences:",
-        "",
-    ]
-    
-    for func_name, func_info in function_manifest.get("functions", {}).items():
-        prompt_parts.append(f"Function: {func_name}")
-        prompt_parts.append(f"  Signature: {func_info.get('signature', 'unknown')}")
-        prompt_parts.append(f"  Description: {func_info.get('docstring', 'No description')}")
-        prompt_parts.append(f"  Parameters: {func_info.get('parameters', {})}")
-        prompt_parts.append(f"  Returns: {func_info.get('return_type', 'unknown')}")
-        prompt_parts.append("")
-    
-    if epistemic_summary:
-        prompt_parts.extend([
-            "-" * 60,
-            "EPISTEMIC MEMORY SUMMARY",
-            "-" * 60,
-            f"Total Judgments: {epistemic_summary.get('total_judgments', 0)}",
-            f"FOLLOW Count: {epistemic_summary.get('follow_count', 0)}",
-            f"NULL Count: {epistemic_summary.get('null_count', 0)}",
-            f"OMIT Count: {epistemic_summary.get('omit_count', 0)}",
-            "",
-        ])
-    
-    if live_omit_branches:
-        prompt_parts.extend([
-            "-" * 60,
-            f"LIVE OMIT BRANCHES ({len(live_omit_branches)} active)",
-            "-" * 60,
-            "These branches had missing effects but no contradictions.",
-            "Consider continuing or completing these trajectories:",
-            "",
-        ])
-        for branch in live_omit_branches[:5]:  # Limit to first 5
-            prompt_parts.append(f"- Branch {branch.branch_id}: signature={branch.signature_hash[:16]}...")
-        
-        if len(live_omit_branches) > 5:
-            prompt_parts.append(f"... and {len(live_omit_branches) - 5} more")
-    
-    if severed_null_signatures:
-        prompt_parts.extend([
-            "",
-            "-" * 60,
-            f"SEVERED NULL BRANCHES ({len(severed_null_signatures)} contradicted)",
-            "-" * 60,
-            "DO NOT use these branch signatures - they led to contradictions:",
-            "",
-        ])
-        for sig in severed_null_signatures[:5]:
-            prompt_parts.append(f"- {sig.signature_hash[:32]}...")
-        
-        if len(severed_null_signatures) > 5:
-            prompt_parts.append(f"... and {len(severed_null_signatures) - 5} more")
-    
-    prompt_parts.extend([
-        "",
-        "-" * 60,
-        "INSTRUCTIONS",
-        "-" * 60,
-        "1. Compose function calls from the manifest into trajectory candidates.",
-        "2. Each candidate should be a sequence of 1-6 function calls (Ref: Spec 2.1).",
-        "3. Prioritize branches that extend live OMIT trajectories.",
-        "4. Avoid any function call sequences that match severed NULL signatures.",
-        "5. Return JSON with format:",
-        '   {"candidates": [{"steps": [{"function": "name", "args": {...}}], "confidence": float}]}',
-        "",
-        "REMINDER: You never see Python source. Work only with function manifests.",
-        "=" * 60,
-    ])
-    
-    return "\n".join(prompt_parts)
+def build_solver_prompts(
+    manifest: dict[str, Any],
+    planning_set: PlanningSet,
+    epistemic_memory: EpistemicMemory | None = None,
+    action_budget: int = 50,
+    game_memory: Any | None = None,
+    has_image: bool = True,
+    level_index: int | None = None,
+) -> tuple[str, str]:
+    """Construct (system_prompt, user_prompt) for the Solver Agent."""
+    functions_summary = manifest.get("functions", [])
+    grid_h, grid_w = planning_set.grid_dims
 
+    # Determine step unit size from confirmed action effects (e.g. dy=3, dx=0 -> 3 pixels per step)
+    step_size_pixels = 1
+    if game_memory is not None and getattr(game_memory, "confirmed_action_effects", None):
+        import re
+        for eff in game_memory.confirmed_action_effects.values():
+            nums = [abs(int(x)) for x in re.findall(r'd[yx]=([+-]?\d+)', eff)]
+            max_num = max(nums) if nums else 0
+            if max_num > 0:
+                step_size_pixels = max_num
+                break
 
-def validate_no_python_source_in_manifest(function_manifest: Dict[str, Any]) -> None:
-    """
-    Validate that function manifest contains no Python source code.
-    
-    Ref: Spec 1.4 ISO-3 Invariant
-    
-    Note: This checks for actual Python code keywords in values, not in 
-    signature strings like "func(x, y)" which contain ':' but are not source code.
-    """
-    # Only check for multi-line Python code blocks or actual statements
-    # Signature strings like "func(x, y)" containing ':' are OK
-    python_code_indicators = ["def ", "\nimport ", "\nclass ", "\nreturn ", "lambda ", ":\\n"]
-    
-    manifest_str = str(function_manifest)
-    for indicator in python_code_indicators:
-        if indicator in manifest_str:
-            raise ValueError(
-                f"ISO-3 VIOLATION: Python source indicator '{indicator}' detected in manifest. "
-                "Solver must never see Python source code."
-            )
+    confirmed_actors = getattr(game_memory, "confirmed_actors", set()) if game_memory else set()
+
+    def salience_key(o: Any) -> tuple[int, int, int]:
+        is_actor = 0 if (confirmed_actors and o.id in confirmed_actors) else 1
+        # Substantive objects (area >= 4) first, then small components (area > 1), then single pixels
+        sub_tier = 0 if o.area >= 4 else (1 if o.area > 1 else 2)
+        return (is_actor, sub_tier, -o.area)
+
+    mid_r = grid_h / 2.0
+    mid_c = grid_w / 2.0
+    # Aggregate small marker dots (area <= 2) that share the same color into composite indicator groups
+    small_dots_by_color: dict[int, list[Any]] = {}
+    substantive_objects: list[Any] = []
+    for obj in planning_set.objects:
+        if obj.area <= 2 and (not confirmed_actors or obj.id not in confirmed_actors):
+            small_dots_by_color.setdefault(obj.color, []).append(obj)
+        else:
+            substantive_objects.append(obj)
+
+    aggregated_marker_groups: list[dict[str, Any]] = []
+    for c, dots in small_dots_by_color.items():
+        if len(dots) >= 4:
+            min_r = min(d.bbox.min_row for d in dots)
+            max_r = max(d.bbox.max_row for d in dots)
+            min_c = min(d.bbox.min_col for d in dots)
+            max_c = max(d.bbox.max_col for d in dots)
+            aggregated_marker_groups.append({
+                "id": f"marker_group_color_{c}",
+                "alias": f"marker_dots_c{c}",
+                "role": "indicator_marker_pattern",
+                "color": c,
+                "dot_count": len(dots),
+                "bounding_extent": {"min_row": min_r, "max_row": max_r, "min_col": min_c, "max_col": max_c},
+                "sample_positions": [(d.centroid.row, d.centroid.col) for d in dots[:8]],
+                "description": f"Group of {len(dots)} marker dots (color {c}) functioning as active indicators or visual focus markers.",
+            })
+        else:
+            substantive_objects.extend(dots)
+
+    quads: dict[str, list[Any]] = {"TL": [], "TR": [], "BL": [], "BR": []}
+    for obj in substantive_objects:
+        qr = "T" if obj.centroid.row < mid_r else "B"
+        qc = "L" if obj.centroid.col < mid_c else "R"
+        quads[qr + qc].append(obj)
+
+    sorted_objs: list[Any] = []
+    # Confirmed actors and largest objects first (up to 16 substantive objects)
+    for obj in sorted(substantive_objects, key=salience_key)[:16]:
+        if obj not in sorted_objs:
+            sorted_objs.append(obj)
+    # Representative objects from each quadrant
+    for q_objs in quads.values():
+        for obj in sorted(q_objs, key=salience_key)[:10]:
+            if obj not in sorted_objs:
+                sorted_objs.append(obj)
+    objects_summary: list[dict[str, Any]] = []
+    # Include aggregated marker groups first as context notes
+    for mg in aggregated_marker_groups:
+        objects_summary.append(mg)
+
+    ascii_assigned = 0
+    for rank, obj in enumerate(sorted_objs):
+        d: dict[str, Any] = {
+            "id": obj.id,
+            "alias": planning_set.object_real_to_alias.get(obj.id, obj.id),
+            "role": getattr(obj, "role", "generic_entity"),
+            "color": obj.color,
+            "area": obj.area,
+            "width": obj.width,
+            "height": obj.height,
+            "shape_type": getattr(obj, "shape_type", "compound_shape"),
+            "shape_signature": getattr(obj, "shape_signature", ""),
+            "bbox": obj.bbox.to_dict(),
+            "centroid": obj.centroid.to_dict(),
+        }
+        if getattr(obj, "normalized_centroid", None) and obj.normalized_centroid != (0.0, 0.0):
+            d["normalized_centroid"] = {
+                "row": obj.normalized_centroid[0],
+                "col": obj.normalized_centroid[1],
+            }
+        if getattr(obj, "chiral_features", None):
+            d["chiral_features"] = dict(obj.chiral_features)
+        if getattr(obj, "multi_dir_relative", None):
+            d["directional_projections"] = dict(obj.multi_dir_relative)
+
+        if grid_h > 0 and grid_w > 0:
+            up_px = obj.bbox.min_row
+            down_px = max(0, (grid_h - 1) - obj.bbox.max_row)
+            left_px = obj.bbox.min_col
+            right_px = max(0, (grid_w - 1) - obj.bbox.max_col)
+            d["freedom_of_motion"] = {
+                "boundary_distance_only": {
+                    "up_to_border": up_px // step_size_pixels,
+                    "down_to_border": down_px // step_size_pixels,
+                    "left_to_border": left_px // step_size_pixels,
+                    "right_to_border": right_px // step_size_pixels,
+                },
+                "step_size_pixels": step_size_pixels,
+                "WARNING": (
+                    "These are distances to GRID EDGES only. Internal walls and obstacles "
+                    "WILL block motion earlier. Actual free steps are likely FEWER."
+                ),
+            }
+        # Only include ASCII art for top 12 substantive objects (area > 1), strictly excluding single pixels
+        if ascii_assigned < 12 and getattr(obj, "area", 0) > 1 and getattr(obj, "compact_ascii", None):
+            d["compact_ascii"] = list(obj.compact_ascii)
+            ascii_assigned += 1
+        objects_summary.append(d)
+
+    def relation_priority(r: Any) -> tuple[int, int, float]:
+        sub = planning_set.get_object(r.subject_id)
+        tgt = planning_set.get_object(r.target_id)
+        sub_area = sub.area if sub else 0
+        tgt_area = tgt.area if tgt else 0
+
+        # Tier 0: Both substantive objects (area >= 4)
+        # Tier 1: One substantive object (area >= 4)
+        # Tier 2: Minor / noise objects
+        if sub_area >= 4 and tgt_area >= 4:
+            tier = 0
+        elif sub_area >= 4 or tgt_area >= 4:
+            tier = 1
+        else:
+            tier = 2
+
+        type_weights = {
+            "identical_shape": 0,
+            "chiral_mirror_h": 1,
+            "chiral_mirror_v": 1,
+            "symmetric_axis_of": 2,
+            "mirrored_across_axis": 2,
+            "target_is_below": 3,
+            "target_is_above": 3,
+            "target_is_to_the_right": 3,
+            "target_is_to_the_left": 3,
+            "contains": 4,
+            "touches": 5,
+            "aligned_v": 6,
+            "aligned_h": 6,
+            "distance": 7,
+        }
+        type_rank = type_weights.get(r.relation_type, 10)
+        dist = r.metric_value if r.metric_value is not None else 999.0
+        return (tier, type_rank, dist)
+
+    sorted_relations = sorted(planning_set.relations, key=relation_priority)
+    relations_summary: list[dict[str, Any]] = []
+    for rel in sorted_relations:
+        sub = planning_set.get_object(rel.subject_id)
+        tgt = planning_set.get_object(rel.target_id)
+        sub_area = sub.area if sub else 0
+        tgt_area = tgt.area if tgt else 0
+        sub_color = sub.color if sub else -1
+        tgt_color = tgt.color if tgt else -1
+
+        # Suppress directional navigation relations involving noise dots (area < 4) or background/hole pixels
+        if "target_is_" in rel.relation_type and (sub_area < 4 or tgt_area < 4 or sub_color == 0 or tgt_color == 0):
+            continue
+
+        r_dict = rel.to_dict()
+        if "target_is_" in rel.relation_type and rel.metric_value is not None:
+            r_dict["steps_required"] = max(1, round(rel.metric_value / step_size_pixels))
+        relations_summary.append(r_dict)
+        if len(relations_summary) >= 50:
+            break
+
+    confirmed_effective = []
+    interactive_coords: set[tuple[int, int]] = set()
+    non_interactive_coords: set[tuple[int, int]] = set()
+    if epistemic_memory:
+        for j in epistemic_memory.judgments:
+            v = getattr(j, "ternary_verdict", None)
+            v_val = getattr(v, "value", str(v)) if v is not None else ""
+            act = getattr(j, "action_dict", {}) or {}
+            data = act.get("data", {}) if isinstance(act, dict) else {}
+            if "x" in data and "y" in data:
+                try:
+                    coord = (int(data["x"]), int(data["y"]))
+                    if "TRUE" in v_val or "FOLLOW" in v_val or getattr(j, "is_effective", False):
+                        interactive_coords.add(coord)
+                    elif "IRRELEVANT" in v_val or "OMIT" in v_val:
+                        non_interactive_coords.add(coord)
+                except (ValueError, TypeError):
+                    pass
+            if "TRUE" in v_val or "FOLLOW" in v_val or getattr(j, "is_effective", False):
+                confirmed_effective.append(j.to_dict())
+
+    trial_summary: dict[str, Any] = {
+        "failed_action_sequences": list(epistemic_memory.severed_null_signatures) if epistemic_memory else [],
+        "partially_effective_sequences": [b.signature_id for b in (epistemic_memory.live_omit_branches if epistemic_memory else [])],
+        "recent_action_outcomes": [j.to_dict() for j in (epistemic_memory.judgments[-10:] if epistemic_memory else [])],
+    }
+    if confirmed_effective:
+        trial_summary["actions_with_observed_effects"] = confirmed_effective[-10:]
+
+    if epistemic_memory is not None and hasattr(epistemic_memory, "format_scratchpad_context"):
+        scratchpad_text = epistemic_memory.format_scratchpad_context()
+        if scratchpad_text:
+            trial_summary["current_level_scratchpad"] = scratchpad_text
+
+    failed_seqs = list(epistemic_memory.severed_null_signatures) if epistemic_memory else []
+    if epistemic_memory and getattr(epistemic_memory, "current_level_attempts", None):
+        for att in epistemic_memory.current_level_attempts:
+            traj = att.get("trajectory")
+            if traj and traj not in failed_seqs:
+                failed_seqs.append(traj)
+
+    user_payload: dict[str, Any] = {
+        "grid_hash": planning_set.grid_hash,
+        "grid_bounds": {
+            "height": grid_h,
+            "width": grid_w,
+        },
+        "available_dsl_functions": functions_summary,
+        "planning_objects": objects_summary,
+        "spatial_relations": relations_summary,
+        "past_failed_sequences": failed_seqs,
+    }
+
+    if trial_summary.get("current_level_scratchpad"):
+        user_payload["current_level_scratchpad"] = trial_summary["current_level_scratchpad"]
+    if trial_summary.get("actions_with_observed_effects"):
+        user_payload["actions_with_observed_effects"] = trial_summary["actions_with_observed_effects"]
+    if trial_summary.get("recent_action_outcomes"):
+        user_payload["recent_action_outcomes"] = trial_summary["recent_action_outcomes"]
+
+    if epistemic_memory is not None and hasattr(epistemic_memory, "format_structured_failures"):
+        struct_failures = epistemic_memory.format_structured_failures()
+        if struct_failures:
+            trial_summary["structured_failures"] = struct_failures[-10:]
+            user_payload["structured_failures"] = struct_failures[-10:]
+
+    confirmed_effects = getattr(game_memory, "confirmed_action_effects", {}) if game_memory else {}
+    unconfirmed_actions = getattr(game_memory, "unconfirmed_actions", {}) if game_memory else {}
+    if action_budget > 0:
+        user_payload["remaining_action_budget"] = action_budget
+    if confirmed_effects:
+        user_payload["confirmed_active_actions"] = confirmed_effects
+    if unconfirmed_actions:
+        user_payload["inactive_or_unconfirmed_actions"] = unconfirmed_actions
+    if confirmed_actors:
+        user_payload["verified_controllable_actors"] = sorted(list(confirmed_actors))
+
+    has_coord_fn = any(
+        p.get("name") in ("x", "y", "row", "col", "r", "c", "column")
+        for fn in functions_summary
+        for p in fn.get("parameters", [])
+    )
+    # Suppress coordinate affordances unless spatial actions are confirmed effective
+    coord_is_confirmed = "ACTION6" in confirmed_effects
+    if has_coord_fn and coord_is_confirmed and getattr(planning_set, "coordinate_candidates", None):
+        user_payload["salient_coordinate_affordances"] = [
+            {"x": c.x, "y": c.y, "label": c.label, "source": c.source_type}
+            for c in planning_set.coordinate_candidates[:36]
+        ]
+
+    if game_memory is not None:
+        if hasattr(game_memory, "format_empirical_context"):
+            emp_ctx = game_memory.format_empirical_context()
+        else:
+            emp_ctx = getattr(game_memory, "confirmed_action_effects", {})
+        if emp_ctx:
+            user_payload["empirical_game_rules_confirmed"] = emp_ctx
+        if hasattr(game_memory, "format_curriculum_context"):
+            curr_ctx = game_memory.format_curriculum_context()
+            if curr_ctx:
+                user_payload["curriculum_progression_from_won_levels"] = curr_ctx
+        if hasattr(game_memory, "format_game_model_summary"):
+            model_summary = game_memory.format_game_model_summary()
+            if model_summary and "confirmed: 0, pending: 0, falsified: 0" not in model_summary:
+                user_payload["confirmed_game_model"] = model_summary
+
+    def format_fn_call_example(fn_meta: dict[str, Any]) -> str:
+        name = fn_meta.get("name", "action1")
+        params = [p for p in fn_meta.get("parameters", []) if p.get("name") != "api"]
+        if not params:
+            return f"{name}()"
+        p_strs = []
+        for p in params:
+            p_name = p.get("name", "x")
+            if p_name == "x":
+                p_strs.append("x=10")
+            elif p_name == "y":
+                p_strs.append("y=10")
+            else:
+                p_strs.append(f"{p_name}=0")
+        return f"{name}({', '.join(p_strs)})"
+
+    fn_0_ex = format_fn_call_example(functions_summary[0]) if len(functions_summary) > 0 else "action1()"
+    fn_1_ex = format_fn_call_example(functions_summary[1]) if len(functions_summary) > 1 else fn_0_ex
+
+    image_note = (
+        "solver_raw_frame.png is the exact same frame as solver_annotated_frame.png, but without object annotations.\n\n"
+        if has_image
+        else ""
+    )
+
+    user_text = f"""\
+{image_note}Current Problem State & Available DSL Functions:
+{json.dumps(user_payload, indent=2)}
+
+Formulate 1 to 3 candidate trajectories using the available DSL functions.
+Provide your response using XML tags:
+
+<invariant_analysis>
+1. Likely level goal: ...
+2. Applicable confirmed invariants: ...
+3. What is new/different: ...
+4. Strategy for this level: ...
+</invariant_analysis>
+
+<trajectory_1>
+1. {fn_0_ex}
+2. {fn_0_ex}
+</trajectory_1>
+
+<trajectory_2>
+1. {fn_1_ex}
+2. {fn_0_ex}
+</trajectory_2>
+"""
+
+    effective_level_index = level_index if level_index is not None else getattr(game_memory, "completed_levels", 0)
+    phase_instruction = _build_phase_instruction(effective_level_index)
+    sys_prompt = f"{SOLVER_SYSTEM_PROMPT}\n\n{phase_instruction}"
+    if unconfirmed_actions:
+        sys_prompt += (
+            "\n\n# STRICT PROHIBITION ON INACTIVE OR UNCONFIRMED ACTIONS\n"
+            "Do not propose actions or DSL functions corresponding to inactive or unconfirmed actions."
+        )
+
+    return sys_prompt, user_text
+

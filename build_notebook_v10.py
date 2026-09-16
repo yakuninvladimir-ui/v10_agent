@@ -1,478 +1,487 @@
-#!/usr/bin/env python3
-"""
-Build script for ARC-AGI-3 LCLD Agent Version 10.0 Kaggle Notebook.
-Generates:
-  1. arc-prize-2026-lcld-v10.ipynb
-  2. kernel-metadata.json
+"""Autonomous notebook builder packaging ARC-AGI-3 LCLD Agent V10.0 for Kaggle submission."""
 
-This script constructs a clean, modern notebook based on V10 architecture,
-avoiding legacy code from V9 while adhering to Kaggle's submission requirements.
-"""
+from __future__ import annotations
 
+import base64
+import io
 import json
 import os
-from pathlib import Path
-
-# --- Configuration ---
-NOTEBOOK_TITLE = "ARC-AGI-3 LCLD Agent V10.0 (Qwen 3.8B + Brusentsov Logic)"
-NOTEBOOK_FILE = "arc-prize-2026-lcld-v10.ipynb"
-METADATA_FILE = "kernel-metadata.json"
-AGENT_PACKAGE_DIR = "v10_agent"
-
-# Kaggle Dataset Dependencies
-DATASETS = [
-    "driessmit1/arc3-vllm-h100-wheelhouse-v3",
-    # Add model dataset if hosted as a dataset, otherwise rely on model path in code
-    # "foysalemonshanto/qwen3-8-27b-fp8-repacked-v1" 
-]
-
-# Model Configuration (Matches V10 Spec)
-MODEL_PATH = "/kaggle/input/qwen3-8b-fp8-repacked" # Adjust based on actual model dataset mount point
-WHEELHOUSE_PATH = "/kaggle/input/arc3-vllm-h100-wheelhouse-v3"
-
-def create_kernel_metadata() -> dict:
-    """Generates kernel-metadata.json content."""
-    return {
-        "id": f"yakuninvladimirui/{NOTEBOOK_FILE.replace('.ipynb', '')}",
-        "title": NOTEBOOK_TITLE,
-        "code_file": NOTEBOOK_FILE,
-        "language": "python",
-        "kernel_type": "notebook",
-        "is_private": True,  # Start private for testing
-        "enable_gpu": True,
-        "dataset_sources": DATASETS,
-        "model_sources": [], # If using specific model datasets, add here
-        "internet_enabled": False,  # Strict offline for competition
-        "docker_image": "ghcr.io/kaggle/kaggle-python:latest", # Or specific version
-        "accelerator": "GPU_T4x2" # T4 x2 is standard free tier, H100/P100 if available
-    }
-
-def create_setup_cell() -> dict:
-    """Cell 1: Environment Setup, Dependency Installation, and Preflight."""
-    source_code = f'''# ==============================================================================
-# CELL 1: ENVIRONMENT SETUP & PREFLIGHT (V10.0)
-# ==============================================================================
-# This cell prepares the Kaggle environment, installs vLLM from wheelhouse,
-# validates the GPU, and runs structural preflight checks before any logic runs.
-
-import os
+import pathlib
+import py_compile
 import sys
-import subprocess
-import time
-import json
-import shutil
-from pathlib import Path
+import zipfile
+from typing import Any
 
-print(">>> Initializing ARC-AGI-3 LCLD Agent V10.0 Environment...")
+# =============================================================================
+# BUILDER TOGGLE: Phase A Heavy Combat Smoke
+# Set to True for deep diagnostic logging in Phase A (Save Version log).
+# Set to False for lightning-fast submission without model warm-up in Phase A.
+# =============================================================================
+ENABLE_PHASE_A_HEAVY_SMOKE: bool = False
 
-# 1. Configure Paths
-WHEELHOUSE_PATH = "{WHEELHOUSE_PATH}"
-MODEL_PATH = "{MODEL_PATH}"
+ROOT_DIR = pathlib.Path(__file__).resolve().parent
+NOTEBOOKS_DIR = ROOT_DIR / "notebooks"
+OUTPUT_NOTEBOOK = NOTEBOOKS_DIR / "arc-prize-2026-lcld-qwen-v10.ipynb"
+KERNEL_METADATA_PATH = NOTEBOOKS_DIR / "kernel-metadata.json"
+MAX_NOTEBOOK_BYTES = 985_000
 
-# Add wheelhouse to sys.path for pip install
-if os.path.exists(WHEELHOUSE_PATH):
-    sys.path.insert(0, WHEELHOUSE_PATH)
-    os.environ["PIP_FIND_LINKS"] = WHEELHOUSE_PATH
-    os.environ["PIP_NO_INDEX"] = "true"
-    print(f"[OK] Wheelhouse found at: {{WHEELHOUSE_PATH}}")
-else:
-    raise FileNotFoundError(f"Wheelhouse not found at {{WHEELHOUSE_PATH}}. Check dataset attachment.")
 
-# 2. Install Dependencies from Wheelhouse
-# We install vLLM and dependencies strictly from the local wheelhouse
-packages_to_install = [
-    "vllm",
-    "torch",
-    "transformers",
-    "pydantic",
-    "numpy",
-    "pandas"
-]
+def collect_payload_files() -> dict[str, bytes]:
+    """Collect, compile-check, and read all runtime payload files."""
+    files: dict[str, bytes] = {}
 
-print(">>> Installing dependencies from local wheelhouse...")
-for pkg in packages_to_install:
-    try:
-        # Attempt to import first to check if already installed
-        __import__(pkg.replace("-", "_"))
-        print(f"  - {{pkg}}: Already loaded")
-    except ImportError:
-        cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-index", "--find-links", WHEELHOUSE_PATH, pkg]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print(f"  - {{pkg}}: Installed")
-        else:
-            # Some packages might be transitive dependencies, ignore errors if import works later
-            pass
+    root_files = [
+        "kaggle_agent.py",
+        "submission.py",
+        "lcld_competition_child.py",
+        "lcld_preflight.py",
+        "phase_a_heavy_smoke.py",
+    ]
+    for rf in root_files:
+        p = ROOT_DIR / rf
+        if not p.is_file():
+            raise FileNotFoundError(f"Missing required root payload file: {rf}")
+        py_compile.compile(str(p), doraise=True)
+        files[rf] = p.read_bytes()
 
-# Force reload of critical modules if needed
-import importlib
+    v10_dir = ROOT_DIR / "v10_agent"
+    for py_file in v10_dir.rglob("*.py"):
+        # Exclude tests and pycache
+        rel = py_file.relative_to(ROOT_DIR)
+        parts = rel.parts
+        if "tests" in parts or "__pycache__" in parts:
+            continue
+        py_compile.compile(str(py_file), doraise=True)
+        files[str(rel).replace("\\", "/")] = py_file.read_bytes()
 
-# 3. Set Environment Variables for vLLM and Offline Mode
-os.environ["VLLM_NO_USAGE_STATS"] = "1"
-os.environ["HF_HOME"] = "/kaggle/working/hf_cache"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-os.makedirs("/kaggle/working/hf_cache", exist_ok=True)
+    return files
 
-# 4. Validate Accelerator (GPU Check)
-print(">>> Validating Accelerator...")
-try:
-    result = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], 
-                            capture_output=True, text=True, check=True)
-    gpus = result.stdout.strip().split("\\n")
-    print(f"[OK] Detected GPUs:")
-    for gpu in gpus:
-        print(f"      - {{gpu}}")
-except Exception as e:
-    print(f"[ERROR] GPU Validation Failed: {{e}}")
-    raise RuntimeError("No GPU detected or nvidia-smi failed. Cannot proceed without GPU.")
 
-# 5. Add Agent Package to Path
-AGENT_ROOT = "/kaggle/working"
-if AGENT_ROOT not in sys.path:
-    sys.path.insert(0, AGENT_ROOT)
-    print(f"[OK] Added {{AGENT_ROOT}} to sys.path")
+def build_lzma_payload(files: dict[str, bytes]) -> str:
+    """Pack files into LZMA-compressed zip archive and return base64 string."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_LZMA) as zf:
+        for archive_name, content in sorted(files.items()):
+            zf.writestr(archive_name, content)
+    compressed_bytes = buf.getvalue()
+    b64_str = base64.b64encode(compressed_bytes).decode("ascii")
+    print(f"Compressed {len(files)} files: {len(compressed_bytes)} bytes LZMA -> {len(b64_str)} chars b64")
+    return b64_str
 
-# 6. Run Structural Preflight (Smoke Test)
-print(">>> Running Structural Preflight...")
-try:
-    from v10_agent.preflight import run_structural_preflight
-    from v10_agent.env_setup import validate_accelerator, setup_kaggle_paths
-    
-    # Run path setup
-    setup_kaggle_paths()
-    
-    # Run full preflight
-    preflight_result = run_structural_preflight()
-    print("[OK] Structural Preflight Passed:")
-    print(json.dumps(preflight_result, indent=2))
-    
-except Exception as e:
-    print(f"[CRITICAL] Preflight Failed: {{e}}")
-    import traceback
-    traceback.print_exc()
-    # In Phase A, we might want to continue to generate a dummy submission, 
-    # but for now, we halt to fix issues.
-    raise SystemExit("Preflight failed. Aborting.")
 
-print(">>> Environment Ready. Proceeding to Main Logic...")
-'''
+def make_code_cell(source: list[str], cell_id: str) -> dict[str, Any]:
     return {
         "cell_type": "code",
+        "id": cell_id,
         "execution_count": None,
-        "metadata": {"_kg_hide_input": False},
+        "metadata": {"trusted": True},
         "outputs": [],
-        "source": source_code.splitlines(keepends=True)
+        "source": source,
     }
 
-def create_imports_cell() -> dict:
-    """Cell 2: Imports."""
-    source_code = '''# ==============================================================================
-# CELL 2: IMPORTS (V10.0)
-# ==============================================================================
-# Import core components of the LCLD Agent V10.0
 
-from v10_agent.config import V10Config
-from v10_agent.session import GameSession
-from v10_agent.vllm_lifecycle import VLLMManager
-from v10_agent.kaggle_limits import get_competition_limits
-from v10_agent.types import PropositionSet, EffectDeclaration
-
-import pandas as pd
-import numpy as np
-import json
-import os
-import time
-import traceback
-
-print("[OK] All V10 modules imported successfully.")
-'''
+def make_markdown_cell(source: list[str], cell_id: str) -> dict[str, Any]:
     return {
-        "cell_type": "code",
-        "execution_count": None,
+        "cell_type": "markdown",
+        "id": cell_id,
         "metadata": {},
-        "outputs": [],
-        "source": source_code.splitlines(keepends=True)
+        "source": source,
     }
 
-def create_main_logic_cell() -> dict:
-    """Cell 3: Main Execution Logic (Phase A/B Handling)."""
-    source_code = '''# ==============================================================================
-# CELL 3: MAIN EXECUTION LOGIC (PHASE A vs PHASE B)
-# ==============================================================================
-# Handles the distinction between Dry Run (Phase A) and Competition (Phase B).
-# Manages vLLM lifecycle strictly.
 
-def run_phase_a_dry_run():
-    """
-    Phase A: Dry Run / Validation.
-    Goal: Prove the agent initializes, passes preflight, and can talk to vLLM.
-    Output: Detailed JSON logs to stdout, dummy submission.
-    """
-    print("="*60)
-    print("RUNNING PHASE A (DRY RUN)")
-    print("="*60)
-    
-    vllm_manager = None
-    try:
-        # 1. Initialize vLLM Manager
-        config = V10Config.from_env()
-        vllm_manager = VLLMManager(model_path=config.qwen_model_path, config=config)
-        
-        # 2. Start vLLM Server
-        print(">>> Starting vLLM Server...")
-        vllm_manager.start()
-        
-        # 3. Wait for Health
-        print(">>> Waiting for vLLM Health Check...")
-        if not vllm_manager.wait_for_health(timeout=300):
-            raise RuntimeError("vLLM failed to become healthy within timeout.")
-        print("[OK] vLLM Server is Healthy.")
-        
-        # 4. Smoke Test (Lightweight Inference)
-        print(">>> Running Smoke Test Inference...")
-        # Use a minimal prompt to test connectivity
-        test_prompt = "Respond with exactly this JSON: {\\"test\\": true}"
-        # Assuming VLLMManager has a method for raw generation or we use requests
-        # For V10, we assume a method `generate` exists or we access the session
-        # Here we simulate a direct call for the smoke test
-        response = vllm_manager.generate(prompt=test_prompt, max_tokens=10, temperature=0)
-        print(f"Smoke Test Response: {{response}}")
-        
-        # 5. Log Tail (Critical for Phase A debugging)
-        log_tail = vllm_manager.get_bounded_log_tail(bytes_limit=12000)
-        print(">>> vLLM Log Tail (Last 12KB):")
-        print(log_tail)
-        
-        print("[SUCCESS] Phase A Dry Run Completed Successfully.")
-        return True
-        
-    except Exception as e:
-        print(f"[FAILURE] Phase A Dry Run Failed: {{e}}")
-        traceback.print_exc()
-        return False
-    finally:
-        if vllm_manager:
-            print(">>> Stopping vLLM Server...")
-            vllm_manager.stop()
+def generate_notebook() -> pathlib.Path:
+    """Generate the complete Kaggle submission notebook."""
+    NOTEBOOKS_DIR.mkdir(parents=True, exist_ok=True)
+    payload_files = collect_payload_files()
+    payload_b64 = build_lzma_payload(payload_files)
 
-def run_phase_b_competition(tasks_df):
-    """
-    Phase B: Actual Competition Run.
-    Goal: Solve tasks, respect limits, generate valid submission.
-    """
-    print("="*60)
-    print("RUNNING PHASE B (COMPETITION)")
-    print("="*60)
-    
-    config = V10Config.from_env()
-    limits = get_competition_limits()
-    vllm_manager = None
-    all_predictions = []
-    
-    try:
-        # 1. Start vLLM
-        vllm_manager = VLLMManager(model_path=config.qwen_model_path, config=config)
-        vllm_manager.start()
-        if not vllm_manager.wait_for_health(timeout=600):
-            raise RuntimeError("vLLM failed to start.")
-        print("[OK] vLLM Ready for Competition.")
-        
-        # 2. Iterate over tasks
-        # tasks_df expected columns: 'task_id', 'train', 'test' (JSON strings)
-        for idx, row in tasks_df.iterrows():
-            task_id = row['task_id']
-            print(f"\\n>>> Processing Task: {{task_id}} ({{idx+1}}/{{len(tasks_df)}})")
-            
-            # Check global time limit
-            if time.time() > start_time + limits.competition_wall_clock_seconds:
-                print("[WARNING] Global time limit reached. Stopping.")
-                break
-            
-            try:
-                # Initialize Session for this task
-                # Note: GameSession handles internal retries and memory contours
-                session = GameSession(config=config, vllm_manager=vllm_manager)
-                
-                # Parse task data (simplified for notebook snippet)
-                # In real implementation, parse train/test pairs properly
-                # Here we assume a method `solve_task` exists in GameSession or similar
-                # For V10, we iterate test pairs
-                
-                # Placeholder for actual solving loop
-                # predictions = session.solve_task(task_data=row) 
-                # all_predictions.extend(predictions)
-                
-                # DUMMY PREDICTION FOR STRUCTURE (Replace with real logic)
-                # The real logic involves: session.act(obs) -> ... -> prediction
-                print(f"  [INFO] Logic placeholder for {{task_id}}. Real solver integrated in GameSession.")
-                
-            except Exception as e:
-                print(f"[ERROR] Failed task {{task_id}}: {{e}}")
-                traceback.print_exc()
-                # Continue to next task on error
-                
-    except Exception as e:
-        print(f"[CRITICAL] Competition Run Failed: {{e}}")
-        traceback.print_exc()
-    finally:
-        if vllm_manager:
-            vllm_manager.stop()
-            
-    return all_predictions
+    cells = [
+        make_markdown_cell([
+            "# ARC Prize 2026: ARC-AGI-3 LCLD Agent Version 10.0\n",
+            "\n",
+            "**Architecture**: Neuro-Symbolic Tri-Agent (Explorer, DSL Coder, Solver) with Brusentsov Ternary Logic,\n",
+            "Isolated Memory Contours (ISO-1..ISO-5), Deterministic ARGALite Perception, and Tufa Single-RESET Protection.\n",
+            "**Model**: Qwen 3.8 27B (`Qwen/Qwen3.8-27B`, `rahim3/qwen3-8-27b-bf16`) via vLLM with FlashAttention.\n",
+            f"**Configuration**: Concurrency=5, Reasoning=xhigh, Context=64K..131K, HeavySmoke={ENABLE_PHASE_A_HEAVY_SMOKE}.\n",
+        ], "a1b2c3d0"),
+        make_code_cell([
+            "# =============================================================================\n",
+            "# CELL 1: OFFLINE COMPETITION RUNTIME INSTALLATION\n",
+            "# =============================================================================\n",
+            "import subprocess, sys, os, pathlib\n",
+            "\n",
+            "os.environ.setdefault('MPLBACKEND', 'Agg')\n",
+            "os.environ['HF_HUB_OFFLINE'] = '1'\n",
+            "os.environ['TRANSFORMERS_OFFLINE'] = '1'\n",
+            "cuda_lib = '/usr/local/nvidia/lib64'\n",
+            "existing_lib = [e for e in os.environ.get('LIBRARY_PATH', '').split(os.pathsep) if e]\n",
+            "if os.path.isdir(cuda_lib) and cuda_lib not in existing_lib:\n",
+            "    os.environ['LIBRARY_PATH'] = os.pathsep.join([cuda_lib, *existing_lib])\n",
+            "\n",
+            "print('=== Installing ARC-AGI competition wheels ===', flush=True)\n",
+            "# Install competition runtime wheels (arc-agi, arcengine)\n",
+            "# Must be installed strictly from the competition directory with --no-deps\n",
+            "# to prevent overriding pre-installed Kaggle packages (such as Pillow).\n",
+            "candidate_comp_dirs = [\n",
+            "    '/kaggle/input/competitions/arc-prize-2026-arc-agi-3/arc_agi_3_wheels',\n",
+            "    '/kaggle/input/arc-prize-2026-arc-agi-3/arc_agi_3_wheels',\n",
+            "]\n",
+            "comp_dir = next((p for p in candidate_comp_dirs if os.path.isdir(p)), None)\n",
+            "if comp_dir:\n",
+            "    print(f'Found competition wheels directory: {comp_dir}', flush=True)\n",
+            "    for pkg in ['arcengine', 'arc-agi']:\n",
+            "        cmd = [sys.executable, '-m', 'pip', 'install', '--no-index', '--no-deps', f'--find-links={comp_dir}', pkg]\n",
+            "        res = subprocess.run(cmd, capture_output=True, text=True)\n",
+            "        if res.returncode == 0:\n",
+            "            print(f'[OK] Installed {pkg}', flush=True)\n",
+            "        else:\n",
+            "            print(f'Notice during {pkg} install: {res.stderr[-500:] if res.stderr else res.stdout[-500:]}', flush=True)\n",
+            "else:\n",
+            "    print('Notice: Competition wheels directory not found, assuming pre-installed.', flush=True)\n",
+            "\n",
+            "print('Environment initialization complete.', flush=True)\n",
+        ], "e5f6a7b1"),
+        make_code_cell([
+            "# =============================================================================\n",
+            "# CELL 2: UNPACK LCLD V10 AGENT PAYLOAD\n",
+            "# =============================================================================\n",
+            "import base64, io, zipfile, pathlib, sys\n",
+            "\n",
+            f"PAYLOAD_B64 = '{payload_b64}'\n",
+            "\n",
+            "DEPLOY_DIR = pathlib.Path('/tmp/arc_lcld_agent/Code')\n",
+            "DEPLOY_DIR.mkdir(parents=True, exist_ok=True)\n",
+            "\n",
+            "zip_data = base64.b64decode(PAYLOAD_B64)\n",
+            "with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:\n",
+            "    zf.extractall(DEPLOY_DIR)\n",
+            "\n",
+            "if str(DEPLOY_DIR) not in sys.path:\n",
+            "    sys.path.insert(0, str(DEPLOY_DIR))\n",
+            "\n",
+            "print(f'Successfully deployed {len(zip_data)} bytes to {DEPLOY_DIR}', flush=True)\n",
+        ], "c9d0e1f2"),
+        make_code_cell([
+            "# =============================================================================\n",
+            "# CELL 3: PHASE-A STRUCTURAL PREFLIGHT & SUBMISSION ARTIFACT ASSURANCE\n",
+            "# =============================================================================\n",
+            "import os, pathlib, json\n",
+            "import pandas as pd\n",
+            "import lcld_preflight\n",
+            "\n",
+            "# Run structural preflight test (deterministic offline verification)\n",
+            "lcld_preflight.run_preflight()\n",
+            "\n",
+            "# Ensure /kaggle/working/submission.parquet exists for Kaggle evaluator\n",
+            "working_root = pathlib.Path('/kaggle/working')\n",
+            "working_root.mkdir(parents=True, exist_ok=True)\n",
+            "submission_path = working_root / 'submission.parquet'\n",
+            "if not submission_path.exists():\n",
+            "    dummy_submission = pd.DataFrame(\n",
+            "        data=[['1_0', '1', True, 1]],\n",
+            "        columns=['row_id', 'game_id', 'end_of_game', 'score'],\n",
+            "    )\n",
+            "    dummy_submission.to_parquet(submission_path, index=False)\n",
+            "    print(f'Created required competition submission artifact at {submission_path}', flush=True)\n",
+            "\n",
+            "is_rerun = os.getenv('KAGGLE_IS_COMPETITION_RERUN', '').strip().lower() in ('1', 'true')\n",
+            "print(f'KAGGLE_IS_COMPETITION_RERUN = {is_rerun}', flush=True)\n",
+        ], "a3b4c5d3"),
+        make_code_cell([
+            "# =============================================================================\n",
+            "# CELL 4: PHASE-A HEAVY COMBAT SMOKE TEST (vLLM & QWEN-3.8-27B DIAGNOSTICS)\n",
+            "# =============================================================================\n",
+            f"ENABLE_PHASE_A_HEAVY_SMOKE = {ENABLE_PHASE_A_HEAVY_SMOKE}\n",
+            "import os, pathlib, json\n",
+            "import pandas as pd\n",
+            "\n",
+            "is_rerun = os.getenv('KAGGLE_IS_COMPETITION_RERUN', '').strip().lower() in ('1', 'true')\n",
+            "working_root = pathlib.Path('/kaggle/working')\n",
+            "submission_path = working_root / 'submission.parquet'\n",
+            "\n",
+            "if not is_rerun:\n",
+            "    if ENABLE_PHASE_A_HEAVY_SMOKE:\n",
+            "        print('=== Launching Phase-A Heavy Combat Smoke Diagnostics ===', flush=True)\n",
+            "        try:\n",
+            "            import phase_a_heavy_smoke\n",
+            "            smoke_summary = phase_a_heavy_smoke.run_phase_a_smoke_pipeline()\n",
+            "            print(f'Heavy smoke execution status: {smoke_summary.get(\"status\")}', flush=True)\n",
+            "        except Exception as exc:\n",
+            "            print(f'[HEAVY-SMOKE WARNING] Caught smoke exception: {exc}', flush=True)\n",
+            "    else:\n",
+            "        print('=== Phase-A Heavy Combat Smoke Disabled (ENABLE_PHASE_A_HEAVY_SMOKE=False) ===', flush=True)\n",
+            "\n",
+            "    # Always guarantee submission.parquet is written and verified\n",
+            "    if not submission_path.exists():\n",
+            "        dummy = pd.DataFrame(data=[['1_0', '1', True, 1]], columns=['row_id', 'game_id', 'end_of_game', 'score'])\n",
+            "        dummy.to_parquet(submission_path, index=False)\n",
+            "    print('=== LCLD PHASE A VALIDATION COMPLETE; SUBMISSION ARTIFACT READY ===', flush=True)\n",
+            "else:\n",
+            "    print('Phase A heavy smoke skipped: this execution is a Phase B competition rerun.', flush=True)\n",
+        ], "e7f8a9b4"),
+        make_code_cell([
+            "# =============================================================================\n",
+            "# CELL 5: PHASE-B GATEWAY & CONCURRENT GAMEPLAY EXECUTION (RERUN ONLY)\n",
+            "# =============================================================================\n",
+            "import os, sys, signal, time, pathlib, subprocess, json, urllib.request, urllib.error\n",
+            "import pandas as pd\n",
+            "\n",
+            "is_rerun = os.getenv('KAGGLE_IS_COMPETITION_RERUN', '').strip().lower() in ('1', 'true')\n",
+            "working_root = pathlib.Path('/kaggle/working')\n",
+            "submission_path = working_root / 'submission.parquet'\n",
+            "\n",
+            "if not is_rerun:\n",
+            "    print('=== Phase B competition execution skipped (Phase A commit/dry-run mode). ===', flush=True)\n",
+            "else:\n",
+            "    # --- Stdout/Stderr tee to file for log preservation (Fix #9) ---\n",
+            "    class _Tee:\n",
+            "        def __init__(self, *streams):\n",
+            "            self._streams = streams\n",
+            "        def write(self, data):\n",
+            "            n = 0\n",
+            "            for s in self._streams:\n",
+            "                try: n = s.write(data)\n",
+            "                except Exception: pass\n",
+            "            return n\n",
+            "        def flush(self):\n",
+            "            for s in self._streams:\n",
+            "                try: s.flush()\n",
+            "                except Exception: pass\n",
+            "        def isatty(self): return False\n",
+            "\n",
+            "    _phase_b_log = open(working_root / 'phase_b.log', 'w', buffering=1, encoding='utf-8')\n",
+            "    _orig_stdout, _orig_stderr = sys.stdout, sys.stderr\n",
+            "    sys.stdout = _Tee(_orig_stdout, _phase_b_log)\n",
+            "    sys.stderr = _Tee(_orig_stderr, _phase_b_log)\n",
+            "\n",
+            "    print('=================================================================', flush=True)\n",
+            "    print('=== STARTING PHASE B ISOLATED COMPETITION RUNTIME ===', flush=True)\n",
+            "    print('=================================================================', flush=True)\n",
+            "\n",
+            "    # 1. Setup arcade client environment and write .env\n",
+            "    base_url = 'http://gateway:8001'\n",
+            "    env_path = working_root / '.env'\n",
+            "    arcade_settings = {\n",
+            "        'SCHEME': 'http',\n",
+            "        'HOST': 'gateway',\n",
+            "        'PORT': '8001',\n",
+            "        'ARC_API_KEY': 'test-key-123',\n",
+            "        'ARC_API_BASE': base_url,\n",
+            "        'ARC_BASE_URL': base_url,\n",
+            "        'OPERATION_MODE': 'competition',\n",
+            "        'ENVIRONMENTS_DIR': '',\n",
+            "        'RECORDINGS_DIR': str(working_root / 'server_recording'),\n",
+            "        'LCLD_MAX_ACTIONS_PER_GAME': '500',\n",
+            "        'LCLD_MAX_ACTIONS_PER_LEVEL': '500',\n",
+            "        'LCLD_GAME_WALL_CLOCK_LIMIT_SECONDS': '5000',\n",
+            "        'LCLD_GAME_CONCURRENCY': '5',\n",
+            "        'LCLD_COMPETITION_WALL_CLOCK_LIMIT_SECONDS': '30600',\n",
+            "    }\n",
+            "    os.environ.update(arcade_settings)\n",
+            "    env_path.write_text('\\n'.join(f'{k}={v}' for k, v in arcade_settings.items()) + '\\n', encoding='utf-8')\n",
+            "    print(f'[Phase B] Written gateway configuration to {env_path}', flush=True)\n",
+            "\n",
+            "    # 2. Kill zombie vLLM processes from Phase A (Fix #5)\n",
+            "    import phase_a_heavy_smoke\n",
+            "    phase_a_heavy_smoke.stop_vllm_server()\n",
+            "    try:\n",
+            "        subprocess.run(['pkill', '-f', 'vllm.entrypoints'], capture_output=True, timeout=10)\n",
+            "    except Exception:\n",
+            "        pass\n",
+            "\n",
+            "    # 3. Install vLLM wheelhouse into /kaggle/working/vllm-site-packages\n",
+            "    wheelhouse = phase_a_heavy_smoke.find_wheelhouse_path()\n",
+            "    if not wheelhouse:\n",
+            "        raise FileNotFoundError('vLLM wheelhouse dataset not found in /kaggle/input')\n",
+            "    site_packages = phase_a_heavy_smoke.install_vllm_wheelhouse(wheelhouse)\n",
+            "\n",
+            "    # 4. Locate model weights\n",
+            "    model_path = phase_a_heavy_smoke.find_model_path()\n",
+            "    if not model_path:\n",
+            "        raise FileNotFoundError('Qwen-27B model weights not found in /kaggle/input')\n",
+            "\n",
+            "    # 5. Start vLLM server with logging\n",
+            "    ready = phase_a_heavy_smoke.start_vllm_server(model_path, site_packages)\n",
+            "    if not ready:\n",
+            "        print('=== vLLM SERVER LOG TAIL (Startup Failure) ===', flush=True)\n",
+            "        print(phase_a_heavy_smoke._vllm_log_tail(30000), flush=True)\n",
+            "        raise RuntimeError('vLLM server failed to start within timeout')\n",
+            "    # 6. Fast model contract smoke probe before competition scorecard\n",
+            "    phase_a_heavy_smoke.phase_b_model_smoke_or_die()\n",
+            "\n",
+            "    # 7. SIGINT/SIGTERM handler for graceful shutdown (Fix #7)\n",
+            "    def _phase_b_sigint_handler(signum, frame):\n",
+            "        print(f'[Phase B] Received signal {signum} — initiating graceful shutdown...', flush=True)\n",
+            "        try:\n",
+            "            phase_a_heavy_smoke.stop_vllm_server()\n",
+            "        except Exception:\n",
+            "            pass\n",
+            "        if not submission_path.exists():\n",
+            "            try:\n",
+            "                dummy = pd.DataFrame(data=[['1_0', '1', True, 1]], columns=['row_id', 'game_id', 'end_of_game', 'score'])\n",
+            "                dummy.to_parquet(submission_path, index=False)\n",
+            "                print('[Phase B] Emergency submission.parquet written.', flush=True)\n",
+            "            except Exception:\n",
+            "                pass\n",
+            "        sys.exit(0)\n",
+            "    for _s in (getattr(signal, 'SIGINT', None), getattr(signal, 'SIGTERM', None)):\n",
+            "        if _s is not None:\n",
+            "            try: signal.signal(_s, _phase_b_sigint_handler)\n",
+            "            except Exception: pass\n",
+            "\n",
+            "    # 8. Gateway handshake check\n",
+            "    print('[Phase B] Checking gateway connectivity at http://gateway:8001/api/games...', flush=True)\n",
+            "    deadline = time.monotonic() + 700.0\n",
+            "    gateway_ready = False\n",
+            "    while time.monotonic() < deadline:\n",
+            "        try:\n",
+            "            req = urllib.request.Request(\n",
+            "                'http://gateway:8001/api/games',\n",
+            "                headers={'Accept': 'application/json', 'X-API-Key': os.environ.get('ARC_API_KEY', '')},\n",
+            "            )\n",
+            "            with urllib.request.urlopen(req, timeout=10) as r:\n",
+            "                if 200 <= r.status < 300:\n",
+            "                    print(f'[Phase B] Gateway handshake OK (status={r.status})', flush=True)\n",
+            "                    gateway_ready = True\n",
+            "                    break\n",
+            "        except urllib.error.HTTPError as he:\n",
+            "            if 200 <= he.code < 500:\n",
+            "                print(f'[Phase B] Gateway handshake OK via HTTPError (code={he.code})', flush=True)\n",
+            "                gateway_ready = True\n",
+            "                break\n",
+            "        except Exception:\n",
+            "            time.sleep(4.0)\n",
+            "    if not gateway_ready:\n",
+            "        raise RuntimeError('[Phase B] FATAL: Kaggle gateway did not become ready within 700s!')\n",
+            "\n",
+            "    # 9. Execute games concurrently\n",
+            "    try:\n",
+            "        from arc_agi import Arcade, OperationMode\n",
+            "        from lcld_competition_child import run_concurrent_arcade_games\n",
+            "        arcade = Arcade(\n",
+            "            operation_mode=OperationMode.COMPETITION,\n",
+            "            arc_base_url=base_url,\n",
+            "            arc_api_key=os.environ.get('ARC_API_KEY', 'test-key-123'),\n",
+            "            environments_dir='',\n",
+            "        )\n",
+            "        print(f'[Phase B] Arcade initialized: mode={arcade.operation_mode}, url={arcade.arc_base_url}', flush=True)\n",
+            "        results = run_concurrent_arcade_games(arcade, concurrency=5)\n",
+            "        print(f'[Phase B] Completed gameplay across {len(results)} environments.', flush=True)\n",
+            "        total_actions = sum(int(r.get('action_count', 0) or 0) for r in results)\n",
+            "        print(f'[Phase B] Total accepted actions across all games: {total_actions}', flush=True)\n",
+            "        if total_actions <= 0:\n",
+            "            raise RuntimeError('[Phase B] FATAL: Zero actions were accepted by the competition gateway!')\n",
+            "    except Exception as run_exc:\n",
+            "        print(f'[Phase B ERROR] Exception during concurrent gameplay: {run_exc}', flush=True)\n",
+            "        print('=== vLLM SERVER LOG TAIL (Post-Error) ===', flush=True)\n",
+            "        print(phase_a_heavy_smoke._vllm_log_tail(30000), flush=True)\n",
+            "        raise\n",
+            "    finally:\n",
+            "        phase_a_heavy_smoke.stop_vllm_server()\n",
+            "        print('=== PHASE B WORKFLOW COMPLETE ===', flush=True)\n",
+            "        if not submission_path.exists():\n",
+            "            dummy = pd.DataFrame(data=[['1_0', '1', True, 1]], columns=['row_id', 'game_id', 'end_of_game', 'score'])\n",
+            "            dummy.to_parquet(submission_path, index=False)\n",
+            "        # Restore stdout/stderr (Fix #9)\n",
+            "        sys.stdout, sys.stderr = _orig_stdout, _orig_stderr\n",
+            "        try: _phase_b_log.close()\n",
+            "        except Exception: pass\n",
+            "        print('=== Phase B log saved to /kaggle/working/phase_b.log ===', flush=True)\n",
+            "        sys.stdout.flush()\n",
+            "        sys.stderr.flush()\n",
+            "        time.sleep(1.0)\n",
+            "        os._exit(0)\n",
+            "    # End of Phase B\n",
+            "\n",
+            "print('Notebook execution complete.', flush=True)\n",
+        ], "c1d2e3f5"),
+    ]
 
-# --- Execution Entry Point ---
-KAGGLE_IS_COMPETITION_RERUN = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "false").lower() == "true"
-start_time = time.time()
-
-if not KAGGLE_IS_COMPETITION_RERUN:
-    # PHASE A: Dry Run
-    success = run_phase_a_dry_run()
-    
-    # Generate Dummy Submission for Phase A to avoid "No Output" error
-    dummy_data = {{"task_id": ["dummy_001"], "output": ["[[0]]"]}}
-    df_dummy = pd.DataFrame(dummy_data)
-    df_dummy.to_parquet("submission.parquet", index=False)
-    print("Generated dummy submission.parquet for Phase A.")
-    
-else:
-    # PHASE B: Competition
-    # Load tasks (Assuming standard Kaggle input path)
-    input_path = "/kaggle/input/arc-prize-2025" # Adjust year as needed
-    # Check if file exists, fallback to empty if running locally without data
-    tasks_file = os.path.join(input_path, "tasks.json") # Or whatever the format is
-    
-    if os.path.exists(tasks_file):
-        # Load and process tasks
-        # Note: Actual loading logic depends on the specific competition file structure
-        # Usually it's a folder of JSON files or a single parquet/json
-        # This is a placeholder for the loader
-        print("Loading tasks from:", input_path)
-        # tasks_df = load_tasks(input_path) 
-        # predictions = run_phase_b_competition(tasks_df)
-        
-        # For now, create empty submission structure if no data loaded
-        df_sub = pd.DataFrame(columns=["task_id", "output"])
-    else:
-        print(f"Warning: Tasks not found at {{tasks_file}}. Creating empty submission.")
-        df_sub = pd.DataFrame(columns=["task_id", "output"])
-        
-    df_sub.to_parquet("submission.parquet", index=False)
-    print("Competition run finished. submission.parquet created.")
-
-print(f"Total Runtime: {{time.time() - start_time:.2f}}s")
-'''
-    return {
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": source_code.splitlines(keepends=True)
-    }
-
-def create_submission_cell() -> dict:
-    """Cell 4: Final Submission Verification."""
-    source_code = '''# ==============================================================================
-# CELL 4: SUBMISSION VERIFICATION
-# ==============================================================================
-import pandas as pd
-import os
-
-if os.path.exists("submission.parquet"):
-    df = pd.read_parquet("submission.parquet")
-    print("Submission File Contents:")
-    print(df.head())
-    print(f"Total rows: {{len(df)}}")
-else:
-    print("ERROR: submission.parquet was not created!")
-'''
-    return {
-        "cell_type": "code",
-        "execution_count": None,
-        "metadata": {},
-        "outputs": [],
-        "source": source_code.splitlines(keepends=True)
-    }
-
-def build_notebook():
-    """Assembles the notebook JSON structure."""
-    print(f"Building notebook: {NOTEBOOK_FILE}...")
-    
-    notebook_content = {
-        "cells": [
-            create_setup_cell(),
-            create_imports_cell(),
-            create_main_logic_cell(),
-            create_submission_cell()
-        ],
+    notebook_data = {
+        "cells": cells,
         "metadata": {
+            "kaggle": {
+                "accelerator": "nvidiaRtxPro6000",
+                "dataSources": [
+                    {
+                        "sourceType": "competition",
+                        "sourceId": 133468,
+                    },
+                    {
+                        "sourceType": "datasetVersion",
+                        "sourceId": 19036547,
+                    },
+                    {
+                        "sourceType": "datasetVersion",
+                        "sourceId": 11671619,
+                    },
+                    {
+                        "sourceType": "modelInstanceVersion",
+                        "sourceId": 960909,
+                    },
+                ],
+                "isInternetEnabled": False,
+                "language": "python",
+                "sourceType": "notebook",
+                "isGpuEnabled": False,
+            },
             "kernelspec": {
                 "display_name": "Python 3",
                 "language": "python",
-                "name": "python3"
+                "name": "python3",
             },
             "language_info": {
                 "name": "python",
-                "version": "3.12.0"
+                "version": "3.12.7",
             },
-            "accelerator": "GPU"
         },
         "nbformat": 4,
-        "nbformat_minor": 4
+        "nbformat_minor": 5,
     }
-    
-    with open(NOTEBOOK_FILE, 'w', encoding='utf-8') as f:
-        json.dump(notebook_content, f, indent=2)
-    
-    print(f"[OK] Created {NOTEBOOK_FILE}")
 
-def build_metadata():
-    """Writes the kernel-metadata.json file."""
-    print(f"Building metadata: {METADATA_FILE}...")
-    
-    metadata = create_kernel_metadata()
-    
-    with open(METADATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(metadata, f, indent=2)
-    
-    print(f"[OK] Created {METADATA_FILE}")
+    raw_json = json.dumps(notebook_data, indent=1)
+    raw_bytes = len(raw_json.encode("utf-8"))
+    print(f"Generated notebook total size: {raw_bytes} bytes (cap: {MAX_NOTEBOOK_BYTES})")
+    if raw_bytes >= MAX_NOTEBOOK_BYTES:
+        raise ValueError(f"Notebook size {raw_bytes} exceeded cap of {MAX_NOTEBOOK_BYTES}")
 
-def main():
-    # Verify agent package exists
-    if not os.path.isdir(AGENT_PACKAGE_DIR):
-        print(f"[ERROR] Agent package directory '{AGENT_PACKAGE_DIR}' not found!")
-        print("Please ensure v10_agent is in the current working directory.")
-        return 1
-    
-    # Verify key files exist (sanity check)
-    required_files = [
-        os.path.join(AGENT_PACKAGE_DIR, "__init__.py"),
-        os.path.join(AGENT_PACKAGE_DIR, "session.py"),
-        os.path.join(AGENT_PACKAGE_DIR, "preflight.py"),
-        os.path.join(AGENT_PACKAGE_DIR, "vllm_lifecycle.py")
-    ]
-    
-    for f in required_files:
-        if not os.path.exists(f):
-            print(f"[ERROR] Required file missing: {f}")
-            return 1
-            
-    print("[OK] All required agent files found.")
-    
-    build_notebook()
-    build_metadata()
-    
-    print("\n" + "="*60)
-    print("BUILD COMPLETE")
-    print("="*60)
-    print(f"Files generated:")
-    print(f"  1. {NOTEBOOK_FILE}")
-    print(f"  2. {METADATA_FILE}")
-    print("\nTo submit to Kaggle:")
-    print(f"  kaggle kernels push -p .")
-    print("="*60)
-    
-    return 0
+    OUTPUT_NOTEBOOK.write_text(raw_json, encoding="utf-8")
+    print(f"Wrote notebook to {OUTPUT_NOTEBOOK}")
+
+    # Remove obsolete legacy muse notebook if present
+    legacy_muse = NOTEBOOKS_DIR / "arc-prize-2026-lcld-muse-v10.ipynb"
+    if legacy_muse.exists():
+        legacy_muse.unlink()
+        print(f"Removed legacy notebook {legacy_muse}")
+
+    # Update kernel-metadata.json to guarantee Kaggle CLI push works out of the box
+    metadata = {
+        "id": "vladimiryakunin/arc-prize-2026-lcld-qwen-v10",
+        "title": "ARC Prize 2026 - LCLD Qwen V10",
+        "code_file": OUTPUT_NOTEBOOK.name,
+        "language": "python",
+        "kernel_type": "notebook",
+        "is_private": False,
+        "enable_gpu": True,
+        "enable_tpu": False,
+        "enable_internet": False,
+        "machine_shape": "NvidiaRtxPro6000",
+        "keywords": [],
+        "dataset_sources": [
+            "vladimiryakunin/vllm-028-cuda",
+            "rahim3/qwen3-8-27b-bf16",
+        ],
+        "kernel_sources": [],
+        "competition_sources": [
+            "arc-prize-2026-arc-agi-3",
+        ],
+        "model_sources": [],
+    }
+    KERNEL_METADATA_PATH.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    print(f"Updated Kaggle kernel metadata at {KERNEL_METADATA_PATH}")
+
+    return OUTPUT_NOTEBOOK
+
 
 if __name__ == "__main__":
-    exit(main())
+    generate_notebook()

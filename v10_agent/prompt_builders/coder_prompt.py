@@ -1,127 +1,177 @@
+"""Coder Prompt Builder (Call 2 Family).
+
+Constructs prompts strictly quarantined from level goals, Solver hypotheses, and EpistemicMemory.
 """
-Coder Prompt Builder - ISO-2 Compliant (Coder has no goal information)
-Ref: Engineering Specification V10.0 Section 8.2
+
+from __future__ import annotations
+
+import json
+from typing import Any, Sequence
+
+from v10_agent.memory_contours import SyntaxErrorRecord
+
+CODER_SYSTEM_PROMPT = """\
+You are a Python DSL (Domain Specific Language) generator.
+Think step by step and reason through the environment mechanics, object structures, and coordinate affordances before writing the code.
+Your task is to translate environment specifications into a pure Python module and a JSON manifest.
+
+CONSTRAINTS:
+- You DO NOT know the puzzle goal. Do not attempt to solve it.
+- Generate pure functions that ONLY call `api.declare_environment_action(...)`.
+- Allowed imports: math, typing, dataclasses, enum, collections. NO os, sys, eval, exec.
+- You MUST implement a function for EVERY action listed in the available actions.
+- Function names must be canonical: `action1`, `action2`, ..., `action6`.
+- Coordinate actions (e.g., ACTION6) must accept `x: int = 0, y: int = 0`.
+
+OUTPUT FORMAT:
+Provide exactly two blocks:
+1. ```python ... ``` containing the DSL module.
+2. ```json ... ``` containing the manifest matching schema 'v10.dsl_manifest.1'.
 """
 
-from typing import Dict, Any, List, Optional
-from ..types import EnvironmentSpecification
+SANDBOX_API_DOC = """\
+The SandboxAPI injected into your functions exposes:
+  - api.planning_set: PlanningSet (read-only access to objects, relations, allowed actions)
+  - api.get_object(obj_id_or_alias: str) -> PlanningObject | None
+  - api.query_objects(predicate: Callable) -> list[PlanningObject]
+  - api.metric_distance(obj_a: str, obj_b: str, metric_name: str = "centroid_distance") -> float
+  - api.declare_environment_action(
+        action_id: str,
+        data: dict | None = None,
+        reasoning: dict | None = None,
+        expected_metric_deltas: dict | None = None,
+        target_object_ids: list[str] | None = None,
+        confidence: float = 1.0,
+    ) -> EffectDeclaration
+"""
 
 
-def build_coder_prompt(
-    environment_spec: EnvironmentSpecification,
-    api_manifest: Dict[str, Any],
-    syntax_error_count: int = 0,
-    recent_errors: Optional[List[Dict[str, str]]] = None,
-) -> str:
-    """
-    Build prompt for DSL Coder Agent.
-    
-    ISO-2 INVARIANT: This prompt MUST explicitly state that Coder has no goal information.
-    Coder only sees: EnvironmentSpecification and API contract.
-    
-    Args:
-        environment_spec: Environment specification from Explorer (Ref: Spec 3.2)
-        api_manifest: JSON Function Manifest with available DSL functions (Ref: Spec 3.3)
-        syntax_error_count: Number of previous syntax errors (for context)
-        recent_errors: Optional list of recent error summaries (NO traceback details)
-    
-    Returns:
-        Formatted prompt string for vLLM/Qwen model
-    """
-    prompt_parts = [
-        "=" * 60,
-        "ARC-AGI-3 DSL CODER AGENT - FUNCTION IMPLEMENTATION",
-        "=" * 60,
-        "",
-        "CRITICAL CONSTRAINT: You have no information about the level goal.",
-        "Your task is to implement DSL functions that match the environment specification.",
-        "",
-        "-" * 60,
-        "ENVIRONMENT SPECIFICATION",
-        "-" * 60,
-        f"Grid Size: {environment_spec.grid_width}x{environment_spec.grid_height}",
-        f"Object Count: {len(environment_spec.object_specs)}",
-        f"Relation Count: {len(environment_spec.relation_specs)}",
-        f"Action Surface: {environment_spec.action_surface_type}",
-        "",
-        "Object Types:",
-    ]
-    
-    for obj_spec in environment_spec.object_specs[:5]:  # Limit to first 5
-        prompt_parts.append(f"  - {obj_spec.type_id}: {obj_spec.description}")
-    
-    if len(environment_spec.object_specs) > 5:
-        prompt_parts.append(f"  ... and {len(environment_spec.object_specs) - 5} more")
-    
-    prompt_parts.extend([
-        "",
-        "Relation Types:",
-    ])
-    
-    for rel_spec in environment_spec.relation_specs[:5]:
-        prompt_parts.append(f"  - {rel_spec.type_id}: {rel_spec.description}")
-    
-    if len(environment_spec.relation_specs) > 5:
-        prompt_parts.append(f"  ... and {len(environment_spec.relation_specs) - 5} more")
-    
-    prompt_parts.extend([
-        "",
-        "-" * 60,
-        "API MANIFEST (Available DSL Functions)",
-        "-" * 60,
-        "You must implement functions using ONLY these signatures:",
+def build_coder_prompts(
+    env_spec: dict[str, Any],
+    syntax_errors: Sequence[SyntaxErrorRecord] | None = None,
+    game_memory: Any | None = None,
+    planning_set: Any | None = None,
+    has_image: bool = True,
+) -> tuple[str, str]:
+    """Construct (system_prompt, user_prompt) for the DSL Coder Agent."""
+    compact_spec = dict(env_spec)
+    if "coordinate_affordances" in compact_spec and len(compact_spec["coordinate_affordances"]) > 20:
+        compact_spec["coordinate_affordances"] = compact_spec["coordinate_affordances"][:20]
+
+    # Resolve ground-truth available actions from planning_set or env_spec
+    available_actions: list[str] = []
+    if planning_set is not None and getattr(planning_set, "allowed_action_ids", None):
+        available_actions = [str(a).upper() for a in planning_set.allowed_action_ids if str(a).upper() not in ("RESET", "ACTION7")]
+    elif "available_actions" in compact_spec:
+        available_actions = [str(a).upper() for a in compact_spec["available_actions"] if str(a).upper() not in ("RESET", "ACTION7")]
+    elif "researched_actions" in compact_spec:
+        available_actions = [
+            str(a["action_id"]).upper()
+            for a in compact_spec["researched_actions"]
+            if isinstance(a, dict) and "action_id" in a and str(a["action_id"]).upper() not in ("RESET", "ACTION7")
+        ]
+
+    image_note = (
+        "coder_raw_frame.png is the exact same frame as coder_annotated_frame.png, but without object annotations.\n\n"
+        if has_image
+        else ""
+    )
+
+    sections: list[str] = []
+    if image_note:
+        sections.append(image_note.strip())
+    sections.extend([
+        "Environment Specification (Observed Facts & Affordances):",
+        json.dumps(compact_spec, indent=2),
         "",
     ])
-    
-    for func_name, func_info in api_manifest.get("functions", {}).items():
-        prompt_parts.append(f"Function: {func_name}")
-        prompt_parts.append(f"  Signature: {func_info.get('signature', 'unknown')}")
-        prompt_parts.append(f"  Description: {func_info.get('docstring', 'No description')}")
-        prompt_parts.append(f"  Parameters: {func_info.get('parameters', {})}")
-        prompt_parts.append(f"  Returns: {func_info.get('return_type', 'unknown')}")
-        prompt_parts.append("")
-    
-    if syntax_error_count > 0 and recent_errors:
-        prompt_parts.extend([
-            "-" * 60,
-            f"PREVIOUS ERRORS ({syntax_error_count} total)",
-            "-" * 60,
-            "Note: You see error summaries, NOT full tracebacks (ISO-3 compliance).",
+
+    if available_actions:
+        sections.extend([
+            "ALL AVAILABLE ENVIRONMENT ACTIONS (You MUST define a function for EVERY action in this list):",
+            "\n".join(f"- {act}" for act in sorted(set(available_actions))),
             "",
         ])
-        for err in recent_errors[-3:]:  # Last 3 errors
-            prompt_parts.append(f"- {err.get('summary', 'Unknown error')}")
-    
-    prompt_parts.extend([
-        "",
-        "-" * 60,
-        "INSTRUCTIONS",
-        "-" * 60,
-        "1. Implement DSL functions that operate on the given object/relation IDs.",
-        "2. Use only the provided API manifest - no external imports.",
-        "3. Ensure all function signatures match the manifest exactly.",
-        "4. Return Python code in a JSON format:",
-        '   {"source_code": "python code string", "function_names": ["list", "of", "names"]}',
-        "",
-        "REMINDER: You do not know the goal. Implement functions based on environment spec only.",
-        "=" * 60,
+
+    sections.extend([
+        "Sandbox API Contract:",
+        SANDBOX_API_DOC,
     ])
-    
-    return "\n".join(prompt_parts)
 
+    if game_memory is not None and hasattr(game_memory, "format_empirical_context"):
+        emp_ctx = game_memory.format_empirical_context(include_curriculum=False)
+        if emp_ctx:
+            sections.extend([
+                "",
+                "EMPIRICAL FACTS DISCOVERED ACROSS PREVIOUS LEVELS:",
+                emp_ctx,
+            ])
 
-def validate_no_goal_in_api_manifest(api_manifest: Dict[str, Any]) -> None:
-    """
-    Validate that API manifest contains no goal-related information.
-    
-    Ref: Spec 1.4 ISO-2 Invariant
-    """
-    goal_keywords = ["goal", "target", "objective", "win", "complete", "finish"]
-    
-    manifest_str = str(api_manifest).lower()
-    for keyword in goal_keywords:
-        if keyword in manifest_str:
-            raise ValueError(
-                f"ISO-2 VIOLATION: Goal keyword '{keyword}' detected in API manifest. "
-                "Coder must not know about goals."
-            )
+    if syntax_errors:
+        sections.append("PREVIOUS COMPILATION / STATIC VALIDATION DIAGNOSTICS (FIX THESE ERRORS):")
+        for idx, err in enumerate(syntax_errors, 1):
+            sections.append(f"--- Attempt #{idx} Failure ---")
+            sections.append(f"Error Type: {err.error_type}")
+            sections.append(f"Message: {err.error_message}")
+            if err.diagnostics:
+                sections.append("Diagnostics:\n" + "\n".join(f"- {d}" for d in err.diagnostics))
+            if err.source_code:
+                sections.append(f"Faulty Source Snippet:\n```python\n{err.source_code[:1500]}\n```")
+
+    user_instructions = """\
+Generate the Python DSL functions and matching function manifest.
+Example format:
+```python
+import math
+from typing import Any
+
+def action1(api):
+    \"\"\"Declare discrete button action ACTION1.\"\"\"
+    return api.declare_environment_action(action_id="ACTION1")
+
+def action5(api):
+    \"\"\"Declare entity selection/cycling action ACTION5.\"\"\"
+    return api.declare_environment_action(action_id="ACTION5")
+
+def action6(api, x: int = 0, y: int = 0):
+    \"\"\"Declare spatial action ACTION6 at target coordinates (x, y).\"\"\"
+    return api.declare_environment_action(action_id="ACTION6", data={"x": int(x), "y": int(y)})
+```
+
+```json
+{
+  "schema_version": "v10.dsl_manifest.1",
+  "functions": [
+    {
+      "name": "action1",
+      "parameters": [],
+      "returns": "effect_declaration",
+      "docstring": "Declare discrete button action ACTION1.",
+      "purity": "pure_declaration",
+      "expected_effect_template": {}
+    },
+    {
+      "name": "action5",
+      "parameters": [],
+      "returns": "effect_declaration",
+      "docstring": "Declare entity selection/cycling action ACTION5.",
+      "purity": "pure_declaration",
+      "expected_effect_template": {}
+    },
+    {
+      "name": "action6",
+      "parameters": [
+        {"name": "x", "type": "int", "default": 0},
+        {"name": "y", "type": "int", "default": 0}
+      ],
+      "returns": "effect_declaration",
+      "docstring": "Declare spatial action ACTION6 at coordinates (x, y).",
+      "purity": "pure_declaration",
+      "expected_effect_template": {}
+    }
+  ]
+}
+```
+"""
+    sections.append(user_instructions)
+    return CODER_SYSTEM_PROMPT, "\n".join(sections)

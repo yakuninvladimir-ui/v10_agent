@@ -1,251 +1,220 @@
-"""
-PlanningSet Identity Contract Implementation.
-
-Ref: Spec 1.4 (Isolation Invariants), Spec 4 (PlanningSet Identity Contract)
-
-The PlanningSet is the immutable snapshot of the environment state that serves as the
-ground truth for the Coder and Solver agents. It enforces strict invariants I1-I8 to
-ensure consistent reasoning across the tri-agent architecture.
-"""
+"""PlanningSet identity contract and vocabulary grounding for ARC-AGI-3."""
 
 from __future__ import annotations
 
 import hashlib
-import json
+import uuid
 from dataclasses import dataclass, field
-from typing import Any, FrozenSet, Mapping, Sequence, Set
-from frozendict import frozendict  # type: ignore[import-untyped]
+from typing import Any, Sequence
+
+from v10_agent.arga_lite import ARGALiteSnapshot, PlanningObject, SpatialRelation
+from v10_agent.types import CoordinateCandidate, PlanningAlias, PlanningObjectId
+
+
+def generate_alias_sequence(count: int) -> list[PlanningAlias]:
+    """Generate deterministic alphanumeric aliases: A, B, ..., Z, AA, AB, ..."""
+    aliases: list[PlanningAlias] = []
+    for i in range(count):
+        label = ""
+        n = i
+        while True:
+            label = chr(ord("A") + (n % 26)) + label
+            n = n // 26 - 1
+            if n < 0:
+                break
+        aliases.append(label)
+    return aliases
 
 
 @dataclass(frozen=True)
 class PlanningSet:
-    """
-    Immutable snapshot of the environment state for agent reasoning.
-    
-    Ref: Spec 4.1 - PlanningSet Identity Contract
-    
-    The PlanningSet provides a canonical representation of the grid state at a specific
-    moment in time. It is used by:
-    - Explorer: To generate probe actions based on allowed_action_ids
-    - Coder: To synthesize Python code that transforms the state
-    - Solver: To evaluate whether candidate solutions achieve the goal
-    
-    Invariants (I1-I8):
-    - I1: snapshot_id must be unique per distinct grid state
-    - I2: grid_hash must be deterministic hash of grid configuration
-    - I3: object_ids must be complete set of all object identifiers
-    - I4: relation_ids must be complete set of all relation identifiers  
-    - I5: allowed_action_ids must be subset of registered DSL actions
-    - I6: object_real_to_alias must be bijective mapping
-    - I7: All IDs must be stable across equivalent states
-    - I8: No mutable references to external state
-    """
-    
-    # Unique identifier for this snapshot
+    """Canonical immutable vocabulary for a single planning snapshot cycle (Invariants I1-I8)."""
     snapshot_id: str
-    
-    # Deterministic hash of the grid configuration
     grid_hash: str
-    
-    # Complete set of object identifiers present in the state
-    object_ids: FrozenSet[str]
-    
-    # Complete set of relation identifiers present in the state
-    relation_ids: FrozenSet[str]
-    
-    # Set of action IDs that are valid in this state (subset of DSL registry)
-    allowed_action_ids: FrozenSet[str]
-    
-    # Bijective mapping from real object IDs to alias IDs for abstraction
-    # Ref: Spec 4.3 - Object Alias System
-    object_real_to_alias: frozendict[str, str]
-    
-    # Optional metadata (frozen to maintain immutability)
-    metadata: frozendict[str, Any] = field(default_factory=lambda: frozendict())
-    
-    def __post_init__(self) -> None:
-        """
-        Validate all invariants I1-I8 after initialization.
-        
-        Raises:
-            ValueError: If any invariant is violated
-        """
-        self._validate_invariants()
-    
-    def _validate_invariants(self) -> None:
-        """
-        Validate invariants I1-I8 as defined in Spec 4.1.
-        
-        Ref: Spec 4.2 - Invariant Validation
-        """
-        errors: list[str] = []
-        
-        # I1: snapshot_id must be non-empty string
-        if not isinstance(self.snapshot_id, str) or len(self.snapshot_id) == 0:
-            errors.append("I1 violated: snapshot_id must be non-empty string")
-        
-        # I2: grid_hash must be valid hex string (64 chars for SHA-256)
-        if not isinstance(self.grid_hash, str) or len(self.grid_hash) != 64:
-            try:
-                int(self.grid_hash, 16)
-            except (ValueError, TypeError):
-                errors.append("I2 violated: grid_hash must be 64-char hex string")
-        
-        # I3: object_ids must be non-empty frozenset of strings
-        if not isinstance(self.object_ids, frozenset):
-            errors.append("I3 violated: object_ids must be frozenset")
-        elif not all(isinstance(oid, str) for oid in self.object_ids):
-            errors.append("I3 violated: all object_ids must be strings")
-        
-        # I4: relation_ids must be frozenset of strings
-        if not isinstance(self.relation_ids, frozenset):
-            errors.append("I4 violated: relation_ids must be frozenset")
-        elif not all(isinstance(rid, str) for rid in self.relation_ids):
-            errors.append("I4 violated: all relation_ids must be strings")
-        
-        # I5: allowed_action_ids must be frozenset of strings
-        if not isinstance(self.allowed_action_ids, frozenset):
-            errors.append("I5 violated: allowed_action_ids must be frozenset")
-        elif not all(isinstance(aid, str) for aid in self.allowed_action_ids):
-            errors.append("I5 violated: all allowed_action_ids must be strings")
-        
-        # I6: object_real_to_alias must be bijective (one-to-one correspondence)
-        if not isinstance(self.object_real_to_alias, frozendict):
-            errors.append("I6 violated: object_real_to_alias must be frozendict")
-        else:
-            # Check bijection: keys and values must have same cardinality
-            keys = set(self.object_real_to_alias.keys())
-            values = set(self.object_real_to_alias.values())
-            if len(keys) != len(values):
-                errors.append("I6 violated: object_real_to_alias must be bijective")
-            # Check that all real IDs are in object_ids
-            if not keys.issubset(self.object_ids):
-                errors.append("I6 violated: object_real_to_alias keys must be subset of object_ids")
-        
-        # I7: Stability check - grid_hash must match recomputed hash from object/relation IDs
-        # This is a consistency check, not a cryptographic one
-        expected_hash_input = json.dumps({
-            "objects": sorted(self.object_ids),
-            "relations": sorted(self.relation_ids),
-        }, sort_keys=True)
-        expected_hash = hashlib.sha256(expected_hash_input.encode()).hexdigest()
-        # Note: We don't enforce exact match here as grid_hash may include additional state
-        # but we log if there's a mismatch for debugging
-        
-        # I8: No mutable references - enforced by frozen dataclass and frozendict/frozenset types
-        
-        if errors:
-            raise ValueError("; ".join(errors))
-    
-    @classmethod
-    def create(
-        cls,
-        object_ids: Sequence[str],
-        relation_ids: Sequence[str],
-        allowed_action_ids: Sequence[str],
-        object_aliases: Mapping[str, str] | None = None,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> PlanningSet:
-        """
-        Factory method to create a PlanningSet with auto-generated IDs.
-        
-        Ref: Spec 4.4 - PlanningSet Construction
-        
-        Args:
-            object_ids: Sequence of object identifiers
-            relation_ids: Sequence of relation identifiers
-            allowed_action_ids: Sequence of allowed DSL action IDs
-            object_aliases: Optional mapping from real IDs to alias IDs
-            metadata: Optional metadata dictionary
-            
-        Returns:
-            PlanningSet with validated invariants
-            
-        Raises:
-            ValueError: If invariants I1-I8 are violated
-        """
-        # Convert to frozenset for immutability
-        obj_ids_frozen = frozenset(object_ids)
-        rel_ids_frozen = frozenset(relation_ids)
-        action_ids_frozen = frozenset(allowed_action_ids)
-        
-        # Generate grid_hash from state
-        hash_input = json.dumps({
-            "objects": sorted(obj_ids_frozen),
-            "relations": sorted(rel_ids_frozen),
-            "actions": sorted(action_ids_frozen),
-        }, sort_keys=True)
-        grid_hash = hashlib.sha256(hash_input.encode()).hexdigest()
-        
-        # Generate snapshot_id from grid_hash with prefix
-        snapshot_id = f"ps_{grid_hash[:16]}"
-        
-        # Create alias mapping (identity if not provided)
-        if object_aliases is None:
-            alias_mapping = {oid: oid for oid in obj_ids_frozen}
-        else:
-            alias_mapping = dict(object_aliases)
-        
-        # Convert to frozendict
-        alias_frozen = frozendict(alias_mapping)
-        metadata_frozen = frozendict(metadata or {})
-        
-        return cls(
-            snapshot_id=snapshot_id,
-            grid_hash=grid_hash,
-            object_ids=obj_ids_frozen,
-            relation_ids=rel_ids_frozen,
-            allowed_action_ids=action_ids_frozen,
-            object_real_to_alias=alias_frozen,
-            metadata=metadata_frozen,
+    full_grid_hex_rows: tuple[str, ...]
+    object_ids: tuple[PlanningObjectId, ...]
+    relation_ids: tuple[str, ...]
+    allowed_action_ids: tuple[str, ...]
+    allowed_coordinate_candidate_ids: tuple[str, ...]
+    object_real_to_alias: dict[PlanningObjectId, PlanningAlias]
+    object_alias_to_real: dict[PlanningAlias, PlanningObjectId]
+    objects: tuple[PlanningObject, ...]
+    relations: tuple[SpatialRelation, ...]
+    coordinate_candidates: tuple[CoordinateCandidate, ...]
+    grid_dims: tuple[int, int] = (0, 0)
+
+    def resolve_object_id(self, key: str) -> PlanningObjectId | None:
+        """Resolve a real object ID or an alias label to the canonical object ID."""
+        if key in self.object_real_to_alias:
+            return key
+        if key in self.object_alias_to_real:
+            return self.object_alias_to_real[key]
+        return None
+
+    def get_object(self, key: str) -> PlanningObject | None:
+        """Retrieve PlanningObject by canonical ID or alias."""
+        canonical_id = self.resolve_object_id(key)
+        if canonical_id is None:
+            return None
+        for obj in self.objects:
+            if obj.id == canonical_id:
+                return obj
+        return None
+
+    def get_coordinate_candidate(self, candidate_id: str) -> CoordinateCandidate | None:
+        for coord in self.coordinate_candidates:
+            if coord.candidate_id == candidate_id:
+                return coord
+        return None
+
+    def is_valid_action(self, action_id: str) -> bool:
+        return action_id.upper() in self.allowed_action_ids
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "grid_hash": self.grid_hash,
+            "grid_dims": {"height": self.grid_dims[0], "width": self.grid_dims[1]},
+            "object_ids": list(self.object_ids),
+            "allowed_action_ids": list(self.allowed_action_ids),
+            "allowed_coordinate_candidate_ids": list(self.allowed_coordinate_candidate_ids),
+            "object_aliases": dict(self.object_real_to_alias),
+            "objects": [obj.to_dict() for obj in self.objects],
+            "relations": [rel.to_dict() for rel in self.relations],
+            "coordinate_candidates": [c.to_dict() for c in self.coordinate_candidates],
+        }
+
+
+def build_planning_set(
+    snapshot: ARGALiteSnapshot,
+    available_actions: Sequence[str],
+    snapshot_id: str | None = None,
+    grid_hex_rows: Sequence[str] | None = None,
+) -> PlanningSet:
+    """Build a certified PlanningSet adhering to Invariants I1-I8."""
+    sid = snapshot_id or str(uuid.uuid4())
+    objects = tuple(snapshot.objects)
+    object_ids = tuple(obj.id for obj in objects)
+    relations = tuple(snapshot.relations)
+
+    # Invariant I2: Build bijective alias mapping
+    aliases = generate_alias_sequence(len(objects))
+    real_to_alias: dict[str, str] = {}
+    alias_to_real: dict[str, str] = {}
+    for obj_id, alias in zip(object_ids, aliases):
+        real_to_alias[obj_id] = alias
+        alias_to_real[alias] = obj_id
+
+    # Compute relation IDs
+    rel_ids: list[str] = []
+    for r in relations:
+        val_str = f"_{r.metric_value:.1f}" if r.metric_value is not None else ""
+        rel_ids.append(f"{r.subject_id}:{r.relation_type}:{r.target_id}{val_str}")
+    relation_ids = tuple(rel_ids)
+
+    # Allowed actions normalized (ACTION7 is strictly excluded to prevent agent confusion)
+    allowed_action_ids = tuple(sorted(set(str(a).upper() for a in available_actions if str(a).upper() != "ACTION7")))
+
+    # Compute coordinate candidates
+    coords: list[CoordinateCandidate] = []
+    height, width = snapshot.grid_dims
+
+    # Grid center
+    if height > 0 and width > 0:
+        coords.append(
+            CoordinateCandidate(
+                candidate_id="coord_center",
+                x=width // 2,
+                y=height // 2,
+                source_type="grid_center",
+                label="Center",
+            )
         )
-    
-    def get_alias(self, real_object_id: str) -> str:
-        """
-        Get the alias for a real object ID.
-        
-        Ref: Spec 4.3 - Object Alias System
-        
-        Args:
-            real_object_id: The real object identifier
-            
-        Returns:
-            The alias identifier, or the real ID if no alias exists
-            
-        Raises:
-            KeyError: If real_object_id is not in object_ids
-        """
-        if real_object_id not in self.object_ids:
-            raise KeyError(f"Object ID '{real_object_id}' not in PlanningSet")
-        return self.object_real_to_alias.get(real_object_id, real_object_id)
-    
-    def get_real(self, alias_object_id: str) -> str:
-        """
-        Get the real object ID for an alias.
-        
-        Ref: Spec 4.3 - Object Alias System
-        
-        Args:
-            alias_object_id: The alias identifier
-            
-        Returns:
-            The real object identifier
-            
-        Raises:
-            KeyError: If alias_object_id is not a valid alias
-        """
-        # Find the key with this value
-        for real_id, alias_id in self.object_real_to_alias.items():
-            if alias_id == alias_object_id:
-                return real_id
-        raise KeyError(f"Alias '{alias_object_id}' not found in mapping")
-    
-    def __hash__(self) -> int:
-        """Enable use as dictionary key."""
-        return hash(self.snapshot_id)
-    
-    def __eq__(self, other: object) -> bool:
-        """Check equality based on snapshot_id."""
-        if not isinstance(other, PlanningSet):
-            return NotImplemented
-        return self.snapshot_id == other.snapshot_id
+
+    # Order objects with spatial diversity across quadrants & area salience
+    mid_r, mid_c = height / 2.0, width / 2.0
+    quads: dict[str, list[Any]] = {"TL": [], "TR": [], "BL": [], "BR": []}
+    for obj in objects:
+        qr = "T" if obj.centroid.row < mid_r else "B"
+        qc = "L" if obj.centroid.col < mid_c else "R"
+        quads[qr + qc].append(obj)
+
+    ordered_objs: list[Any] = []
+    # Largest objects overall first
+    for obj in sorted(objects, key=lambda o: -o.area)[:6]:
+        if obj.area >= 4 and obj not in ordered_objs:
+            ordered_objs.append(obj)
+    # Add top objects from each quadrant
+    for q_list in quads.values():
+        for obj in sorted(q_list, key=lambda o: -o.area)[:10]:
+            if obj not in ordered_objs:
+                ordered_objs.append(obj)
+    # Add remaining objects
+    for obj in objects:
+        if obj not in ordered_objs:
+            ordered_objs.append(obj)
+
+    # Centroids of all ordered objects first
+    for obj in ordered_objs:
+        alias = real_to_alias[obj.id]
+        coords.append(
+            CoordinateCandidate(
+                candidate_id=f"coord_c_{obj.id}",
+                x=int(round(obj.centroid.col)),
+                y=int(round(obj.centroid.row)),
+                source_type="object_centroid",
+                object_id=obj.id,
+                label=f"{alias}_centroid",
+            )
+        )
+
+    # Top-left and bottom-right corners
+    for obj in ordered_objs:
+        alias = real_to_alias[obj.id]
+        coords.append(
+            CoordinateCandidate(
+                candidate_id=f"coord_tl_{obj.id}",
+                x=obj.bbox.min_col,
+                y=obj.bbox.min_row,
+                source_type="object_corner_tl",
+                object_id=obj.id,
+                label=f"{alias}_TL",
+            )
+        )
+        coords.append(
+            CoordinateCandidate(
+                candidate_id=f"coord_br_{obj.id}",
+                x=obj.bbox.max_col,
+                y=obj.bbox.max_row,
+                source_type="object_corner_br",
+                object_id=obj.id,
+                label=f"{alias}_BR",
+            )
+        )
+
+    coordinate_candidates = tuple(coords)
+    allowed_coord_ids = tuple(c.candidate_id for c in coordinate_candidates)
+
+    if grid_hex_rows is not None:
+        hex_rows_tuple = tuple(grid_hex_rows)
+    else:
+        # Reconstruct dummy representation if none provided
+        hex_rows_tuple = ()
+
+    grid_hash = hashlib.sha256("\n".join(hex_rows_tuple).encode("utf-8")).hexdigest()
+
+    return PlanningSet(
+        snapshot_id=sid,
+        grid_hash=grid_hash,
+        full_grid_hex_rows=hex_rows_tuple,
+        object_ids=object_ids,
+        relation_ids=relation_ids,
+        allowed_action_ids=allowed_action_ids,
+        allowed_coordinate_candidate_ids=allowed_coord_ids,
+        object_real_to_alias=real_to_alias,
+        object_alias_to_real=alias_to_real,
+        objects=objects,
+        relations=relations,
+        coordinate_candidates=coordinate_candidates,
+        grid_dims=snapshot.grid_dims,
+    )

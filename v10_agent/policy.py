@@ -1,26 +1,43 @@
-"""
-Policy Module
-Ref: Engineering Specification V10.0 Section 6
+"""Action and candidate selection policy for GameSession."""
 
-Selects the next Candidate via policy (prefer live OMIT continuations, then new Solver candidates, then symbolic fallback)
-"""
-from typing import Dict, Any, Optional, List
+from __future__ import annotations
 
-class PolicyEngine:
-    """
-    Selects the best trajectory candidate to execute.
-    """
-    def __init__(self):
-        pass
+from typing import Any
 
-    def select_best_candidate(self, solver_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+from v10_agent.memory_contours import EpistemicMemory
+from v10_agent.planning_set import PlanningSet
+from v10_agent.trajectory import CandidateTrajectory, TrajectoryPool
+
+
+class ActionSelectionPolicy:
+    """Selects the next trajectory step prioritizing live OMIT branches, then fresh candidates, then fallback."""
+
+    def select_next_step(
+        self,
+        pool: TrajectoryPool | None,
+        epistemic_memory: EpistemicMemory,
+        planning_set: PlanningSet,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Select next step dict and strategy label.
+
+        Returns (step_dict, strategy) or (None, 'fallback').
         """
-        Select best action from Solver candidates.
-        """
-        candidates = solver_payload.get("candidates", [])
-        if not candidates:
-            return None
+        if pool is not None:
+            active_cand = pool.active_candidate()
+            if active_cand is not None:
+                step = active_cand.current_step()
+                if step is not None:
+                    return (step, "solver_candidate")
 
-        # Simple selection: highest confidence
-        best = max(candidates, key=lambda c: c.get("confidence", 0.0))
-        return best
+        if epistemic_memory.live_omit_branches:
+            for branch in epistemic_memory.live_omit_branches:
+                if epistemic_memory.is_severed(branch.signature_id):
+                    continue
+                if pool is not None:
+                    for cand in pool.candidates:
+                        if cand.trajectory_id == branch.trajectory_id and cand.active:
+                            step = cand.current_step()
+                            if step is not None:
+                                return (step, "branch_dispatch")
+
+        return (None, "fallback")

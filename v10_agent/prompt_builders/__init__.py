@@ -1,14 +1,15 @@
-"""
-Prompt Builders Package - ISO-1, ISO-2, ISO-3 Compliant
-Ref: Engineering Specification V10.0 Section 8 (Prompt Construction)
-"""
+"""Prompt builders for isolated Tri-Agent roles."""
 
-from .explorer_prompt import build_explorer_prompt
-from .coder_prompt import build_coder_prompt
-from .solver_prompt import build_solver_prompt
+from v10_agent.prompt_builders.explorer_prompt import (
+    build_coordinate_hypothesis_prompt,
+    build_explorer_prompts,
+)
+from v10_agent.prompt_builders.coder_prompt import build_coder_prompts
+from v10_agent.prompt_builders.solver_prompt import build_solver_prompts
 
 __all__ = [
-    "build_explorer_prompt",
-    "build_coder_prompt",
-    "build_solver_prompt",
+    "build_explorer_prompts",
+    "build_coordinate_hypothesis_prompt",
+    "build_coder_prompts",
+    "build_solver_prompts",
 ]

@@ -1,958 +1,1117 @@
-"""
-Game Session Module for V10 Agent.
-Orchestrates the main execution loop with strict isolation invariants.
-Ref: Spec 5 (Execution Loop), Spec 6 (Error Handling)
+"""GameSession: Master orchestrator of the Tri-Agent pipeline & Double-Loop feedback routing."""
 
-ISO Invariants enforced:
-- ISO-1: Explorer has no goal information
-- ISO-2: Coder cannot see traceback from Solver
-- ISO-3: Memory contours are strictly disjoint
-- ISO-4: Solver never sees Python source code
-- ISO-5: PlanningSet bijection maintained
-
-CRITICAL: reasoning_trace from LLM responses is NEVER passed to agents.
-It goes ONLY to logging for audit purposes. This prevents:
-- Goal leakage to Explorer (ISO-1)
-- Traceback exposure to Coder (ISO-2)  
-- Python source exposure to Solver (ISO-3)
-"""
+from __future__ import annotations
 
 import logging
-import hashlib
-from typing import Any, Optional, Dict, List
-from dataclasses import dataclass, field
+import time
+from typing import Any, Mapping
 
-from .config import V10Config
-from .llm_client import VLLMClient, AgentRole, ParsedResponse
-from .memory_contours import EnvironmentSpecMemory, SyntaxErrorMemory, EpistemicMemory
-from .agents.explorer_agent import ExplorerAgent
-from .agents.dsl_coder import DSLCoder
-from .agents.solver_agent import SolverAgent
-
+from v10_agent.action_adapter import to_native_action
+from v10_agent.arga_lite import ARGALiteSnapshot, extract_arga_snapshot
+from v10_agent.brusentsov_logic import Ternary
+from v10_agent.config import V10Config, config_from_mapping
+from v10_agent.dsl_coder import DSLCoder
+from v10_agent.explorer_agent import ExplorerAgent, compute_probe_effect
+from v10_agent.fallback_symbolic import SymbolicFallbackEngine
+from v10_agent.frame_media import render_annotated_frame_png, render_dual_frame_png, render_grid_png
+from v10_agent.judge import LayeredVerifier
+from v10_agent.llm_advisor import BaseLLMAdvisor, build_llm_advisor
+from v10_agent.logging import StructuredAuditLogger
+from v10_agent.memory_contours import BranchSignature, MemoryContourManager, SyntaxErrorRecord
+from v10_agent.observe import grid_to_hex_rows, normalize_observation
+from v10_agent.planning_set import PlanningSet, build_planning_set
+from v10_agent.sandbox import SandboxedModule, SandboxExecutor
+from v10_agent.solver_agent import SolverAgent
+from v10_agent.symbolic_executor import SymbolicTrajectoryExecutor
+from v10_agent.trajectory import TrajectoryPool
+from v10_agent.types import EffectDeclaration, Grid2D
+from v10_agent.verification import GroundedStep, GroundingError, VerificationBinder
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class GameSessionConfig:
-    """Configuration for GameSession."""
-    max_steps_per_level: int = 50
-    enable_logging: bool = True
-    max_coder_retries: int = 3
-    max_solver_retries: int = 4
+class LevelAttemptsExhaustedError(RuntimeError):
+    """Raised when level retry budget (5 attempts) is exhausted, triggering game_over without reset."""
+    pass
+
+
+from enum import Enum
+
+class SessionPhase(Enum):
+    PROBING = "probing"
+    CODING = "coding"
+    SOLVING = "solving"
+    EXECUTING = "executing"
+    REFLECTING = "reflecting"
+    FALLBACK = "fallback"
+
+class PhaseTransition:
+    """Определяет допустимые переходы и условия."""
+    TRANSITIONS = {
+        SessionPhase.PROBING: [SessionPhase.CODING, SessionPhase.FALLBACK, SessionPhase.PROBING],
+        SessionPhase.CODING: [SessionPhase.SOLVING, SessionPhase.PROBING, SessionPhase.FALLBACK],
+        SessionPhase.SOLVING: [SessionPhase.EXECUTING, SessionPhase.PROBING, SessionPhase.FALLBACK],
+        SessionPhase.EXECUTING: [SessionPhase.REFLECTING, SessionPhase.SOLVING, SessionPhase.PROBING, SessionPhase.FALLBACK],
+        SessionPhase.REFLECTING: [SessionPhase.PROBING, SessionPhase.SOLVING, SessionPhase.EXECUTING],
+        SessionPhase.FALLBACK: [SessionPhase.EXECUTING, SessionPhase.PROBING, SessionPhase.SOLVING],
+    }
+
+    @classmethod
+    def can_transition(cls, from_phase: SessionPhase, to_phase: SessionPhase) -> bool:
+        if from_phase == to_phase:
+            return True
+        allowed = cls.TRANSITIONS.get(from_phase, [])
+        return to_phase in allowed
+
+
 
 
 class GameSession:
-    """
-    Main orchestration class for ARC-AGI-3 game sessions.
-    
-    Implements the double-loop learning architecture:
-    - Outer loop: Level progression
-    - Inner loop: Hypothesis testing with Explorer/Coder/Solver
-    
-    ISO Invariants:
-    - ISO-1: Explorer has no goal information
-    - ISO-2: Coder cannot see traceback from Solver
-    - ISO-3: Memory contours are strictly disjoint
-    - ISO-4: Solver never sees Python source code
-    - ISO-5: PlanningSet bijection maintained
-    
-    CRITICAL SECURITY INVARIANT:
-    The VLLMClient returns ParsedResponse with:
-    - payload: Clean JSON for agents (NO thinking traces)
-    - reasoning_trace: Raw model reasoning (LOGGING ONLY)
-    
-    GameSession MUST only pass payload to agents, never reasoning_trace.
-    This is enforced at the type level - agents accept Dict, not ParsedResponse.
-    """
-    
-    def __init__(self, config: V10Config, llm_client: Optional[VLLMClient] = None):
-        """
-        Initialize GameSession.
-        
-        Args:
-            config: V10Config instance with budget limits
-            llm_client: VLLMClient instance for LLM calls (optional, creates default if None)
-        """
-        self.config = config
-        self.llm_client = llm_client or VLLMClient(
-            base_url=None,  # Uses default
-            timeout=config.qwen_timeout_seconds,
-            model_name=config.qwen_model_path or None
-        )
-        
-        self.session_config = GameSessionConfig(
-            max_coder_retries=config.max_coder_retries_per_level,
-            max_solver_retries=config.max_solver_retries_per_level,
-        )
-        
-        # Initialize agents with llm_client reference
-        # NOTE: Agents receive only clean Dict payloads, never ParsedResponse
-        self.explorer = ExplorerAgent(llm_client=self.llm_client)
-        self.coder = DSLCoder(llm_client=self.llm_client)
-        self.solver = SolverAgent(llm_client=self.llm_client)
-        
-        # Memory contours (strictly isolated per ISO-3)
-        self.env_spec_memory: Optional[EnvironmentSpecMemory] = None
-        self.syntax_error_memory: Optional[SyntaxErrorMemory] = None
-        self.epistemic_memory: Optional[EpistemicMemory] = None
-        
-        from .action_boundary import ActionBoundary
-        self.action_boundary = ActionBoundary()
+    """Session orchestrator managing the full ARC-AGI-3 lifecycle."""
 
-        # State tracking
-        self.current_level_id: Optional[str] = None
-        self.step_count: int = 0
-        self.action_history: List[Dict[str, Any]] = []
-        
-        # Retry counters (reset per level)
-        self.coder_retry_count: int = 0
-        self.solver_retry_count: int = 0
-        
-        # LLM call counter for monitoring
-        self.llm_call_count: int = 0
-    
-    def _log_reasoning_trace(self, role: AgentRole, reasoning_trace: Optional[str]) -> None:
-        """
-        Log reasoning trace for audit purposes ONLY.
-        
-        CRITICAL: This method ensures reasoning traces NEVER reach agents.
-        They go ONLY to structured logging for debugging/audit.
-        
-        Ref: ISO-1...ISO-5 Isolation Invariants
-        
-        Args:
-            role: Agent role that generated the reasoning
-            reasoning_trace: Raw model reasoning (NEVER passed to other agents)
-        """
-        if reasoning_trace and self.session_config.enable_logging:
-            logger.info(
-                f"[AUDIT] {role.value.upper()} reasoning trace ({len(reasoning_trace)} chars)",
-                extra={
-                    "role": role.value,
-                    "reasoning_length": len(reasoning_trace),
-                    "level_id": self.current_level_id,
-                    "step": self.step_count
-                }
-            )
-            # Debug log contains full trace (only in debug mode)
-            logger.debug(f"[AUDIT] {role.value.upper()} full trace: {reasoning_trace}")
-    
-    def _call_llm_with_isolation(self, role: AgentRole, messages: List[Dict], 
-                                  json_schema: Dict) -> Optional[Dict]:
-        """
-        Call LLM and return ONLY the clean payload, logging reasoning_trace.
-        
-        This is the PRIMARY enforcement point for thinking trace isolation.
-        
-        Flow:
-        1. Call VLLMClient.generate() -> ParsedResponse
-        2. Log reasoning_trace via _log_reasoning_trace() (audit only)
-        3. Return payload if status=="OK", else handle error
-        
-        Ref: ISO-1...ISO-5 - reasoning_trace NEVER reaches agents
-        
-        Args:
-            role: Agent role (determines temperature, thinking config)
-            messages: Chat messages for LLM
-            json_schema: JSON Schema for response validation
-            
-        Returns:
-            Clean Dict payload if successful, None on error
-        """
-        self.llm_call_count += 1
-        
-        response = self.llm_client.generate(
-            role=role,
-            messages=messages,
-            json_schema=json_schema
-        )
-        
-        # CRITICAL: Log reasoning_trace BEFORE any agent interaction
-        # This ensures it goes to logs ONLY, never to agents
-        self._log_reasoning_trace(role, response.reasoning_trace)
-        
-        if response.status == "OK":
-            return response.payload
-        elif response.status == "PARSE_ERROR":
-            logger.warning(
-                f"LLM parse error for {role.value}: {response.error_message}",
-                extra={"role": role.value, "level_id": self.current_level_id}
-            )
-            return None
-        elif response.status == "TIMEOUT":
-            logger.warning(
-                f"LLM timeout for {role.value}: {response.error_message}",
-                extra={"role": role.value, "level_id": self.current_level_id}
-            )
-            return None
-        else:  # CONNECTION_ERROR
-            logger.error(
-                f"LLM connection error for {role.value}: {response.error_message}",
-                extra={"role": role.value, "level_id": self.current_level_id}
-            )
-            return None
-    
-    def act(self, raw_observation: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Execute one step of the agent loop.
-        
-        Flow:
-        1. Prepare PlanningSet snapshot
-        2. Explorer (if environment unknown) -> receives ONLY payload
-        3. Coder (if manifest needed) -> receives ONLY payload
-        4. Solver (generate candidates) -> receives ONLY payload
-        5. Select candidate via PolicyEngine
-        6. Verify arguments via VerificationBinder
-        7. Execute ONE step via ActionBoundary
-        
-        ISO Invariant Enforcement:
-        - Explorer receives NO goal info (ISO-1)
-        - Coder receives NO traceback (ISO-2)
-        - Solver receives NO Python source (ISO-3)
-        
-        Args:
-            raw_observation: Current grid state from environment
-            
-        Returns:
-            Action to execute, or None if no valid action found
-        """
-        try:
-            # Step 1: Explorer phase (if needed)
-            explorer_payload = self._run_explorer(raw_observation)
-            
-            if explorer_payload is None:
-                # Explorer failed - use fallback or previous env spec
-                logger.warning("Explorer failed, using fallback")
-                explorer_payload = self._explorer_fallback(raw_observation)
-            
-            # Step 2: Coder phase (generate/update DSL functions)
-            coder_payload = self._run_coder(explorer_payload)
-            
-            if coder_payload is None:
-                # Coder failed - trigger double-loop retry
-                logger.warning("Coder failed, triggering retry loop")
-                coder_payload = self._run_coder_with_retry(explorer_payload)
-                
-                if coder_payload is None:
-                    # Exhausted retries - force symbolic fallback
-                    logger.error("Coder exhausted retries, forcing fallback")
-                    return self._symbolic_fallback(raw_observation)
-            
-            # Step 3: Solver phase (generate trajectory candidates)
-            solver_payload = self._run_solver(coder_payload)
-            
-            if solver_payload is None:
-                # Solver failed - retry or fallback
-                logger.warning("Solver failed, attempting retry")
-                solver_payload = self._run_solver_with_retry(coder_payload)
-                
-                if solver_payload is None:
-                    # Exhausted retries - symbolic fallback
-                    logger.error("Solver exhausted retries, forcing fallback")
-                    return self._symbolic_fallback(raw_observation)
-            
-            # Step 4: Select best candidate and extract first action
-            selected_action = self._select_action_from_candidates(solver_payload)
-            
-            # 7. emit pending action through ActionBoundary (one step only)
-            if selected_action:
-                self.action_boundary.execute_action(selected_action["action"], selected_action.get("args", {}))
-
-            return selected_action
-            
-        except Exception as e:
-            logger.exception(f"Unexpected error in act(): {e}")
-            return self._symbolic_fallback(raw_observation)
-    
-    def _run_explorer(self, observation: Dict) -> Optional[Dict]:
-        """
-        Run Explorer agent with isolated LLM call.
-        
-        Ref: ISO-1 - Explorer receives NO goal information
-        
-        Args:
-            observation: Current environment observation
-            
-        Returns:
-            Explorer payload (probes, env_spec) or None on error
-        """
-        try:
-            # Build PlanningSet snapshot from raw observation
-            planning_set = self._build_planning_set_from_observation(observation)
-            
-            # Create annotated frame placeholder (full impl would render PNG)
-            annotated_frame = self._create_annotated_frame(observation)
-            
-            # Call Explorer agent with proper interface
-            explorer_response = self.explorer.act(
-                planning_set=planning_set,
-                annotated_frame=annotated_frame,
-                action_history=self.action_history[-10:],  # Last 10 actions
-                probe_history=None,  # Full impl would pass probe history
-            )
-            
-            return explorer_response
-            
-        except Exception as e:
-            logger.exception(f"Explorer agent failed: {e}")
-            return None
-    
-    def _build_planning_set_from_observation(self, observation: Dict) -> "PlanningSet":
-        """
-        Build PlanningSet snapshot from raw observation.
-        
-        Args:
-            observation: Raw grid observation dict
-            
-        Returns:
-            PlanningSet instance for Explorer agent
-        """
-        from .planning_set import PlanningSet
-        
-        # Extract grid and compute hash
-        grid = observation.get("grid", [])
-        grid_str = str(grid)
-        grid_hash = hashlib.sha256(grid_str.encode()).hexdigest()
-        
-        # Generate snapshot ID
-        snapshot_id = f"snapshot_{self.current_level_id}_{self.step_count}" if self.current_level_id else f"snapshot_{self.step_count}"
-        
-        # Stub object/relation/action IDs as frozensets (required by PlanningSet)
-        object_ids = frozenset(["obj_0", "obj_1"])  # Default stub objects
-        relation_ids = frozenset(["rel_0"])  # Default stub relations
-        allowed_action_ids = frozenset(["ACTION1", "ACTION6"])  # Default actions
-        
-        # Identity mapping for object aliases (I6 bijection requirement)
-        from frozendict import frozendict
-        object_real_to_alias = frozendict({oid: oid for oid in object_ids})
-        
-        return PlanningSet(
-            snapshot_id=snapshot_id,
-            grid_hash=grid_hash,
-            object_ids=object_ids,
-            relation_ids=relation_ids,
-            allowed_action_ids=allowed_action_ids,
-            object_real_to_alias=object_real_to_alias,
-        )
-    
-    def _create_annotated_frame(self, observation: Dict) -> str:
-        """
-        Create annotated frame representation for Explorer.
-        
-        Args:
-            observation: Raw grid observation dict
-            
-        Returns:
-            Annotated frame string (base64 PNG or text representation)
-        """
-        # Stub implementation - returns text representation
-        # Full impl would render PNG with object/relation overlays
-        return f"Grid observation at step {self.step_count}: {str(observation)[:200]}..."
-    
-    def _run_coder(self, explorer_payload: Dict) -> Optional[Dict]:
-        """
-        Run Coder agent with isolated LLM call.
-        
-        Ref: ISO-2 - Coder receives NO traceback, only error summaries
-        Ref: ISO-4 - Coder sees syntax errors but NOT Solver's Python traceback
-        
-        Args:
-            explorer_payload: Clean Explorer output (probes, reasoning)
-            
-        Returns:
-            Coder payload (source_code, function_names) or None on error
-        """
-        try:
-            # Build EnvironmentSpecification from explorer payload
-            env_spec = self._build_environment_spec(explorer_payload)
-            
-            # Build API manifest (proper dict structure, not list)
-            # Extract function names from probes or use default DSL functions
-            probe_list = explorer_payload.get("probes", [])
-            api_manifest = {
-                "functions": {
-                    f"probe_{i}": {
-                        "signature": f"probe_{i}(x, y)",
-                        "docstring": f"Probe action at coordinates",
-                        "parameters": {"x": "int", "y": "int"},
-                        "return_type": "EffectDeclaration"
-                    }
-                    for i in range(len(probe_list))
-                } if probe_list else {
-                    "default_probe": {
-                        "signature": "default_probe(x, y)",
-                        "docstring": "Default probe action",
-                        "parameters": {"x": "int", "y": "int"},
-                        "return_type": "EffectDeclaration"
-                    }
-                }
-            }
-            
-            # Get error summaries from SyntaxErrorMemory (NOT full tracebacks)
-            error_summaries = []
-            if self.syntax_error_memory:
-                error_summaries = self.syntax_error_memory.get_recent_summaries(limit=5)
-            
-            # Convert to SyntaxErrorRecord format for Coder
-            from .types import SyntaxErrorRecord
-            recent_errors: Optional[List[SyntaxErrorRecord]] = None
-            if error_summaries:
-                recent_errors = [
-                    SyntaxErrorRecord(
-                        level_id=self.current_level_id or "unknown",
-                        prompt_hash=f"hash_{i}",
-                        source_hash=f"src_{i}",
-                        summary=err.get("summary", str(err)),
-                        timestamp=i
-                    )
-                    for i, err in enumerate(error_summaries)
-                ]
-            
-            # Call Coder agent with proper interface
-            coder_response = self.coder.act(
-                environment_spec=env_spec,
-                api_manifest=api_manifest,
-                recent_errors=recent_errors,
-            )
-            
-            return coder_response
-            
-        except Exception as e:
-            logger.exception(f"Coder agent failed: {e}")
-            return None
-    
-    def _build_environment_spec(self, explorer_payload: Dict) -> "EnvironmentSpecification":
-        """
-        Build EnvironmentSpecification from Explorer payload.
-        
-        Args:
-            explorer_payload: Raw Explorer output dict
-            
-        Returns:
-            EnvironmentSpecification instance for Coder agent
-        """
-        from .types import EnvironmentSpecification, ObjectSpec, RelationSpec
-        
-        # Extract from explorer payload (stub implementation)
-        grid_width = explorer_payload.get("grid_width", 10)
-        grid_height = explorer_payload.get("grid_height", 10)
-        
-        # Stub object/relation specs (full impl extracts from probes)
-        object_specs: List[ObjectSpec] = []
-        relation_specs: List[RelationSpec] = []
-        
-        return EnvironmentSpecification(
-            grid_width=grid_width,
-            grid_height=grid_height,
-            object_specs=object_specs,
-            relation_specs=relation_specs,
-            action_surface_type="grid",
-            allowed_actions=["ACTION1", "ACTION6"],
-        )
-    
-    def _run_coder_with_retry(self, explorer_payload: Dict) -> Optional[Dict]:
-        """
-        Retry Coder with updated error context (double-loop).
-        
-        Ref: Spec 6 - Error Handling with max_coder_retries
-        
-        Flow:
-        1. Check if retries exhausted
-        2. Update SyntaxErrorMemory with latest error
-        3. Retry Coder with error context
-        
-        Args:
-            explorer_payload: Environment spec from Explorer
-            
-        Returns:
-            Coder payload or None if retries exhausted
-        """
-        while self.coder_retry_count < self.session_config.max_coder_retries:
-            self.coder_retry_count += 1
-            logger.info(
-                f"Coder retry {self.coder_retry_count}/{self.session_config.max_coder_retries}",
-                extra={"level_id": self.current_level_id}
-            )
-            
-            result = self._run_coder(explorer_payload)
-            if result is not None:
-                # Success - reset counter
-                self.coder_retry_count = 0
-                return result
-        
-        # Retries exhausted
-        return None
-    
-    def _run_solver(self, coder_payload: Dict) -> Optional[Dict]:
-        """
-        Run Solver agent with isolated LLM call.
-        
-        Ref: ISO-3 - Solver NEVER sees Python source code
-        Ref: ISO-4 - Solver sees function manifest, NOT implementation
-        
-        Args:
-            coder_payload: Clean Coder output (source_code, function_names, function_manifest)
-            
-        Returns:
-            Solver payload (candidates) or None on error
-        """
-        try:
-            # Build function manifest from coder payload
-            # ISO-3: Extract only manifest with signatures/docstrings, never pass source_code to Solver
-            # Priority: Use function_manifest from CoderResponse if available, otherwise build from function_names
-            if "function_manifest" in coder_payload and coder_payload["function_manifest"]:
-                function_manifest = {"functions": coder_payload["function_manifest"]}
-            else:
-                # Fallback: build minimal manifest from function_names list
-                function_manifest = {
-                    "functions": {
-                        name: {
-                            "signature": f"{name}()",
-                            "docstring": f"DSL function {name}",
-                            "parameters": {},
-                            "return_type": "EffectDeclaration"
-                        }
-                        for name in coder_payload.get("function_names", [])
-                    }
-                }
-            
-            # Get epistemic summary (Brusentsov judgments from previous steps)
-            epistemic_summary = None
-            if self.epistemic_memory:
-                epistemic_summary = self.epistemic_memory.get_summary()
-            
-            # Get live/omit branches from EpistemicMemory
-            live_omit_branches = None
-            severed_null_signatures = None
-            if self.epistemic_memory:
-                live_omit_branches = self.epistemic_memory.get_live_omit_branches(limit=5)
-                severed_null_signatures = self.epistemic_memory.get_severed_null_signatures(limit=5)
-            
-            # Call Solver agent with proper interface
-            solver_response = self.solver.act(
-                function_manifest=function_manifest,
-                epistemic_summary=epistemic_summary,
-                live_omit_branches=live_omit_branches,
-                severed_null_signatures=severed_null_signatures,
-            )
-            
-            return solver_response
-            
-        except Exception as e:
-            logger.exception(f"Solver agent failed: {e}")
-            return None
-    
-    def _run_solver_with_retry(self, coder_payload: Dict) -> Optional[Dict]:
-        """
-        Retry Solver with updated epistemic context.
-        
-        Ref: Spec 6 - Error Handling with max_solver_retries
-        
-        Args:
-            coder_payload: Function manifest from Coder
-            
-        Returns:
-            Solver payload or None if retries exhausted
-        """
-        while self.solver_retry_count < self.session_config.max_solver_retries:
-            self.solver_retry_count += 1
-            logger.info(
-                f"Solver retry {self.solver_retry_count}/{self.session_config.max_solver_retries}",
-                extra={"level_id": self.current_level_id}
-            )
-            
-            result = self._run_solver(coder_payload)
-            if result is not None:
-                # Success - reset counter
-                self.solver_retry_count = 0
-                return result
-        
-        # Retries exhausted
-        return None
-    
-    def _explorer_fallback(self, observation: Dict) -> Dict:
-        """Fallback Explorer when LLM fails."""
-        logger.warning("Using Explorer fallback")
-        return {
-            "probes": [{"x": 0, "y": 0, "confidence": 0.5}],
-            "reasoning": "Fallback: minimal probe"
-        }
-    
-    def _symbolic_fallback(self, observation: Dict) -> Optional[Dict[str, Any]]:
-        """
-        Symbolic fallback when all agents fail.
-        
-        Ref: Spec 6 - Fallback Configuration
-        
-        Returns:
-            Minimal probe action
-        """
-        logger.warning("Using symbolic fallback")
-        from .fallback_symbolic import get_symbolic_action
-        return get_symbolic_action(observation)
-    
-    def _select_action_from_candidates(self, solver_payload: Dict) -> Optional[Dict[str, Any]]:
-        """
-        Select best action from Solver candidates using PolicyEngine.
-        """
-        from .policy import PolicyEngine
-        engine = PolicyEngine()
-        best = engine.select_best_candidate(solver_payload)
-        
-        if not best:
-            return None
-
-        steps = best.get("steps", [])
-        if not steps:
-            return None
-
-        first_step = steps[0]
-        return {
-            "action": first_step.get("function", "PROBE"),
-            "args": first_step.get("args", {})
-        }
-    
-    def _extract_propositions_from_observation(
+    def __init__(
         self,
-        observation: Dict[str, Any],
-        snapshot_hash: str,
-    ) -> List["AtomicProposition"]:
-        """
-        Extract AtomicPropositions from raw grid observation.
-        
-        This is a stub implementation that extracts basic propositions.
-        Full implementation would use SnapshotBuilder to extract all
-        registered proposition families per Spec 3.3.
-        
-        Args:
-            observation: Raw grid observation dict with 'grid' key
-            snapshot_hash: Hash of the snapshot for PropositionSet context
-            
-        Returns:
-            List of AtomicProposition instances representing observed state
-        
-        Ref: Spec 3.3 - Atomic proposition families (normative)
-        """
-        from .types import AtomicProposition
-        
-        propositions: List[AtomicProposition] = []
-        grid = observation.get("grid", [])
-        
-        if not grid:
-            return propositions
-        
-        # Extract grid dimensions as positional context
-        height = len(grid)
-        width = len(grid[0]) if height > 0 else 0
-        
-        # Stub proposition: grid dimensions (attribute_delta family)
-        propositions.append(
-            AtomicProposition(
-                family="attribute_delta",
-                data={
-                    "attribute": "grid_dimensions",
-                    "object_id": "grid_main",
-                    "delta_width": width,
-                    "delta_height": height,
-                },
-                objects=("grid_main",),
-                relations=(),
-            )
+        config: V10Config | None = None,
+        advisor: BaseLLMAdvisor | None = None,
+    ):
+        self.config = config or V10Config()
+        self.advisor = advisor or build_llm_advisor(self.config)
+
+        # Contours & Services
+        self.memory_manager = MemoryContourManager()
+        self.sandbox_executor = SandboxExecutor(
+            allowed_modules=self.config.sandbox_allowed_modules,
+            timeout_seconds=self.config.sandbox_max_cpu_seconds,
         )
-        
-        # Count non-zero cells as a simple metric_sign proposition
-        non_zero_count = sum(1 for row in grid for cell in row if cell != 0)
-        propositions.append(
-            AtomicProposition(
-                family="metric_sign",
-                data={
-                    "metric": "non_zero_cells",
-                    "sign": 1 if non_zero_count > 0 else 0,
-                    "count": non_zero_count,
-                },
-                objects=("grid_main",),
-                relations=(),
-            )
+        self.binder = VerificationBinder()
+        self.verifier = LayeredVerifier(self.config)
+        self.fallback_engine = SymbolicFallbackEngine(self.config)
+        self.symbolic_executor = SymbolicTrajectoryExecutor(
+            config=self.config,
+            sandbox_executor=self.sandbox_executor,
+            binder=self.binder,
+            verifier=self.verifier,
         )
-        
-        # Stub terminal flag (assume non-terminal unless grid is empty)
-        propositions.append(
-            AtomicProposition(
-                family="terminal_flag",
-                data={"is_terminal": False, "reason": "active_level"},
-                objects=("grid_main",),
-                relations=(),
-            )
-        )
-        
-        logger.debug(
-            f"Extracted {len(propositions)} atomic propositions from observation",
-            extra={"snapshot_hash": snapshot_hash, "grid_size": f"{width}x{height}"}
-        )
-        
-        return propositions
-    
-    def observe_action_result(
-        self,
-        after_observation: Dict[str, Any],
-        expected_propositions: Optional[List["AtomicProposition"]] = None,
-        action_sequence: Optional[tuple] = None,
-        sandbox_exception: Optional[Exception] = None,
-    ) -> None:
-        """
-        Process the result of an executed action with double-loop learning.
-        
-        This method implements the core of the double-loop learning architecture:
-        - Inner loop: Hypothesis testing via LayeredVerifier
-        - Outer loop: Memory contour updates for cross-level learning
-        
-        Flow:
-        1. IF sandbox_exception occurred:
-           - Create SyntaxErrorRecord and add to SyntaxErrorMemory
-           - Trigger Coder retry path (handled by caller)
-        
-        2. IF no exception:
-           a. Build PropositionSet from observed state (after_observation)
-           b. Build PropositionSet from expected effects (expected_propositions)
-           c. Call LayeredVerifier.verify_transition()
-           d. Route judgment to EpistemicMemory:
-              - FOLLOW (TRUE): Continue current trajectory branch
-              - NULL (FALSE): Record severed branch signature
-              - OMIT (IRRELEVANT): Record live omit branch for potential pivot
-        
-        ISO Invariants Enforced:
-        - ISO-3: Memory contours remain strictly disjoint
-        - SyntaxErrorMemory receives only error summaries (no Python tracebacks visible to Solver)
-        - EpistemicMemory receives only Brusentsov judgments (no source code)
-        
-        Args:
-            after_observation: Grid state after action execution
-            expected_propositions: Expected AtomicPropositions from DSL function's EffectDeclaration
-            action_sequence: Sequence of action IDs for branch signature tracking
-            sandbox_exception: Exception raised during sandbox execution (if any)
-        
-        Returns:
-            None (side effects: updates memory contours)
-        
-        Ref: Spec 5 - LayeredVerifier Contract
-        Ref: Spec 3.5 - Memory Contours (EpistemicMemory, SyntaxErrorMemory)
-        Ref: Spec 3.1 - Brusentsov Ternary Logic
-        """
-        import time
-        
-        # =========================================================================
-        # Path A: Sandbox Exception -> SyntaxErrorMemory
-        # =========================================================================
-        if sandbox_exception is not None:
-            logger.info(
-                f"Sandbox exception detected, recording to SyntaxErrorMemory",
-                extra={
-                    "level_id": self.current_level_id,
-                    "step": self.step_count,
-                    "exception_type": type(sandbox_exception).__name__,
-                }
-            )
-            
-            if self.syntax_error_memory is None:
-                # Lazy initialization on first error
-                from .memory_contours import SyntaxErrorMemory
-                object.__setattr__(self, 'syntax_error_memory', SyntaxErrorMemory())
-            
-            # Create prompt/source hashes for error record
-            # (In full impl, these would come from Coder's last generation)
-            prompt_hash = hashlib.sha256(b"stub_prompt").hexdigest()
-            source_hash = hashlib.sha256(b"stub_source").hexdigest()
-            
-            # Capture traceback string (NEVER passed to Solver - ISO-2)
-            import traceback
-            traceback_str = traceback.format_exception(type(sandbox_exception), sandbox_exception, sandbox_exception.__traceback__)
-            traceback_text = "".join(traceback_str)
-            
-            # Add to SyntaxErrorMemory (max 5 entries, FIFO eviction)
-            self.syntax_error_memory = self.syntax_error_memory.add_error(
-                level_id=self.current_level_id or "unknown",
-                prompt_hash=prompt_hash,
-                source_hash=source_hash,
-                traceback=traceback_text,
-                static_diagnostics=[f"SandboxException: {type(sandbox_exception).__name__}"],
-                timestamp=int(time.time()),
-            )
-            
-            logger.info(
-                f"SyntaxErrorMemory now contains {self.syntax_error_memory.error_count} errors",
-                extra={"level_id": self.current_level_id}
-            )
-            return  # Early return - no verification possible with exception
-        
-        # =========================================================================
-        # Path B: Normal Execution -> LayeredVerifier -> EpistemicMemory
-        # =========================================================================
-        
-        # Initialize memory contours if not already created
-        if self.env_spec_memory is None:
-            from .memory_contours import EnvironmentSpecMemory, EnvironmentSpecification
-            from .types import PropositionSet
-            initial_spec = EnvironmentSpecification(
-                spec_id=f"spec_{self.current_level_id or 'init'}",
-                initial_propositions=PropositionSet.create(snapshot_hash="init"),
-            )
-            object.__setattr__(self, 'env_spec_memory', EnvironmentSpecMemory(current_spec=initial_spec))
-        
-        if self.epistemic_memory is None:
-            from .memory_contours import EpistemicMemory
-            object.__setattr__(self, 'epistemic_memory', EpistemicMemory())
-        
-        # -------------------------------------------------------------------------
-        # Step 1: Build Observed PropositionSet from after_observation
-        # -------------------------------------------------------------------------
-        grid = after_observation.get("grid", [])
-        grid_str = str(grid)
-        observed_hash = hashlib.sha256(grid_str.encode()).hexdigest()
-        
-        # Extract atomic propositions from observed grid state
-        # (Full impl would use SnapshotBuilder to extract all proposition families)
-        observed_propositions = self._extract_propositions_from_observation(
-            after_observation, observed_hash
-        )
-        
-        from .types import PropositionSet
-        observed_set = PropositionSet.create(
-            snapshot_hash=observed_hash,
-            propositions=observed_propositions,
-            timestamp=self.step_count,
-        )
-        
-        # -------------------------------------------------------------------------
-        # Step 2: Build Expected PropositionSet from DSL function's EffectDeclaration
-        # -------------------------------------------------------------------------
-        if expected_propositions is None:
-            # No expected propositions provided - create empty set
-            # This represents an exploratory action with no specific prediction
-            expected_set = PropositionSet.create(
-                snapshot_hash=observed_hash,  # Same snapshot context
-                propositions=[],
-                timestamp=self.step_count,
-            )
-            logger.debug(
-                "No expected propositions provided; using empty expected set",
-                extra={"step": self.step_count}
+        self.audit_logger = StructuredAuditLogger()
+
+        # Agents
+        self.explorer = ExplorerAgent(self.config, self.advisor)
+        self.coder = DSLCoder(self.config, self.advisor, self.sandbox_executor)
+        self.solver = SolverAgent(self.config, self.advisor)
+
+        # Active Session State
+        self.active_module: SandboxedModule | None = None
+        self.active_manifest: dict[str, Any] | None = None
+        self.active_pool: TrajectoryPool | None = None
+
+        self.last_snapshot: ARGALiteSnapshot | None = None
+        self.last_planning_set: PlanningSet | None = None
+        self.pending_step: GroundedStep | None = None
+        self.pending_action: dict[str, Any] | None = None
+
+        # Divided Fallback & Probe Orchestration State
+        self.probe_queue: list[dict[str, Any]] = []
+        self.current_phase: SessionPhase = SessionPhase.PROBING
+        self.probe_actions_executed_this_level: int = 0
+        self.known_actions: set[str] = set()
+        self.active_pipeline: str = "discrete"
+        self.last_probe_action: dict[str, Any] | None = None
+        self.session_aborted: bool = False
+        self.replan_requested: bool = False
+
+        self.coder_failed_for_level: bool = False
+        self.game_over_reset_count: int = 0
+        self.solver_reset_pending: bool = False
+        self.solver_reset_reason: str | None = None
+        self.last_engine_action: str = ""
+        self.current_level_id: str = "level_0"
+        self.current_game_id: str = "game_0"
+        self.accepted_action_count: int = 0
+        self.levels_completed_observed: int = 0
+        self.observed_transition_ingestions: int = 0
+        self.observed_transition_duplicate_skips: int = 0
+        self._level_win_handled: bool = False
+        self._last_trajectory_id: str | None = None
+        self.crop_offset: int = 0
+        self.level_chain_attempts: int = 0
+        self.explorer_attempts_this_level: int = 0
+        self.explorer_reprobe_pending: bool = False
+        self.level_initial_grid: Grid2D | None = None
+        self.level_initial_grid_hash: str | None = None
+        self.level_executed_actions: list[str] = []
+
+    def transition_to(self, new_phase: SessionPhase, reason: str = "") -> None:
+        """Explicit state machine transition enforcing allowed lifecycle progression."""
+        if not PhaseTransition.can_transition(self.current_phase, new_phase):
+            logger.warning(
+                f"State Machine: unexpected transition {self.current_phase.value} -> {new_phase.value} ({reason})."
             )
         else:
-            expected_set = PropositionSet.create(
-                snapshot_hash=observed_hash,
-                propositions=expected_propositions,
-                timestamp=self.step_count,
+            logger.debug(f"State Machine: {self.current_phase.value} -> {new_phase.value} ({reason})")
+        self.current_phase = new_phase
+
+    @property
+    def probing_phase(self) -> bool:
+        return self.current_phase == SessionPhase.PROBING
+
+    @probing_phase.setter
+    def probing_phase(self, val: bool) -> None:
+        if val:
+            self.transition_to(SessionPhase.PROBING, "probing_phase set True")
+        else:
+            if self.current_phase == SessionPhase.PROBING:
+                target = SessionPhase.CODING if self.active_module is None else SessionPhase.SOLVING
+                self.transition_to(target, "probing_phase set False")
+
+    def update_runtime_config(self, updates: Mapping[str, Any]) -> None:
+        """Dynamically update runtime configuration without destroying session memory."""
+        self.config.update_runtime(updates)
+
+    def handle_level_transition(self, new_level_id: str) -> None:
+        """Clean level-local state, preserve GameMemory cross-level invariants."""
+        # Record distilled solution pattern into GameMemory for curriculum progression
+        if self.current_level_id:
+            game_mem = self.memory_manager.get_game_memory("session")
+            setup_str = f"{len(self.last_planning_set.objects) if self.last_planning_set else 'several'} entities"
+
+            winning_cand: dict[str, Any] | None = None
+            if self.active_pool and self.active_pool.candidates:
+                active_c = self.active_pool.active_candidate() or self.active_pool.candidates[0]
+                winning_cand = {
+                    "trajectory_id": active_c.trajectory_id,
+                    "steps": active_c.steps,
+                }
+
+            executed_steps = [
+                a for a in self.level_executed_actions
+                if a and a.upper() not in ("RESET", "ACTION7")
+            ]
+            exec_summary = (
+                f"{len(executed_steps)} actions executed: {', '.join(executed_steps[:12])}"
+                if executed_steps
+                else "Direct candidate completion"
             )
-        
-        # -------------------------------------------------------------------------
-        # Step 3: Call LayeredVerifier.verify_transition()
-        # -------------------------------------------------------------------------
-        from .judge import LayeredVerifier
-        verifier = LayeredVerifier()
-        
-        verification_result = verifier.verify_transition(
-            expected=expected_set,
-            observed=observed_set,
-            action_sequence=action_sequence,
+
+            # Turn 2: Ask Solver to reflect on the win and distill domain-general invariants
+            self.transition_to(SessionPhase.REFLECTING, "distilling level win invariants")
+            distilled_invariants = self.solver.distill_level_win_invariants(
+                winning_candidate=winning_cand,
+                execution_summary=exec_summary,
+            )
+
+            for inv in distilled_invariants:
+                game_mem.record_stratified_invariant(inv, tier=3)
+
+            primary_inv = " | ".join(distilled_invariants) if distilled_invariants else "Satisfied level goal via coordinated alignment"
+            game_mem.record_level_solution(
+                level_id=self.current_level_id,
+                setup_summary=setup_str,
+                invariant_rule=primary_inv,
+                winning_macro="",  # Omitted to prevent button-sequence pollution in cross-level memory
+            )
+
+            # Track discovered invariants across level transitions
+            if self.last_planning_set:
+                try:
+                    from v10_agent.universal_invariants import discover_invariants
+                    new_invs = discover_invariants(self.last_planning_set, confirmed_actors=game_mem.confirmed_actors)
+                    inv_diff = game_mem.compare_and_record_invariants(new_invs)
+                    re_eval_stats = game_mem.re_evaluate_invariants(self.last_planning_set, level_id=new_level_id)
+                    logger.info(
+                        f"Cross-level invariant re-evaluation: {re_eval_stats['confirmed']} confirmed, "
+                        f"{re_eval_stats['falsified']} falsified, {re_eval_stats['unchanged']} unchanged."
+                    )
+                except Exception as exc:
+                    logger.debug(f"Cross-level invariant comparison skipped: {exc}")
+
+        self.level_executed_actions.clear()
+
+        self.current_level_id = new_level_id
+        self.active_module = None
+        self.active_manifest = None
+        self.active_pool = None
+        self.pending_step = None
+        self.pending_action = None
+        self.last_probe_action = None
+        self.probe_queue = []
+        self.transition_to(SessionPhase.PROBING, "new level transition")
+        self.probe_actions_executed_this_level = 0
+        self.level_chain_attempts = 0
+        self.explorer_attempts_this_level = 0
+        self.explorer_reprobe_pending = False
+        # Seed known_actions from GameMemory confirmed kinematics to avoid blind re-probing
+        game_mem = self.memory_manager.get_game_memory("session")
+        self.known_actions = set(game_mem.confirmed_action_effects.keys())
+        self.active_pipeline = "discrete"
+        self.session_aborted = False
+        self.replan_requested = False
+        self.coder_failed_for_level = False
+        self.solver_reset_pending = False
+        self.solver_reset_reason = None
+        self._level_win_handled = False
+        self._last_trajectory_id = None
+        self.level_initial_grid = None
+        self.level_initial_grid_hash = None
+        self.memory_manager.handle_level_transition(new_level_id)
+        if hasattr(self.explorer, "probe_manager") and hasattr(self.explorer.probe_manager, "handle_level_transition"):
+            self.explorer.probe_manager.handle_level_transition(game_mem.confirmed_action_effects)
+        logger.info(f"Transitioned to new level {new_level_id}; GameMemory preserved ({len(self.known_actions)} confirmed actions carried forward).")
+
+    def handle_game_transition(self, new_game_id: str) -> None:
+        """Reset all contours when switching games."""
+        self.current_game_id = new_game_id
+        self.level_chain_attempts = 0
+        self.explorer_attempts_this_level = 0
+        self.explorer_reprobe_pending = False
+        self.level_executed_actions.clear()
+        self.current_level_id = "level_0"
+        self.active_module = None
+        self.active_manifest = None
+        self.active_pool = None
+        self.pending_step = None
+        self.pending_action = None
+        self.last_probe_action = None
+        self.probe_queue = []
+        self.probing_phase = True
+        self.probe_actions_executed_this_level = 0
+        self.solver_reset_pending = False
+        self.solver_reset_reason = None
+        self.level_initial_grid = None
+        self.level_initial_grid_hash = None
+        self.known_actions = set()
+        from v10_agent.explorer_agent import PrimitiveProbeManager
+        self.explorer.probe_manager = PrimitiveProbeManager(max_probes=self.config.max_primitive_probes_per_level)
+        self.active_pipeline = "discrete"
+        self.session_aborted = False
+        self.replan_requested = False
+        self.coder_failed_for_level = False
+        self._level_win_handled = False
+        self._last_trajectory_id = None
+        self.memory_manager.handle_game_transition(new_game_id, self.current_level_id)
+        logger.info(f"Reset session for new game {new_game_id}.")
+
+    def act(self, raw_observation: Mapping[str, Any]) -> dict[str, Any]:
+        """Propose the single next environment action."""
+        obs = normalize_observation(
+            raw_observation,
+            frame_index=self.accepted_action_count,
+            game_id=self.current_game_id,
+            crop_border=self.config.crop_border_pixels,
         )
-        
-        # Log verification result for audit
-        logger.info(
-            f"LayeredVerifier judgment: {verification_result.judgment.verdict_name}",
-            extra={
-                "judgment": verification_result.judgment.value,
-                "verdict": verification_result.judgment.verdict_name,
-                "reasoning_length": len(verification_result.reasoning),
-                "level_id": self.current_level_id,
-                "step": self.step_count,
+        self.crop_offset = int(obs.get("crop_offset", 0))
+        state_name = obs["state"]
+
+        # 1. Exact Tufa GAME_OVER single RESET Invariant / Resets disabled / 5-attempt budget
+        if state_name == "GAME_OVER":
+            if self.last_engine_action == "RESET":
+                logger.error("GAME_OVER persisted after single RESET. Forcing loop break.")
+                raise RuntimeError("GAME_OVER persisted after single RESET")
+
+            max_attempts = getattr(self.config, "max_chain_attempts_per_level", 5)
+            if not self.config.reset_on_game_over or self.level_chain_attempts >= max_attempts:
+                logger.warning(
+                    f"GAME_OVER encountered and level attempts exhausted ({self.level_chain_attempts}/{max_attempts}) "
+                    f"or resets disabled; abandoning game without reset."
+                )
+                self.session_aborted = True
+                raise LevelAttemptsExhaustedError(
+                    f"GAME_OVER encountered and level attempts exhausted ({max_attempts} attempts); "
+                    f"transitioning to next game without reset"
+                )
+
+            self.game_over_reset_count += 1
+            self.replan_requested = True
+            self.active_pool = None
+            self.level_executed_actions.clear()
+            reset_action = {
+                "id": "RESET",
+                "action_id": "RESET",
+                "data": {},
+                "reasoning": {
+                    "source": "tufa_game_over_auto_reset",
+                    "reset_count": self.game_over_reset_count,
+                    "attempt": self.level_chain_attempts,
+                },
             }
+            self.pending_action = reset_action
+            self.last_engine_action = "RESET"
+            self.pending_step = None
+            return reset_action
+
+        # Check for level change (multi-signal detection)
+        observed_levels = obs.get("levels_completed", 0)
+        level_transition_detected = False
+        if observed_levels > self.levels_completed_observed:
+            level_transition_detected = True
+            self.levels_completed_observed = observed_levels
+        elif state_name == "WIN" and not self._level_win_handled:
+            level_transition_detected = True
+            self.levels_completed_observed += 1
+            self._level_win_handled = True
+
+        if state_name != "WIN":
+            self._level_win_handled = False
+
+        if level_transition_detected:
+            self.handle_level_transition(f"level_{self.levels_completed_observed}")
+
+        available_actions = obs.get("available_actions", [])
+
+        # 2. Hard Abort Check (if session aborted due to attempt exhaustion)
+        if self.session_aborted:
+            raise LevelAttemptsExhaustedError("Session aborted due to level attempt exhaustion (5 attempts). Transitioning to next game without reset.")
+
+        # 3. Perception & PlanningSet Construction
+        grid = obs["grid"]
+        snapshot = extract_arga_snapshot(grid)
+        snapshot.levels_completed = int(obs.get("levels_completed", 0) or 0)
+        hex_rows = grid_to_hex_rows(grid)
+        planning_set = build_planning_set(
+            snapshot=snapshot,
+            available_actions=available_actions,
+            grid_hex_rows=hex_rows,
         )
-        logger.debug(
-            f"Verification reasoning: {verification_result.reasoning}",
-            extra={"level_id": self.current_level_id}
-        )
-        
-        # -------------------------------------------------------------------------
-        # Step 4: Route judgment to EpistemicMemory
-        # -------------------------------------------------------------------------
-        from .types import BrusentsovJudgment
-        
-        # Create BrusentsovJudgment record for EpistemicMemory
-        judgment_record = verifier.create_judgment_record(
-            verification_result,
-            timestamp=float(time.time()),
-        )
-        
-        # Add judgment to EpistemicMemory (automatically tracks live/severed branches)
-        self.epistemic_memory = self.epistemic_memory.add_judgment(judgment_record)
-        
-        # Log memory contour state
-        logger.info(
-            f"EpistemicMemory updated: {self.epistemic_memory.judgment_count} judgments, "
-            f"{self.epistemic_memory.live_omit_count} live OMIT branches, "
-            f"{self.epistemic_memory.severed_null_count} severed NULL branches",
-            extra={
-                "level_id": self.current_level_id,
-                "judgment_type": judgment_record.judgment_type,
+
+        # Record pristine initial frame of level on very first step before any actions
+        if self.level_initial_grid is None:
+            self.level_initial_grid = [list(row) for row in grid]
+            self.level_initial_grid_hash = planning_set.grid_hash
+            logger.info(f"Recorded pristine level initial frame for {self.current_level_id} (hash={planning_set.grid_hash[:8]}).")
+        elif self.last_engine_action == "RESET" and self.level_initial_grid_hash is not None:
+            if planning_set.grid_hash == self.level_initial_grid_hash:
+                logger.info(f"Verified post-reset frame strictly matches initial level frame (hash={planning_set.grid_hash[:8]}).")
+            else:
+                logger.warning(
+                    f"Post-reset frame divergence: initial={self.level_initial_grid_hash[:8]}, current={planning_set.grid_hash[:8]}. "
+                    f"Synchronizing reference to fresh reset state."
+                )
+                self.level_initial_grid = [list(row) for row in grid]
+                self.level_initial_grid_hash = planning_set.grid_hash
+
+        env_mem = self.memory_manager.get_env_spec_memory("session")
+        syntax_mem = self.memory_manager.get_syntax_error_memory("session")
+        ep_mem = self.memory_manager.get_epistemic_memory("session")
+
+        # 3.5. Clean State Reset (Takes precedence to ensure clean board before probing/replan)
+        if self.solver_reset_pending:
+            self.solver_reset_pending = False
+            reset_action = {
+                "id": "RESET",
+                "action_id": "RESET",
+                "data": {},
+                "reasoning": {"source": self.solver_reset_reason or "solver_clean_state_reset"},
             }
+            self.last_snapshot = snapshot
+            self.last_planning_set = planning_set
+            self.pending_action = reset_action
+            self.last_engine_action = "RESET"
+            self.pending_step = None
+            self.level_executed_actions.clear()
+            self.audit_logger.log(
+                "action_emitted",
+                action="RESET",
+                data={},
+                strategy="solver_reset",
+                grid_hash=planning_set.grid_hash,
+                level_id=self.current_level_id,
+            )
+            return reset_action
+
+        # 4. Pipeline Determination & Probing Phase
+        if self.probing_phase:
+            non_meta_actions = [a for a in available_actions if str(a).upper() not in ("RESET", "ACTION7")]
+            only_coords = all(str(a).upper() == "ACTION6" for a in non_meta_actions) and len(non_meta_actions) > 0
+            coord_quota = 5 if only_coords else 3
+
+            has_coords = "ACTION6" in planning_set.allowed_action_ids or any(
+                isinstance(a, str) and any(kw in a.lower() for kw in ("x", "y", "coord", "click"))
+                for a in available_actions
+            )
+
+            # Check if an explorer reprobe was scheduled after a clean state reset
+            if self.explorer_reprobe_pending and not self.probe_queue:
+                self.explorer_reprobe_pending = False
+                if has_coords and "ACTION6" not in self.explorer.probe_manager.confirmed_effective_actions:
+                    explorer_mm = getattr(
+                        self.config, "explorer_multimodal_enabled",
+                        getattr(self.config, "multimodal_enabled", getattr(self.config, "qwen_multimodal_enabled", True))
+                    )
+                    raw_png = render_grid_png(grid) if explorer_mm else None
+                    annotated_png = render_annotated_frame_png(grid, planning_set) if explorer_mm else None
+                    if raw_png:
+                        try:
+                            with open("explorer_raw_frame.png", "wb") as f:
+                                f.write(raw_png)
+                        except Exception as e:
+                            logger.debug(f"Frame save skipped: {e}")
+                    if annotated_png:
+                        try:
+                            with open("explorer_annotated_frame.png", "wb") as f:
+                                f.write(annotated_png)
+                        except Exception as e:
+                            logger.debug(f"Frame save skipped: {e}")
+                    explorer_images = [raw_png, annotated_png] if explorer_mm else None
+                    coord_probes = self.explorer.propose_coordinate_probes(
+                        planning_set, memory=env_mem, max_coords=coord_quota, image_png=explorer_images
+                    )
+                    self.explorer_attempts_this_level += 1
+                    logger.info(
+                        f"Explorer reprobe initiated: attempt {self.explorer_attempts_this_level}/"
+                        f"{getattr(self.config, 'max_explorer_attempts_per_level', 5)} (quota={coord_quota})"
+                    )
+                    self.probe_queue.extend(coord_probes)
+
+            if not self.probe_queue:
+                is_dyn = self.explorer.probe_manager.is_dynamic_action_surface(available_actions, self.known_actions)
+
+                has_discrete = any(
+                    str(a).upper() in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5")
+                    for a in available_actions
+                )
+                if has_coords and has_discrete:
+                    self.active_pipeline = "hybrid"
+                elif has_coords:
+                    self.active_pipeline = "coordinate"
+                elif is_dyn:
+                    self.active_pipeline = "dynamic"
+                else:
+                    self.active_pipeline = "discrete"
+
+                if not getattr(self.explorer.probe_manager, "_initial_sweep_planned", False):
+                    if self.config.enable_primitive_probing:
+                        # 1. Plan discrete probes for initial sweep of ACTION1..ACTION5
+                        discrete_probes = self.explorer.probe_manager.plan_discrete_probes(
+                            planning_set, memory=env_mem, max_probes=self.config.max_primitive_probes_per_level,
+                            known_actions=self.known_actions,
+                        )
+                        self.probe_queue.extend(discrete_probes)
+
+                        # 2. Plan coordinate probes via Qwen if ACTION6 available, not yet confirmed, and not yet probed in env_mem
+                        has_tested_coords = any(
+                            p.action_id == "ACTION6" for p in env_mem.probe_history
+                        )
+                        if has_coords and not has_tested_coords and "ACTION6" not in self.known_actions:
+                            explorer_mm = getattr(
+                                self.config, "explorer_multimodal_enabled",
+                                getattr(self.config, "multimodal_enabled", getattr(self.config, "qwen_multimodal_enabled", True))
+                            )
+                            raw_png = render_grid_png(grid) if explorer_mm else None
+                            annotated_png = render_annotated_frame_png(grid, planning_set) if explorer_mm else None
+                            if raw_png:
+                                try:
+                                    with open("explorer_raw_frame.png", "wb") as f:
+                                        f.write(raw_png)
+                                except Exception as e:
+                                    logger.debug(f"Frame save skipped: {e}")
+                            if annotated_png:
+                                try:
+                                    with open("explorer_annotated_frame.png", "wb") as f:
+                                        f.write(annotated_png)
+                                except Exception as e:
+                                    logger.debug(f"Frame save skipped: {e}")
+                            explorer_images = [raw_png, annotated_png] if explorer_mm else None
+                            coord_probes = self.explorer.propose_coordinate_probes(
+                                planning_set, memory=env_mem, max_coords=coord_quota, image_png=explorer_images
+                            )
+                            self.explorer_attempts_this_level += 1
+                            logger.info(
+                                f"Explorer initial coordinate probes: attempt {self.explorer_attempts_this_level}/"
+                                f"{getattr(self.config, 'max_explorer_attempts_per_level', 5)} (quota={coord_quota})"
+                            )
+                            self.probe_queue.extend(coord_probes)
+                    elif has_coords and "ACTION6" not in self.known_actions:
+                        coord_probes = self.explorer.probe_manager.plan_targeted_coordinate_probes(
+                            planning_set, available_actions
+                        )
+                        self.probe_queue.extend(coord_probes)
+                    else:
+                        self.probing_phase = False
+                else:
+                    # Initial sweep already executed: query combinatorial chaining for inactive actions
+                    if self.config.enable_primitive_probing:
+                        next_chain = self.explorer.probe_manager.get_next_combinatorial_chain()
+                        if next_chain:
+                            self.probe_queue.extend(next_chain)
+
+            if self.active_pipeline == "dynamic" and not self.probe_queue and self.probing_phase:
+                new_actions = [a for a in available_actions if a not in self.known_actions and a not in ("RESET", "ACTION7")]
+                if new_actions:
+                    new_probes = self.explorer.probe_manager.plan_discrete_probes(
+                        new_actions, memory=env_mem, max_probes=self.config.max_primitive_probes_per_level,
+                        known_actions=self.known_actions,
+                    )
+                    self.probe_queue.extend(new_probes)
+
+            if self.probe_queue:
+                probe_action_item = self.probe_queue.pop(0)
+                probe_action = (
+                    probe_action_item.to_dict()
+                    if hasattr(probe_action_item, "to_dict")
+                    else dict(probe_action_item)
+                )
+                if self.crop_offset > 0 and isinstance(probe_action.get("data"), dict):
+                    if "x" in probe_action["data"] and "y" in probe_action["data"]:
+                        p_data = dict(probe_action["data"])
+                        p_data["x"] = int(p_data["x"]) + self.crop_offset
+                        p_data["y"] = int(p_data["y"]) + self.crop_offset
+                        probe_action["data"] = p_data
+
+                self.last_probe_action = probe_action
+                self.last_snapshot = snapshot
+                self.last_planning_set = planning_set
+                self.pending_action = probe_action
+                self.pending_step = None
+                self.last_engine_action = probe_action["action_id"]
+                if probe_action["action_id"] != "RESET":
+                    self.known_actions.add(probe_action["action_id"])
+                    self.probe_actions_executed_this_level += 1
+
+                self.audit_logger.log(
+                    "action_emitted",
+                    action=probe_action["action_id"],
+                    data=probe_action.get("data", {}),
+                    strategy="probe",
+                    grid_hash=planning_set.grid_hash,
+                    level_id=self.current_level_id,
+                )
+                return probe_action
+
+            if self.probing_phase:
+                game_mem = self.memory_manager.get_game_memory("session")
+                has_effective = bool(self.explorer.probe_manager.confirmed_effective_actions) or bool(game_mem.confirmed_action_effects)
+
+                if has_effective or not self.config.enable_primitive_probing or not has_coords:
+                    self.probing_phase = False
+                    self.explorer_reprobe_pending = False
+                    if self.probe_actions_executed_this_level > 0:
+                        self.probe_actions_executed_this_level = 0
+                        reset_action = {
+                            "id": "RESET",
+                            "action_id": "RESET",
+                            "data": {},
+                            "reasoning": {"source": "probe_phase_complete_reset_to_pristine"},
+                        }
+                        self.last_probe_action = None
+                        self.last_snapshot = snapshot
+                        self.last_planning_set = planning_set
+                        self.pending_action = reset_action
+                        self.pending_step = None
+                        self.last_engine_action = "RESET"
+                        self.level_executed_actions.clear()
+                        self.audit_logger.log(
+                            "action_emitted",
+                            action="RESET",
+                            data={},
+                            strategy="probe_phase_reset",
+                            grid_hash=planning_set.grid_hash,
+                            level_id=self.current_level_id,
+                        )
+                        return reset_action
+
+                else:
+                    # No confirmed actions discovered yet: check recursive attempt budget
+                    max_exp_attempts = getattr(self.config, "max_explorer_attempts_per_level", 5)
+                    if self.explorer_attempts_this_level >= max_exp_attempts:
+                        self.session_aborted = True
+                        logger.error(
+                            f"Explorer probe budget exhausted ({max_exp_attempts} attempts) on {self.current_level_id} "
+                            f"without discovering effective actions. Transitioning to next game without reset."
+                        )
+                        raise LevelAttemptsExhaustedError(
+                            f"Explorer probe budget exhausted ({max_exp_attempts} attempts) on {self.current_level_id} "
+                            f"without discovering effective actions. Transitioning to next game without reset."
+                        )
+                    else:
+                        # Queue clean board reset before launching next explorer attempt
+                        self.explorer_reprobe_pending = True
+                        self.probe_actions_executed_this_level = 0
+                        reset_action = {
+                            "id": "RESET",
+                            "action_id": "RESET",
+                            "data": {},
+                            "reasoning": {
+                                "source": "explorer_retry_clean_state",
+                                "attempt": self.explorer_attempts_this_level,
+                            },
+                        }
+                        self.last_probe_action = None
+                        self.last_snapshot = snapshot
+                        self.last_planning_set = planning_set
+                        self.pending_action = reset_action
+                        self.pending_step = None
+                        self.last_engine_action = "RESET"
+                        self.level_executed_actions.clear()
+                        self.audit_logger.log(
+                            "action_emitted",
+                            action="RESET",
+                            data={},
+                            strategy="explorer_retry_clean_state",
+                            grid_hash=planning_set.grid_hash,
+                            level_id=self.current_level_id,
+                        )
+                        return reset_action
+
+        # 4.5. Solver Clean State Reset (Single clean reset between candidates or after replan)
+        if self.solver_reset_pending:
+            self.solver_reset_pending = False
+            reset_action = {
+                "id": "RESET",
+                "action_id": "RESET",
+                "data": {},
+                "reasoning": {"source": self.solver_reset_reason or "solver_clean_state_reset"},
+            }
+            self.last_snapshot = snapshot
+            self.last_planning_set = planning_set
+            self.pending_action = reset_action
+            self.last_engine_action = "RESET"
+            self.pending_step = None
+            self.level_executed_actions.clear()
+            self.audit_logger.log(
+                "action_emitted",
+                action="RESET",
+                data={},
+                strategy="solver_reset",
+                grid_hash=planning_set.grid_hash,
+                level_id=self.current_level_id,
+            )
+            return reset_action
+
+        # 5. Explorer Phase (Spec Generation)
+        game_mem = self.memory_manager.get_game_memory("session")
+        if not env_mem.specs and self.config.max_explorer_probe_actions_per_level > 0:
+            explorer_mm = getattr(
+                self.config, "explorer_multimodal_enabled",
+                getattr(self.config, "multimodal_enabled", getattr(self.config, "qwen_multimodal_enabled", True))
+            )
+            raw_png = render_grid_png(grid) if explorer_mm else None
+            annotated_png = render_annotated_frame_png(grid, planning_set) if explorer_mm else None
+            if raw_png:
+                try:
+                    with open("explorer_raw_frame.png", "wb") as f:
+                        f.write(raw_png)
+                except Exception as e:
+                    logger.debug(f"Frame save skipped: {e}")
+            if annotated_png:
+                try:
+                    with open("explorer_annotated_frame.png", "wb") as f:
+                        f.write(annotated_png)
+                except Exception as e:
+                    logger.debug(f"Frame save skipped: {e}")
+            explorer_images = [raw_png, annotated_png] if explorer_mm else None
+            self.explorer.generate_environment_spec(planning_set, env_mem, image_png=explorer_images, game_memory=game_mem)
+
+        # 6. Coder Phase (DSL Generation with up to 3 retries)
+        if self.active_module is None and not self.coder_failed_for_level:
+            spec = env_mem.specs[0] if env_mem.specs else {}
+            coder_mm = getattr(
+                self.config, "coder_multimodal_enabled",
+                getattr(self.config, "multimodal_enabled", getattr(self.config, "qwen_multimodal_enabled", True))
+            )
+            raw_png = render_grid_png(grid) if coder_mm else None
+            annotated_png = render_annotated_frame_png(grid, planning_set) if coder_mm else None
+            if raw_png:
+                try:
+                    with open("coder_raw_frame.png", "wb") as f:
+                        f.write(raw_png)
+                except Exception as e:
+                    logger.debug(f"Frame save skipped: {e}")
+            if annotated_png:
+                try:
+                    with open("coder_annotated_frame.png", "wb") as f:
+                        f.write(annotated_png)
+                except Exception as e:
+                    logger.debug(f"Frame save skipped: {e}")
+            coder_images = [raw_png, annotated_png] if coder_mm else None
+            self.transition_to(SessionPhase.CODING, "generating dsl with coder")
+            from v10_agent.types import CoderInput
+            _ = CoderInput.from_session(spec, syntax_mem, list(self.known_actions))
+            module, manifest, errors = self.coder.generate_dsl(spec, syntax_mem, planning_set, game_memory=game_mem, image_png=coder_images)
+            if module is not None and manifest is not None:
+                self.active_module = module
+                self.active_manifest = manifest
+                for fn in manifest.get("functions", []):
+                    fn_name = str(fn.get("name", "")).upper()
+                    # Only certify primitives that correspond to confirmed effective actions
+                    act_match = next((act for act in game_mem.confirmed_action_effects if act in fn_name), None)
+                    if act_match or "ACTION" not in fn_name:
+                        game_mem.record_reusable_primitive(fn)
+                logger.info(f"DSL Certified with {len(manifest.get('functions', []))} primitives.")
+            else:
+                self.coder_failed_for_level = True
+                retries = self.config.max_coder_retries_per_level
+                logger.warning(f"DSLCoder retries exhausted ({retries} attempts).")
+                if not (self.config.coder_exhaustion_forces_fallback and not self.config.abort_on_dsl_exhaustion):
+                    self.session_aborted = True
+                    logger.error(f"DSLCoder retries exhausted ({retries} attempts). Transitioning to next game without reset.")
+                    raise LevelAttemptsExhaustedError(f"Coder retries exhausted ({retries} attempts). Transitioning to next game without reset.")
+
+        # 7. Solver Phase (Trajectory Generation & Replanning)
+        if self.replan_requested:
+            self.active_pool = None
+            self.replan_requested = False
+
+        if self.active_module is not None and (self.active_pool is None or self.active_pool.active_candidate() is None):
+            # Ironclad guarantee: before calling Solver, if board is dirty from prior execution, emit RESET first
+            if self.level_initial_grid_hash is not None and planning_set.grid_hash != self.level_initial_grid_hash:
+                logger.info(
+                    f"Solver replan requires clean board (current hash {planning_set.grid_hash[:8]} != initial {self.level_initial_grid_hash[:8]}). "
+                    f"Emitting clean RESET before invoking Solver."
+                )
+                reset_action = {
+                    "id": "RESET",
+                    "action_id": "RESET",
+                    "data": {},
+                    "reasoning": {"source": "solver_replan_clean_state_reset"},
+                }
+                self.last_snapshot = snapshot
+                self.last_planning_set = planning_set
+                self.pending_action = reset_action
+                self.last_engine_action = "RESET"
+                self.pending_step = None
+                self.level_executed_actions.clear()
+                self.active_pool = None
+                self.replan_requested = False
+                return reset_action
+
+            max_attempts = getattr(self.config, "max_chain_attempts_per_level", 5)
+            if self.level_chain_attempts >= max_attempts:
+                logger.warning(f"Level chain attempt budget exhausted ({max_attempts}) for {self.current_level_id}. Transitioning to next game without reset.")
+                self.session_aborted = True
+                raise LevelAttemptsExhaustedError(f"Level chain attempt budget exhausted ({max_attempts} attempts). Transitioning to next game without reset.")
+            else:
+                self.level_chain_attempts += 1
+                logger.info(f"Initiating Solver planning attempt {self.level_chain_attempts}/{max_attempts} for {self.current_level_id}...")
+                solver_mm = getattr(
+                    self.config, "solver_multimodal_enabled",
+                    getattr(self.config, "multimodal_enabled", getattr(self.config, "qwen_multimodal_enabled", True))
+                )
+                raw_png = render_grid_png(grid) if solver_mm else None
+                annotated_png = render_annotated_frame_png(grid, planning_set) if solver_mm else None
+                if raw_png:
+                    try:
+                        with open("solver_raw_frame.png", "wb") as f:
+                            f.write(raw_png)
+                    except Exception as e:
+                        logger.debug(f"Frame save skipped: {e}")
+                if annotated_png:
+                    try:
+                        with open("solver_annotated_frame.png", "wb") as f:
+                            f.write(annotated_png)
+                    except Exception as e:
+                        logger.debug(f"Frame save skipped: {e}")
+                solver_images = [raw_png, annotated_png] if solver_mm else None
+                matches_initial = (self.level_initial_grid_hash is not None and planning_set.grid_hash == self.level_initial_grid_hash)
+                logger.info(
+                    f"Solver invocation prepared: frame hash={planning_set.grid_hash[:8]} "
+                    f"(verified matches initial level frame: {matches_initial}, png_attached={solver_images is not None})."
+                )
+                self.transition_to(SessionPhase.SOLVING, "generating solver trajectory package")
+                from v10_agent.types import SolverInput
+                _ = SolverInput.from_session(
+                    planning_set=planning_set,
+                    game_memory=game_mem,
+                    epistemic_memory=ep_mem,
+                    action_budget=max(1, self.config.max_actions_per_level - self.accepted_action_count),
+                )
+                pkg = self.solver.generate_trajectory_package(
+                    manifest=self.active_manifest or {},
+                    planning_set=planning_set,
+                    epistemic_memory=ep_mem,
+                    budget=max(1, self.config.max_actions_per_level - self.accepted_action_count),
+                    image_png=solver_images,
+                    game_memory=game_mem,
+                )
+                if pkg is not None:
+                    self.active_pool = TrajectoryPool.from_package(pkg)
+                    c_summaries = [f"{c.trajectory_id}({len(c.steps)} steps: {[s.get('dsl_function') for s in c.steps[:6]]}...)" for c in self.active_pool.candidates]
+                    logger.info(f"Solver generated {len(self.active_pool.candidates)} candidates: {'; '.join(c_summaries)}")
+                else:
+                    logger.warning(f"Solver trajectory proposal failed on attempt {self.level_chain_attempts}/{max_attempts}.")
+                    if self.level_chain_attempts >= max_attempts:
+                        self.session_aborted = True
+                        raise LevelAttemptsExhaustedError(f"Solver trajectory proposal retries exhausted ({max_attempts} attempts). Transitioning to next game without reset.")
+
+        # 8. Symbolic Step Verification & Execution (Independent from Qwen)
+        self.transition_to(SessionPhase.EXECUTING, "executing symbolic step")
+        exec_res = self.symbolic_executor.prepare_and_execute_step(
+            pool=self.active_pool,
+            planning_set=planning_set,
+            active_module=self.active_module,
+            epistemic_memory=ep_mem,
+            syntax_memory=syntax_mem,
+            game_memory=self.memory_manager.get_game_memory("session"),
         )
-        
-        # -------------------------------------------------------------------------
-        # Step 5: Branch effect handling (for caller's decision making)
-        # -------------------------------------------------------------------------
-        # The caller should check EpistemicMemory to determine next action:
-        # - FOLLOW: Continue current trajectory
-        # - NULL: Sever branch, trigger Solver retry with new candidate
-        # - OMIT: Keep branch alive, may pivot later
-        
-        # Log actionable insight based on judgment
-        if verification_result.judgment.is_null():
-            logger.warning(
-                "NULL judgment: Physical contradiction detected. "
-                "Current trajectory branch must be severed.",
-                extra={"level_id": self.current_level_id, "step": self.step_count}
+
+        effect: EffectDeclaration | None = exec_res.effect
+        grounded_step: GroundedStep | None = exec_res.grounded_step
+        strategy: str = exec_res.strategy
+
+        if exec_res.circuit_broken:
+            next_cand = self.active_pool.active_candidate() if self.active_pool else None
+            if next_cand is None:
+                self.replan_requested = True
+                self.active_pool = None
+            else:
+                logger.info(f"Session: Circuit broken on candidate; advancing to next pool candidate: {next_cand.trajectory_id}")
+
+            reset_action = {
+                "id": "RESET",
+                "action_id": "RESET",
+                "data": {},
+                "reasoning": {"source": "circuit_breaker_immediate_reset", "error": exec_res.error_message},
+            }
+            self.pending_action = reset_action
+            self.last_engine_action = "RESET"
+            self.pending_step = None
+            self.level_executed_actions.clear()
+            return reset_action
+
+        # 9. Fallback Path
+        if effect is None:
+            if self.session_aborted or (self.config.abort_on_dsl_exhaustion and self.active_module is None):
+                self.session_aborted = True
+                raise LevelAttemptsExhaustedError("DSL missing or session aborted due to retry exhaustion. Transitioning to next game without reset.")
+
+            self.transition_to(SessionPhase.FALLBACK, "selecting fallback action")
+            effect = self.fallback_engine.select_fallback_action(
+                planning_set, game_memory=self.memory_manager.game_memory
             )
-        elif verification_result.judgment.is_omit():
-            logger.info(
-                "OMIT judgment: Expected effects absent but no contradiction. "
-                "Branch remains live for potential pivot.",
-                extra={"level_id": self.current_level_id, "step": self.step_count}
+            grounded_step = None
+
+        # 10. ActionBoundary: emit strictly one step
+        action_decl = effect.declared_action
+        action_dict = {
+            "id": action_decl.action_id,
+            "action_id": action_decl.action_id,
+            "data": action_decl.data,
+            "reasoning": {
+                **action_decl.reasoning,
+                "source": action_decl.reasoning.get("source") or ("dsl_execution" if grounded_step else "fallback"),
+                "strategy": strategy,
+            },
+        }
+
+        if self.crop_offset > 0 and isinstance(action_dict.get("data"), dict):
+            if "x" in action_dict["data"] and "y" in action_dict["data"]:
+                a_data = dict(action_dict["data"])
+                a_data["x"] = int(a_data["x"]) + self.crop_offset
+                a_data["y"] = int(a_data["y"]) + self.crop_offset
+                action_dict["data"] = a_data
+
+        self.last_snapshot = snapshot
+        self.last_planning_set = planning_set
+        self.pending_step = grounded_step
+        self.pending_action = action_dict
+        self.last_engine_action = action_decl.action_id
+        self.level_executed_actions.append(action_decl.action_id)
+
+        self.audit_logger.log(
+            "action_emitted",
+            action=action_decl.action_id,
+            data=action_dict.get("data", action_decl.data),
+            strategy=strategy,
+            grid_hash=planning_set.grid_hash,
+            level_id=self.current_level_id,
+        )
+
+        return action_dict
+
+    def observe_action_result(self, after_observation: Mapping[str, Any] | None = None) -> bool:
+        """Commit the transition result and evaluate Brusentsov ternary judgment."""
+        if self.pending_action is None:
+            self.observed_transition_duplicate_skips += 1
+            return False
+
+        if after_observation is None:
+            self.observed_transition_duplicate_skips += 1
+            return False
+
+        norm_after = normalize_observation(
+            after_observation,
+            game_id=self.current_game_id,
+            crop_border=self.config.crop_border_pixels,
+        )
+        self.accepted_action_count += 1
+        self.observed_transition_ingestions += 1
+
+        # A. If the action was a probe, record the effect in PrimitiveProbeManager
+        if self.last_probe_action is not None:
+            action_id = self.last_probe_action.get("action_id", "")
+            action_data = self.last_probe_action.get("data", {})
+            if self.last_snapshot is not None and action_id and action_id != "RESET":
+                env_mem = self.memory_manager.get_env_spec_memory("session")
+                rec = self.explorer.probe_manager.record_probe_result(
+                    action_id=action_id,
+                    action_data=action_data,
+                    before_snapshot=self.last_snapshot,
+                    after_obs=norm_after,
+                    memory=env_mem,
+                )
+                game_mem = self.memory_manager.get_game_memory("session")
+                if "moved" in rec.observed_effect and any(d in rec.observed_effect for d in ("UP", "DOWN", "LEFT", "RIGHT")):
+                    game_mem.record_action_effect(action_id, rec.observed_effect)
+                    self.known_actions.add(action_id)
+                elif "color transition" in rec.observed_effect:
+                    game_mem.record_action_effect(action_id, rec.observed_effect)
+                    self.known_actions.add(action_id)
+                elif "selection indicator" in rec.observed_effect:
+                    act_desc = f"{action_id}({action_data})" if action_data else action_id
+                    offset_note = ""
+                    try:
+                        after_grid = norm_after.get("grid")
+                        if after_grid:
+                            after_snap = extract_arga_snapshot(after_grid)
+                            after_pset = build_planning_set(after_snap, available_actions=list(self.known_actions))
+                            from v10_agent.universal_invariants import discover_invariants
+                            invs = discover_invariants(after_pset)
+                            # Dynamically determine step size from confirmed action effects
+                            step_sz = 1.0
+                            if game_mem and getattr(game_mem, "confirmed_action_effects", None):
+                                import re
+                                for eff in game_mem.confirmed_action_effects.values():
+                                    nums = [abs(int(x)) for x in re.findall(r'd[yx]=([+-]?\d+)', eff)]
+                                    if nums and max(nums) > 0:
+                                        step_sz = float(max(nums))
+                                        break
+
+                            for inv in invs:
+                                if inv.invariant_type == "axial_symmetry_vertical" and inv.axis_id:
+                                    sub = after_pset.get_object(inv.subject_id)
+                                    tgt = after_pset.get_object(inv.target_id)
+                                    ax = after_pset.get_object(inv.axis_id)
+                                    if sub and tgt and ax:
+                                        req_c = (tgt.centroid.col + sub.centroid.col) / 2.0
+                                        d_ax = req_c - ax.centroid.col
+                                        d_pc = tgt.centroid.row - sub.centroid.row
+                                        ax_s = int(round(d_ax / step_sz))
+                                        pc_s = int(round(d_pc / step_sz))
+                                        if ax_s != 0 or pc_s != 0:
+                                            offset_note = f" (axis_steps={ax_s}, piece_steps={pc_s})"
+                                            break
+                                elif inv.invariant_type == "axial_symmetry_horizontal" and inv.axis_id:
+                                    sub = after_pset.get_object(inv.subject_id)
+                                    tgt = after_pset.get_object(inv.target_id)
+                                    ax = after_pset.get_object(inv.axis_id)
+                                    if sub and tgt and ax:
+                                        req_r = (tgt.centroid.row + sub.centroid.row) / 2.0
+                                        d_ax = req_r - ax.centroid.row
+                                        d_pc = tgt.centroid.col - sub.centroid.col
+                                        ax_s = int(round(d_ax / step_sz))
+                                        pc_s = int(round(d_pc / step_sz))
+                                        if ax_s != 0 or pc_s != 0:
+                                            offset_note = f" (axis_steps={ax_s}, piece_steps={pc_s})"
+                                            break
+                    except Exception as exc:
+                        logger.warning(f"Failed to extract post-toggle invariants: {exc}")
+                    game_mem.record_selection_mechanic(f"{act_desc}: {rec.observed_effect}{offset_note}")
+                    game_mem.record_action_effect(action_id, rec.observed_effect)
+                    self.known_actions.add(action_id)
+                    if self.active_module is not None:
+                        logger.info("Session: Modal toggle discovered; invalidating active DSL module.")
+                        self.active_module = None
+                        self.active_manifest = None
+                elif "object count changed" in rec.observed_effect:
+                    game_mem.record_action_effect(action_id, rec.observed_effect)
+                    self.known_actions.add(action_id)
+                else:
+                    game_mem.record_unconfirmed_action(action_id, rec.observed_effect)
+
+                # Trigger dynamic reprobes if this action altered state or toggled selection
+                reprobes = self.explorer.probe_manager.get_dynamic_reprobes(action_id, rec.observed_effect)
+                if reprobes:
+                    self.probe_queue.extend(reprobes)
+
+            self.last_probe_action = None
+
+        # B. Evaluate transition if a grounded solver step was pending
+        if self.pending_step is not None and self.last_snapshot is not None and self.last_planning_set is not None:
+            ep_mem = self.memory_manager.get_epistemic_memory("session")
+            game_mem = self.memory_manager.get_game_memory("session")
+            eval_res = self.symbolic_executor.evaluate_transition(
+                pending_step=self.pending_step,
+                before_snapshot=self.last_snapshot,
+                after_obs=norm_after,
+                planning_set=self.last_planning_set,
+                active_pool=self.active_pool,
+                epistemic_memory=ep_mem,
+                game_memory=game_mem,
+                action_dict=self.pending_action,
             )
-        else:  # FOLLOW
-            logger.info(
-                "FOLLOW judgment: Trajectory validated. Continue current branch.",
-                extra={"level_id": self.current_level_id, "step": self.step_count}
-            )
-    
-    def reset_level(self, level_id: str) -> None:
-        """Reset session state for a new level."""
-        self.current_level_id = level_id
-        self.step_count = 0
-        self.action_history = []
-        self.coder_retry_count = 0
-        self.solver_retry_count = 0
-        # Note: Memory contours persist across levels within same game
-        logger.info(f"Reset level: {level_id}")
-    
-    def reset_game(self) -> None:
-        """Clear all memory contours for new game."""
-        self.env_spec_memory = None
-        self.syntax_error_memory = None
-        self.epistemic_memory = None
-        self.current_level_id = None
-        self.step_count = 0
-        self.action_history = []
-        self.coder_retry_count = 0
-        self.solver_retry_count = 0
-        self.llm_call_count = 0
-        logger.info("Game reset - all memory contours cleared")
+
+            if eval_res.falsification_detected:
+                falsified = eval_res.falsified_action or "initial_motion"
+                logger.warning(
+                    f"Session: Действие {falsified} не валидно при текущих координатах объекта. "
+                    f"Invalidating DSL and scheduling clean micro-reprobe cycle."
+                )
+                self.active_module = None
+                self.active_manifest = None
+                self.active_pool = None
+                self.replan_requested = True
+
+                # Invalidate stale kinematics in GameMemory and known_actions
+                if eval_res.falsified_action:
+                    game_mem.invalidate_action_effect(eval_res.falsified_action, level_id=self.current_level_id)
+                    self.known_actions.discard(eval_res.falsified_action)
+
+                # Clear old environment spec to force fresh generation from new probes
+                env_mem = self.memory_manager.get_env_spec_memory("session")
+                env_mem.specs.clear()
+
+                # Reset board to pristine state and trigger micro-reprobe
+                self.solver_reset_pending = True
+                self.solver_reset_reason = "falsification_clean_reprobe_reset"
+                self.probing_phase = True
+                if hasattr(self.explorer, "probe_manager") and hasattr(self.explorer.probe_manager, "schedule_falsification_reprobe"):
+                    reprobes = self.explorer.probe_manager.schedule_falsification_reprobe(
+                        [eval_res.falsified_action] if eval_res.falsified_action else None
+                    )
+                    self.probe_queue.clear()
+                    self.probe_queue.extend(reprobes)
+
+            elif eval_res.replan_needed or (self.active_pool is not None and self.active_pool.active_candidate() is None):
+                self.replan_requested = True
+                self.active_pool = None
+
+            if eval_res.reset_needed:
+                self.solver_reset_pending = True
+                self.solver_reset_reason = (
+                    "falsification_clean_reprobe_reset"
+                    if eval_res.falsification_detected
+                    else (
+                        "replan_reset_clean_state"
+                        if eval_res.replan_needed
+                        else "next_candidate_reset_clean_state"
+                    )
+                )
+
+            if self.active_pool:
+                next_cand = self.active_pool.active_candidate()
+                if next_cand is not None:
+                    self._last_trajectory_id = next_cand.trajectory_id
 
 
-if __name__ == "__main__":
-    print("GameSession module loaded successfully")
-    # Smoke test with stub config
-    from .config import V10Config
-    config = V10Config.from_env()
-    session = GameSession(config)
-    print(f"Session created with LLM client: {session.llm_client is not None}")
+        # Clear pending action references for next cycle
+        self.pending_action = None
+        self.pending_step = None
+        return True
+
+    def harness_telemetry(self) -> dict[str, Any]:
+        """Return structured telemetry for competition harness."""
+        ep_mem = self.memory_manager.get_epistemic_memory("session")
+        return {
+            "accepted_action_count": self.accepted_action_count,
+            "levels_completed": self.levels_completed_observed,
+            "game_over_reset_count": self.game_over_reset_count,
+            "observed_transition_ingestions": self.observed_transition_ingestions,
+            "observed_transition_duplicate_skips": self.observed_transition_duplicate_skips,
+            "epistemic_judgments_count": len(ep_mem.judgments),
+            "live_omit_branches_count": len(ep_mem.live_omit_branches),
+            "severed_null_signatures_count": len(ep_mem.severed_null_signatures),
+            "current_level_id": self.current_level_id,
+            "current_game_id": self.current_game_id,
+            "session_aborted": self.session_aborted,
+            "active_pipeline": self.active_pipeline,
+            "probing_phase": self.probing_phase,
+            "probe_queue_length": len(self.probe_queue),
+        }

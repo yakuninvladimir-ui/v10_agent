@@ -1,28 +1,32 @@
-"""
-Game Adapter Module
-Provides the interface to the ARC Arcade or competition environment.
-"""
+"""Game and environment adapter for ARC-AGI-3 Arcade / ArcEngine."""
 
-from typing import Dict, Any, Optional
+from __future__ import annotations
 
-class GameAdapter:
-    """
-    Adapter for the environment.
-    """
-    def __init__(self, env: Any = None):
-        self._env = env
+from typing import Any, Mapping
 
-    def step(self, action_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute step in environment.
-        """
-        if self._env:
-            return self._env.step(action_id, payload)
-        # Mock behavior
-        return {"grid": [[0]], "action_taken": action_id}
+from v10_agent.observe import normalize_observation, normalize_state_name
 
-    def reset(self) -> Dict[str, Any]:
-        """Reset environment."""
-        if self._env:
-            return self._env.reset()
-        return {"grid": [[0]]}
+
+def frame_to_observation(frame: Any, frame_index: int = 0, game_id: str = "") -> dict[str, Any]:
+    """Convert an Arcade FrameData or dict to canonical V10 observation."""
+    if hasattr(frame, "__dict__") and not isinstance(frame, Mapping):
+        data: dict[str, Any] = {}
+        for attr in ("frame", "available_actions", "game_id", "guid", "score", "state", "levels_completed", "win_levels", "full_reset"):
+            if hasattr(frame, attr):
+                data[attr] = getattr(frame, attr)
+        return normalize_observation(data, frame_index=frame_index, game_id=game_id)
+    if isinstance(frame, Mapping):
+        return normalize_observation(frame, frame_index=frame_index, game_id=game_id)
+    return normalize_observation({"frame": frame}, frame_index=frame_index, game_id=game_id)
+
+
+def is_terminal_success(state: str) -> bool:
+    """Check if the state indicates successful completion of the game."""
+    s = normalize_state_name(state)
+    return s in {"WIN", "WON", "DONE", "TERMINAL", "VICTORY"}
+
+
+def is_game_over(state: str) -> bool:
+    """Check if the state indicates recoverable GAME_OVER."""
+    s = normalize_state_name(state)
+    return s in {"GAME_OVER", "LOST", "FAILED"}

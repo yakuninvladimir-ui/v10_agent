@@ -1,3 +1,20 @@
-```
-v9_repo/
-```
+﻿# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest cache
+.pytest_cache/
+
+# Runtime and log files
+*.log
+*.png
+local_harness_run*.json
+
+# Notebook build outputs
+notebooks/
+*.ipynb
+
+# OS artifacts
+.DS_Store
+Thumbs.db
