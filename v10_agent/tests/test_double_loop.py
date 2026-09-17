@@ -37,7 +37,7 @@ def broken_fn(api, obj):
     advisor.set_response("coder", f"```python\n{broken_py}\n```\n```json\n{json.dumps(manifest)}\n```")
     advisor.set_response("solver", f"```json\n{json.dumps(traj_pkg)}\n```")
 
-    config = V10Config(llm_advisor_backend="fake", max_coder_retries_per_level=1)
+    config = V10Config(llm_advisor_backend="fake", max_coder_retries_per_level=1, abort_on_dsl_exhaustion=True)
     session = GameSession(config, advisor)
 
     # Note: load_module compiles it, but dry-run will catch the 1/0

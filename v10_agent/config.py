@@ -98,16 +98,16 @@ class V10Config:
 
     # Fallback System
     enable_symbolic_fallback: bool = True
-    coder_exhaustion_forces_fallback: bool = False
+    coder_exhaustion_forces_fallback: bool = True
     solver_exhaustion_forces_fallback: bool = True
-    abort_on_dsl_exhaustion: bool = True
+    abort_on_dsl_exhaustion: bool = False
     max_primitive_probes_per_level: int = 30
     enable_primitive_probing: bool = False
     probe_reset_after_discrete: bool = False
 
     # Competition Execution Limits
-    max_actions_per_game: int = 200
-    max_actions_per_level: int = 200
+    max_actions_per_game: int = 250
+    max_actions_per_level: int = 250
     max_game_over_resets_per_game: int = 5
     max_game_over_resets_per_level: int = 5
     reset_on_game_over: bool = True
@@ -267,14 +267,14 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         epistemic_memory_max_entries=_int_from_env("ARC_EPISTEMIC_MEMORY_MAX_ENTRIES", 50),
         syntax_error_memory_max_entries=_int_from_env("ARC_SYNTAX_ERROR_MEMORY_MAX_ENTRIES", 5),
         enable_symbolic_fallback=_bool_from_env("ARC_ENABLE_SYMBOLIC_FALLBACK", True),
-        coder_exhaustion_forces_fallback=_bool_from_env("ARC_CODER_EXHAUSTION_FORCES_FALLBACK", False),
+        coder_exhaustion_forces_fallback=_bool_from_env("ARC_CODER_EXHAUSTION_FORCES_FALLBACK", True),
         solver_exhaustion_forces_fallback=_bool_from_env("ARC_SOLVER_EXHAUSTION_FORCES_FALLBACK", True),
-        abort_on_dsl_exhaustion=_bool_from_env("ARC_ABORT_ON_DSL_EXHAUSTION", True),
+        abort_on_dsl_exhaustion=_bool_from_env("ARC_ABORT_ON_DSL_EXHAUSTION", False),
         max_primitive_probes_per_level=_int_from_env("ARC_MAX_PRIMITIVE_PROBES", 30),
         enable_primitive_probing=_bool_from_env("ARC_ENABLE_PRIMITIVE_PROBING", True),
         probe_reset_after_discrete=_bool_from_env("ARC_PROBE_RESET_AFTER_DISCRETE", False),
-        max_actions_per_game=_int_from_env("LCLD_MAX_ACTIONS_PER_GAME", 200),
-        max_actions_per_level=_int_from_env("LCLD_MAX_ACTIONS_PER_LEVEL", 200),
+        max_actions_per_game=_int_from_env("LCLD_MAX_ACTIONS_PER_GAME", 250),
+        max_actions_per_level=_int_from_env("LCLD_MAX_ACTIONS_PER_LEVEL", 250),
         max_game_over_resets_per_game=_int_from_env("ARC_MAX_GAME_OVER_RESETS_PER_GAME", 5),
         max_game_over_resets_per_level=_int_from_env("ARC_MAX_GAME_OVER_RESETS_PER_LEVEL", 5),
         reset_on_game_over=_bool_from_env("ARC_RESET_ON_GAME_OVER", True),

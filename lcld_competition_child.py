@@ -135,7 +135,7 @@ def run_direct_game(
     last_engine_action = ""
 
     try:
-        max_actions = int(config.get("max_actions_per_game", 500))
+        max_actions = int(config.get("max_actions_per_game", 250))
         while True:
             if abort_event is not None and abort_event.is_set():
                 stop_reason = "parallel_abort"
@@ -261,9 +261,13 @@ def run_concurrent_arcade_games(
     print(f"[Phase B] Starting concurrent gameplay coordinator (concurrency={concurrency})", flush=True)
 
     scorecard_id = None
-    scheduled_games: list[tuple[int, str, Any, Any]] = []
+    lazy_game_tasks: list[tuple[int, str]] = []
+    direct_env_tasks: list[tuple[int, str, Any, Any]] = []
 
-    # 1. Serial environment preparation & scorecard opening
+    if config is None:
+        config = default_config()
+
+    # 1. Lazy environment task collection & scorecard opening
     if hasattr(arcade, "create_scorecard") and hasattr(arcade, "available_environments"):
         try:
             scorecard_id = arcade.create_scorecard()
@@ -272,20 +276,13 @@ def run_concurrent_arcade_games(
             print(f"[Phase B] Available competition environments count: {len(env_infos)}", flush=True)
             for idx, env_info in enumerate(env_infos):
                 game_id = str(getattr(env_info, "game_id", getattr(env_info, "id", f"game_{idx}")))
-                try:
-                    env = arcade.make(game_id, scorecard_id=scorecard_id)
-                    if env is None:
-                        raise RuntimeError(f"arcade.make returned None for {game_id}")
-                    initial_frame = _current_frame(env)
-                    scheduled_games.append((idx, game_id, env, initial_frame))
-                    print(f"[Phase B] Serially prepared game #{idx + 1}/{len(env_infos)}: {game_id}", flush=True)
-                except Exception as prep_exc:
-                    print(f"[Phase B] Warning: serial prep failed for {game_id}: {prep_exc}", flush=True)
+                lazy_game_tasks.append((idx, game_id))
+            print(f"[Phase B] Registered {len(lazy_game_tasks)} games for lazy worker creation (avoiding 15m idle timeout).", flush=True)
         except Exception as sc_exc:
             print(f"[Phase B] Notice during scorecard setup: {sc_exc}", flush=True)
 
     try:
-        if not scheduled_games:
+        if not lazy_game_tasks:
             # Fallback to direct iterator
             print("[Phase B] Consuming environments from direct iterator...", flush=True)
             for idx, item in enumerate(arcade):
@@ -296,20 +293,50 @@ def run_concurrent_arcade_games(
                     env = item
                     initial_frame = _current_frame(env)
                 game_id = str(getattr(initial_frame, "game_id", getattr(env, "game_id", f"game_{idx}")))
-                scheduled_games.append((idx, game_id, env, initial_frame))
+                direct_env_tasks.append((idx, game_id, env, initial_frame))
 
-        if not scheduled_games:
+        all_tasks = lazy_game_tasks if lazy_game_tasks else direct_env_tasks
+        if not all_tasks:
             raise RuntimeError("[Phase B] FATAL: Zero games could be prepared from Arcade!")
 
-        print(f"[Phase B] Prepared {len(scheduled_games)} games. Submitting to thread pool...", flush=True)
+        print(f"[Phase B] Prepared {len(all_tasks)} game tasks. Submitting to thread pool (concurrency={concurrency})...", flush=True)
         results: list[dict[str, Any]] = []
+
+        def _execute_worker_task(task: tuple) -> dict[str, Any]:
+            if len(task) == 2:
+                idx, g_id = task
+                print(f"[Phase B] Lazy worker opening environment for game #{idx + 1}: {g_id}", flush=True)
+                try:
+                    if scorecard_id:
+                        env = arcade.make(g_id, scorecard_id=scorecard_id)
+                    else:
+                        env = arcade.make(g_id)
+                    if env is None:
+                        raise RuntimeError(f"arcade.make returned None for {g_id}")
+                    initial_frame = _current_frame(env)
+                    return run_direct_game(env, g_id, initial_frame, config=config)
+                except Exception as exc:
+                    print(f"[Phase B] Game #{idx + 1} ({g_id}) worker error: {exc}", flush=True)
+                    return {
+                        "game_id": g_id,
+                        "status": "failed",
+                        "error": str(exc),
+                        "action_count": getattr(exc, "metrics", {}).get("action_count", 0),
+                        "levels_completed": 0,
+                        "stop_reason": f"lazy_worker_exception:{exc}",
+                    }
+            else:
+                idx, g_id, env, initial_frame = task
+                print(f"[Phase B] Direct worker starting game #{idx + 1}: {g_id}", flush=True)
+                return run_direct_game(env, g_id, initial_frame, config=config)
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures: dict[Any, tuple[int, str]] = {}
-            for idx, game_id, env, initial_frame in scheduled_games:
-                print(f"[Phase B] Launching worker for game #{idx + 1}: {game_id}", flush=True)
-                fut = executor.submit(run_direct_game, env, game_id, initial_frame, config=config)
-                futures[fut] = (idx, game_id)
+            for t in all_tasks:
+                task_idx = t[0]
+                task_gid = t[1]
+                fut = executor.submit(_execute_worker_task, t)
+                futures[fut] = (task_idx, task_gid)
 
             for fut in as_completed(futures):
                 game_idx, g_id = futures[fut]
@@ -318,16 +345,18 @@ def run_concurrent_arcade_games(
                     results.append(res)
                     print(
                         f"[Phase B] Game #{game_idx + 1} ({g_id}) complete: "
-                        f"status={res.get('status')} actions={res.get('action_count')} levels={res.get('levels_completed')}",
+                        f"status={res.get('status')} actions={res.get('action_count')} levels={res.get('levels_completed')} reason={res.get('stop_reason')}",
                         flush=True,
                     )
                 except Exception as exc:
-                    print(f"[Phase B] Game #{game_idx + 1} ({g_id}) failed with exception: {exc}", flush=True)
+                    print(f"[Phase B] Game #{game_idx + 1} ({g_id}) failed with unhandled exception: {exc}", flush=True)
                     results.append({
                         "game_id": g_id,
                         "status": "failed",
                         "error": str(exc),
                         "action_count": getattr(exc, "metrics", {}).get("action_count", 0),
+                        "levels_completed": 0,
+                        "stop_reason": f"unhandled_future_exception:{exc}",
                     })
 
         print(f"[Phase B] All {len(results)} games finalized.", flush=True)

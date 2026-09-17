@@ -48,12 +48,12 @@ class SessionPhase(Enum):
 class PhaseTransition:
     """Определяет допустимые переходы и условия."""
     TRANSITIONS = {
-        SessionPhase.PROBING: [SessionPhase.CODING, SessionPhase.FALLBACK, SessionPhase.PROBING],
+        SessionPhase.PROBING: [SessionPhase.CODING, SessionPhase.FALLBACK, SessionPhase.PROBING, SessionPhase.REFLECTING],
         SessionPhase.CODING: [SessionPhase.SOLVING, SessionPhase.PROBING, SessionPhase.FALLBACK],
         SessionPhase.SOLVING: [SessionPhase.EXECUTING, SessionPhase.PROBING, SessionPhase.FALLBACK],
         SessionPhase.EXECUTING: [SessionPhase.REFLECTING, SessionPhase.SOLVING, SessionPhase.PROBING, SessionPhase.FALLBACK],
         SessionPhase.REFLECTING: [SessionPhase.PROBING, SessionPhase.SOLVING, SessionPhase.EXECUTING],
-        SessionPhase.FALLBACK: [SessionPhase.EXECUTING, SessionPhase.PROBING, SessionPhase.SOLVING],
+        SessionPhase.FALLBACK: [SessionPhase.EXECUTING, SessionPhase.PROBING, SessionPhase.SOLVING, SessionPhase.REFLECTING, SessionPhase.FALLBACK],
     }
 
     @classmethod
@@ -139,6 +139,7 @@ class GameSession:
         self.level_initial_grid: Grid2D | None = None
         self.level_initial_grid_hash: str | None = None
         self.level_executed_actions: list[str] = []
+        self.in_persistent_fallback: bool = False
 
     def transition_to(self, new_phase: SessionPhase, reason: str = "") -> None:
         """Explicit state machine transition enforcing allowed lifecycle progression."""
@@ -246,6 +247,7 @@ class GameSession:
         self.session_aborted = False
         self.replan_requested = False
         self.coder_failed_for_level = False
+        self.in_persistent_fallback = False
         self.solver_reset_pending = False
         self.solver_reset_reason = None
         self._level_win_handled = False
@@ -285,6 +287,7 @@ class GameSession:
         self.session_aborted = False
         self.replan_requested = False
         self.coder_failed_for_level = False
+        self.in_persistent_fallback = False
         self._level_win_handled = False
         self._last_trajectory_id = None
         self.memory_manager.handle_game_transition(new_game_id, self.current_level_id)
@@ -391,6 +394,46 @@ class GameSession:
         env_mem = self.memory_manager.get_env_spec_memory("session")
         syntax_mem = self.memory_manager.get_syntax_error_memory("session")
         ep_mem = self.memory_manager.get_epistemic_memory("session")
+
+        # 3.2. Fast path for persistent symbolic fallback (bypasses LLM, replans, and clean resets)
+        if self.in_persistent_fallback:
+            self.transition_to(SessionPhase.FALLBACK, "persistent fallback execution")
+            effect = self.fallback_engine.select_fallback_action(
+                planning_set, game_memory=self.memory_manager.get_game_memory("session")
+            )
+            action_decl = effect.declared_action
+            action_dict = {
+                "id": action_decl.action_id,
+                "action_id": action_decl.action_id,
+                "data": action_decl.data,
+                "reasoning": {
+                    **action_decl.reasoning,
+                    "source": action_decl.reasoning.get("source") or "symbolic_fallback",
+                    "strategy": "symbolic_fallback",
+                },
+            }
+            if self.crop_offset > 0 and isinstance(action_dict.get("data"), dict):
+                if "x" in action_dict["data"] and "y" in action_dict["data"]:
+                    a_data = dict(action_dict["data"])
+                    a_data["x"] = int(a_data["x"]) + self.crop_offset
+                    a_data["y"] = int(a_data["y"]) + self.crop_offset
+                    action_dict["data"] = a_data
+
+            self.last_snapshot = snapshot
+            self.last_planning_set = planning_set
+            self.pending_step = None
+            self.pending_action = action_dict
+            self.last_engine_action = action_decl.action_id
+            self.level_executed_actions.append(action_decl.action_id)
+            self.audit_logger.log(
+                "action_emitted",
+                action=action_decl.action_id,
+                data=action_dict.get("data", action_decl.data),
+                strategy="symbolic_fallback",
+                grid_hash=planning_set.grid_hash,
+                level_id=self.current_level_id,
+            )
+            return action_dict
 
         # 3.5. Clean State Reset (Takes precedence to ensure clean board before probing/replan)
         if self.solver_reset_pending:
@@ -740,7 +783,10 @@ class GameSession:
                 self.coder_failed_for_level = True
                 retries = self.config.max_coder_retries_per_level
                 logger.warning(f"DSLCoder retries exhausted ({retries} attempts).")
-                if not (self.config.coder_exhaustion_forces_fallback and not self.config.abort_on_dsl_exhaustion):
+                if self.config.coder_exhaustion_forces_fallback and not self.config.abort_on_dsl_exhaustion:
+                    self.in_persistent_fallback = True
+                    logger.info("Engaging persistent symbolic fallback after Coder exhaustion.")
+                else:
                     self.session_aborted = True
                     logger.error(f"DSLCoder retries exhausted ({retries} attempts). Transitioning to next game without reset.")
                     raise LevelAttemptsExhaustedError(f"Coder retries exhausted ({retries} attempts). Transitioning to next game without reset.")
@@ -750,7 +796,7 @@ class GameSession:
             self.active_pool = None
             self.replan_requested = False
 
-        if self.active_module is not None and (self.active_pool is None or self.active_pool.active_candidate() is None):
+        if not self.in_persistent_fallback and self.active_module is not None and (self.active_pool is None or self.active_pool.active_candidate() is None):
             # Ironclad guarantee: before calling Solver, if board is dirty from prior execution, emit RESET first
             if self.level_initial_grid_hash is not None and planning_set.grid_hash != self.level_initial_grid_hash:
                 logger.info(
@@ -775,9 +821,14 @@ class GameSession:
 
             max_attempts = getattr(self.config, "max_chain_attempts_per_level", 5)
             if self.level_chain_attempts >= max_attempts:
-                logger.warning(f"Level chain attempt budget exhausted ({max_attempts}) for {self.current_level_id}. Transitioning to next game without reset.")
-                self.session_aborted = True
-                raise LevelAttemptsExhaustedError(f"Level chain attempt budget exhausted ({max_attempts} attempts). Transitioning to next game without reset.")
+                logger.warning(f"Level chain attempt budget exhausted ({max_attempts}) for {self.current_level_id}.")
+                if self.config.enable_symbolic_fallback and getattr(self.config, "solver_exhaustion_forces_fallback", True):
+                    self.in_persistent_fallback = True
+                    logger.info("Engaging persistent symbolic fallback after Solver attempt budget exhausted.")
+                else:
+                    self.session_aborted = True
+                    logger.warning(f"Level chain attempt budget exhausted ({max_attempts}) for {self.current_level_id}. Transitioning to next game without reset.")
+                    raise LevelAttemptsExhaustedError(f"Level chain attempt budget exhausted ({max_attempts} attempts). Transitioning to next game without reset.")
             else:
                 self.level_chain_attempts += 1
                 logger.info(f"Initiating Solver planning attempt {self.level_chain_attempts}/{max_attempts} for {self.current_level_id}...")
@@ -828,55 +879,78 @@ class GameSession:
                 else:
                     logger.warning(f"Solver trajectory proposal failed on attempt {self.level_chain_attempts}/{max_attempts}.")
                     if self.level_chain_attempts >= max_attempts:
-                        self.session_aborted = True
-                        raise LevelAttemptsExhaustedError(f"Solver trajectory proposal retries exhausted ({max_attempts} attempts). Transitioning to next game without reset.")
+                        if self.config.enable_symbolic_fallback and getattr(self.config, "solver_exhaustion_forces_fallback", True):
+                            self.in_persistent_fallback = True
+                            logger.info("Solver proposal retries exhausted: engaging persistent symbolic fallback.")
+                        else:
+                            self.session_aborted = True
+                            raise LevelAttemptsExhaustedError(f"Solver trajectory proposal retries exhausted ({max_attempts} attempts). Transitioning to next game without reset.")
 
         # 8. Symbolic Step Verification & Execution (Independent from Qwen)
-        self.transition_to(SessionPhase.EXECUTING, "executing symbolic step")
-        exec_res = self.symbolic_executor.prepare_and_execute_step(
-            pool=self.active_pool,
-            planning_set=planning_set,
-            active_module=self.active_module,
-            epistemic_memory=ep_mem,
-            syntax_memory=syntax_mem,
-            game_memory=self.memory_manager.get_game_memory("session"),
-        )
+        effect: EffectDeclaration | None = None
+        grounded_step: GroundedStep | None = None
+        strategy: str = "symbolic_fallback"
 
-        effect: EffectDeclaration | None = exec_res.effect
-        grounded_step: GroundedStep | None = exec_res.grounded_step
-        strategy: str = exec_res.strategy
+        if not self.in_persistent_fallback and self.active_module is not None and self.active_pool is not None and self.active_pool.active_candidate() is not None:
+            self.transition_to(SessionPhase.EXECUTING, "executing symbolic step")
+            exec_res = self.symbolic_executor.prepare_and_execute_step(
+                pool=self.active_pool,
+                planning_set=planning_set,
+                active_module=self.active_module,
+                epistemic_memory=ep_mem,
+                syntax_memory=syntax_mem,
+                game_memory=self.memory_manager.get_game_memory("session"),
+            )
 
-        if exec_res.circuit_broken:
-            next_cand = self.active_pool.active_candidate() if self.active_pool else None
-            if next_cand is None:
-                self.replan_requested = True
-                self.active_pool = None
-            else:
-                logger.info(f"Session: Circuit broken on candidate; advancing to next pool candidate: {next_cand.trajectory_id}")
+            effect = exec_res.effect
+            grounded_step = exec_res.grounded_step
+            strategy = exec_res.strategy
 
-            reset_action = {
-                "id": "RESET",
-                "action_id": "RESET",
-                "data": {},
-                "reasoning": {"source": "circuit_breaker_immediate_reset", "error": exec_res.error_message},
-            }
-            self.pending_action = reset_action
-            self.last_engine_action = "RESET"
-            self.pending_step = None
-            self.level_executed_actions.clear()
-            return reset_action
+            if exec_res.circuit_broken:
+                next_cand = self.active_pool.active_candidate() if self.active_pool else None
+                if next_cand is None:
+                    max_attempts = getattr(self.config, "max_chain_attempts_per_level", 5)
+                    if self.level_chain_attempts >= max_attempts:
+                        logger.warning(f"All candidates failed and attempt budget ({max_attempts}) reached. Switching to persistent fallback.")
+                        if self.config.enable_symbolic_fallback and getattr(self.config, "solver_exhaustion_forces_fallback", True):
+                            self.in_persistent_fallback = True
+                            self.active_pool = None
+                            self.replan_requested = False
+                        else:
+                            self.session_aborted = True
+                            raise LevelAttemptsExhaustedError(f"All candidates failed and attempt budget exhausted ({max_attempts} attempts). Transitioning to next game without reset.")
+                    else:
+                        self.replan_requested = True
+                        self.active_pool = None
+                else:
+                    logger.info(f"Session: Circuit broken on candidate; advancing to next pool candidate: {next_cand.trajectory_id}")
+
+                if not self.in_persistent_fallback:
+                    reset_action = {
+                        "id": "RESET",
+                        "action_id": "RESET",
+                        "data": {},
+                        "reasoning": {"source": "circuit_breaker_immediate_reset", "error": exec_res.error_message},
+                    }
+                    self.pending_action = reset_action
+                    self.last_engine_action = "RESET"
+                    self.pending_step = None
+                    self.level_executed_actions.clear()
+                    return reset_action
 
         # 9. Fallback Path
-        if effect is None:
-            if self.session_aborted or (self.config.abort_on_dsl_exhaustion and self.active_module is None):
+        if effect is None or self.in_persistent_fallback:
+            if not self.config.enable_symbolic_fallback or (self.session_aborted and not self.in_persistent_fallback):
                 self.session_aborted = True
                 raise LevelAttemptsExhaustedError("DSL missing or session aborted due to retry exhaustion. Transitioning to next game without reset.")
 
+            self.in_persistent_fallback = True
             self.transition_to(SessionPhase.FALLBACK, "selecting fallback action")
             effect = self.fallback_engine.select_fallback_action(
-                planning_set, game_memory=self.memory_manager.game_memory
+                planning_set, game_memory=self.memory_manager.get_game_memory("session")
             )
             grounded_step = None
+            strategy = "symbolic_fallback"
 
         # 10. ActionBoundary: emit strictly one step
         action_decl = effect.declared_action

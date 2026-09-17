@@ -37,6 +37,10 @@ def default_config() -> dict[str, Any]:
         "max_explorer_probes": cfg.max_explorer_probe_actions_per_level,
         "max_game_over_resets_per_game": cfg.max_game_over_resets_per_game,
         "reset_on_game_over": cfg.reset_on_game_over,
+        "enable_symbolic_fallback": cfg.enable_symbolic_fallback,
+        "coder_exhaustion_forces_fallback": cfg.coder_exhaustion_forces_fallback,
+        "solver_exhaustion_forces_fallback": cfg.solver_exhaustion_forces_fallback,
+        "abort_on_dsl_exhaustion": cfg.abort_on_dsl_exhaustion,
     })
     return cfg_dict
 
