@@ -560,10 +560,10 @@ class DashScopeResponsesAdvisor(BaseLLMAdvisor):
 
     def __init__(
         self,
-        base_url: str = "https://dashscope-intl.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1",
+        base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         api_key: str = "",
     ):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").rstrip("/")
         self.api_key = api_key
         self._client: Any = None
 
@@ -580,7 +580,22 @@ class DashScopeResponsesAdvisor(BaseLLMAdvisor):
         agent_role: str = "generic",
     ) -> str:
         client = self._get_client()
-        model_id = config.qwen_model_path or "qwen3.7-max-2026-06-08"
+        raw_model = (
+            getattr(self, "_cached_model_id", None)
+            or config.qwen_model_path
+            or getattr(config, "model_path", None)
+            or "qwen3.8-27b"
+        )
+        if "/" in raw_model:
+            tail = raw_model.split("/")[-1].lower()
+            if "27b" in tail:
+                model_id = "qwen3.8-27b"
+            elif "flash" in tail or "3.7" in tail:
+                model_id = "qwen3.7-flash"
+            else:
+                model_id = tail
+        else:
+            model_id = raw_model
 
         extra_body: dict[str, Any] = {}
         if config.qwen_enable_thinking:
@@ -594,7 +609,28 @@ class DashScopeResponsesAdvisor(BaseLLMAdvisor):
             if m.get("role") == "system":
                 instructions = m.get("content", "")
             else:
-                user_input.append(m)
+                raw_content = m.get("content")
+                if isinstance(raw_content, list):
+                    adapted_content: list[dict[str, Any]] = []
+                    for part in raw_content:
+                        if isinstance(part, dict):
+                            p_type = part.get("type")
+                            if p_type == "text":
+                                adapted_content.append({"type": "input_text", "text": part.get("text", "")})
+                            elif p_type == "image_url":
+                                img_url = part.get("image_url", "")
+                                if isinstance(img_url, dict):
+                                    img_url = img_url.get("url", "")
+                                adapted_content.append({"type": "input_image", "image_url": str(img_url)})
+                            elif p_type in ("input_text", "input_image", "input_file"):
+                                adapted_content.append(part)
+                            else:
+                                adapted_content.append(part)
+                        else:
+                            adapted_content.append({"type": "input_text", "text": str(part)})
+                    user_input.append({"role": m.get("role", "user"), "content": adapted_content})
+                else:
+                    user_input.append(m)
 
         for attempt in range(3):
             try:
@@ -609,12 +645,10 @@ class DashScopeResponsesAdvisor(BaseLLMAdvisor):
                 for item in getattr(resp, "output", []):
                     if getattr(item, "type", None) == "reasoning":
                         for s in getattr(item, "summary", []):
-                            if hasattr(s, "text"):
-                                reasoning_text += s.text
+                            reasoning_text += getattr(s, "text", str(s))
                     elif getattr(item, "type", None) == "message":
                         for c in getattr(item, "content", []):
-                            if hasattr(c, "text"):
-                                answer_text += c.text
+                            answer_text += getattr(c, "text", str(c))
 
                 if reasoning_text:
                     print(f"\n[Reasoning ({agent_role})]")
@@ -625,7 +659,7 @@ class DashScopeResponsesAdvisor(BaseLLMAdvisor):
                 if answer_text:
                     print(f"[Answer ({agent_role})]")
                     print(answer_text[:500] + ("..." if len(answer_text) > 500 else ""), flush=True)
-                    return answer_text
+                    return sanitize_model_response(answer_text)
                 return str(resp)
             except Exception as exc:
                 if attempt < 2:
@@ -663,7 +697,17 @@ class DashScopeStreamingChatAdvisor(BaseLLMAdvisor):
         agent_role: str = "generic",
     ) -> str:
         client = self._get_client()
-        model_id = config.qwen_model_path or "qwen3.7-flash"
+        raw_model = getattr(self, "_cached_model_id", None) or config.qwen_model_path or getattr(config, "model_path", None) or "qwen3.8-27b"
+        if "/" in raw_model:
+            tail = raw_model.split("/")[-1].lower()
+            if "27b" in tail:
+                model_id = "qwen3.8-27b"
+            elif "flash" in tail or "3.7" in tail:
+                model_id = "qwen3.7-flash"
+            else:
+                model_id = tail
+        else:
+            model_id = raw_model
 
         extra_body: dict[str, Any] = {}
         if config.qwen_enable_thinking:

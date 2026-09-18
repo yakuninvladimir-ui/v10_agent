@@ -88,10 +88,14 @@ class ARC_AGI_Agent:
         if state != "GAME_OVER":
             raise RuntimeError(f"reset_after_game_over requires GAME_OVER state, got {state!r}")
 
+        max_resets = int(self.config.get("max_game_over_resets_per_level", 5))
         max_attempts = int(self.config.get("max_chain_attempts_per_level", 5))
-        if not self.config.get("reset_on_game_over", True) or (
-            self._session and self._session.level_chain_attempts >= max_attempts
-        ):
+        fallback_active = bool(self._session and getattr(self._session, "in_persistent_fallback", False))
+        resets_exhausted = bool(self._session and self._session.game_over_reset_count >= max_resets)
+        solver_exhausted = bool(self._session and not fallback_active and self._session.level_chain_attempts >= max_attempts)
+        fallback_enabled = bool(self.config.get("enable_symbolic_fallback", True))
+
+        if not self.config.get("reset_on_game_over", True) or resets_exhausted or solver_exhausted:
             raise RuntimeError(f"GAME_OVER reset budget exhausted ({max_attempts} attempts): abandoning game without reset")
 
         try:

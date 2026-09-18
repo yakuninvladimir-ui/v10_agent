@@ -237,6 +237,7 @@ class GameSession:
         self.probe_queue = []
         self.transition_to(SessionPhase.PROBING, "new level transition")
         self.probe_actions_executed_this_level = 0
+        self.game_over_reset_count = 0
         self.level_chain_attempts = 0
         self.explorer_attempts_this_level = 0
         self.explorer_reprobe_pending = False
@@ -262,6 +263,7 @@ class GameSession:
     def handle_game_transition(self, new_game_id: str) -> None:
         """Reset all contours when switching games."""
         self.current_game_id = new_game_id
+        self.game_over_reset_count = 0
         self.level_chain_attempts = 0
         self.explorer_attempts_this_level = 0
         self.explorer_reprobe_pending = False
@@ -310,11 +312,15 @@ class GameSession:
                 logger.error("GAME_OVER persisted after single RESET. Forcing loop break.")
                 raise RuntimeError("GAME_OVER persisted after single RESET")
 
+            max_resets = getattr(self.config, "max_game_over_resets_per_level", 5)
             max_attempts = getattr(self.config, "max_chain_attempts_per_level", 5)
-            if not self.config.reset_on_game_over or self.level_chain_attempts >= max_attempts:
+            resets_exhausted = self.game_over_reset_count >= max_resets
+            attempts_exhausted = (not self.in_persistent_fallback) and (self.level_chain_attempts >= max_attempts)
+
+            if not self.config.reset_on_game_over or resets_exhausted or attempts_exhausted:
                 logger.warning(
-                    f"GAME_OVER encountered and level attempts exhausted ({self.level_chain_attempts}/{max_attempts}) "
-                    f"or resets disabled; abandoning game without reset."
+                    f"GAME_OVER encountered and resets/attempts exhausted (resets: {self.game_over_reset_count}/{max_resets}, "
+                    f"solver attempts: {self.level_chain_attempts}/{max_attempts}, fallback: {self.in_persistent_fallback}); abandoning game without reset."
                 )
                 self.session_aborted = True
                 raise LevelAttemptsExhaustedError(
