@@ -17,7 +17,7 @@ from typing import Any
 # Set to True for deep diagnostic logging in Phase A (Save Version log).
 # Set to False for lightning-fast submission without model warm-up in Phase A.
 # =============================================================================
-ENABLE_PHASE_A_HEAVY_SMOKE: bool = True
+ENABLE_PHASE_A_HEAVY_SMOKE: bool = False
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parent
 NOTEBOOKS_DIR = ROOT_DIR / "notebooks"
@@ -102,7 +102,7 @@ def generate_notebook() -> pathlib.Path:
             "**Architecture**: Neuro-Symbolic Tri-Agent (Explorer, DSL Coder, Solver) with Brusentsov Ternary Logic,\n",
             "Isolated Memory Contours (ISO-1..ISO-5), Deterministic ARGALite Perception, and Tufa Single-RESET Protection.\n",
             "**Model**: Qwen 3.8 27B (`Qwen/Qwen3.8-27B`, `rahim3/qwen3-8-27b-bf16`) via vLLM with FlashAttention.\n",
-            f"**Configuration**: Concurrency=5, Reasoning=xhigh, Context=64K..131K, HeavySmoke={ENABLE_PHASE_A_HEAVY_SMOKE}.\n",
+            f"**Configuration**: Concurrency=4, Reasoning=xhigh, Context=64K..131K, HeavySmoke={ENABLE_PHASE_A_HEAVY_SMOKE}.\n",
         ], "a1b2c3d0"),
         make_code_cell([
             "# =============================================================================\n",
@@ -290,6 +290,13 @@ def generate_notebook() -> pathlib.Path:
             "            'LCLD_GAME_WALL_CLOCK_LIMIT_SECONDS': '5000',\n",
             "            'LCLD_GAME_CONCURRENCY': '4',\n",
             "            'LCLD_COMPETITION_WALL_CLOCK_LIMIT_SECONDS': '30600',\n",
+            "            'ARC_ENABLE_PRIMITIVE_PROBING': '1',\n",
+            "            'ARC_MAX_PRIMITIVE_PROBES': '30',\n",
+            "            'ARC_ENABLE_SYMBOLIC_FALLBACK': '1',\n",
+            "            'ARC_CODER_EXHAUSTION_FORCES_FALLBACK': '1',\n",
+            "            'ARC_SOLVER_EXHAUSTION_FORCES_FALLBACK': '1',\n",
+            "            'ARC_ABORT_ON_DSL_EXHAUSTION': '0',\n",
+            "            'ARC_MAX_CHAIN_ATTEMPTS': '5',\n",
             "        }\n",
             "        os.environ.update(arcade_settings)\n",
             "        env_path.write_text('\\n'.join(f'{k}={v}' for k, v in arcade_settings.items()) + '\\n', encoding='utf-8')\n",
