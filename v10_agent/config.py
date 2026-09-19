@@ -6,6 +6,7 @@ Provides V10Config with environment variable resolution and competition ceilings
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
@@ -78,7 +79,7 @@ class V10Config:
 
     # Trajectory & Solver Package Limits
     max_candidates_per_solver_package: int = 4
-    max_steps_per_candidate: int = 20
+    max_steps_per_candidate: int = 30
     execute_one_step_at_a_time: bool = True
 
     # Deterministic Sandbox
@@ -125,6 +126,13 @@ class V10Config:
     vllm_speculative_config: str | None = None
     vllm_speculative_cli_format: str = "auto"  # "auto" | "config_json" | "spec_tokens" | "speculative_model"
 
+    # vLLM Server Launch Configuration (Unified Phase A / Phase B serving runtime)
+    vllm_enable_prefix_caching: bool = False
+    vllm_enable_chunked_prefill: bool = True
+    vllm_async_scheduling: bool = True
+    vllm_no_enable_log_requests: bool = True
+    vllm_disable_uvicorn_access_log: bool = True
+
     # V10.1 Persistent Object Tracker & Four-valued Verdict Knobs
     enable_persistent_tracker: bool = True
     track_match_threshold: float = 0.45
@@ -137,6 +145,37 @@ class V10Config:
     enable_undecided_verdict: bool = True
     max_undecided_streak: int = 2
     max_evidence_probes_per_level: int = 2
+
+    # Deadline reserve & Time budgeting (Flash Loop Recovery port)
+    deadline_reserve_seconds: float = 15.0
+    notebook_reserve_seconds: float = 600.0
+    _deadline_time: float | None = None
+
+    # Visible Cycle Detection (Flash Loop Recovery port)
+    enable_cycle_detector: bool = True
+    cycle_detector_min_actions: int = 24
+    cycle_detector_max_period: int = 8
+    cycle_detector_min_cycles: int = 4
+    cycle_detector_per_level_limit: int = 2
+
+    def set_deadline(self, wall_clock_seconds: float) -> None:
+        """Set absolute monotonic deadline from duration."""
+        if wall_clock_seconds > 0:
+            self._deadline_time = time.monotonic() + wall_clock_seconds
+
+    def remaining_time_seconds(self) -> float | None:
+        """Return remaining seconds until deadline, or None if unconfigured."""
+        if self._deadline_time is not None:
+            return max(0.0, self._deadline_time - time.monotonic())
+        return None
+
+    def is_deadline_exceeded(self, reserve_seconds: float | None = None) -> bool:
+        """Check if remaining time has fallen below reserve threshold."""
+        rem = self.remaining_time_seconds()
+        if rem is None:
+            return False
+        reserve = self.deadline_reserve_seconds if reserve_seconds is None else reserve_seconds
+        return rem <= reserve
 
     @property
     def model_name(self) -> str:
@@ -304,10 +343,10 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         max_chain_attempts_per_level=_int_from_env("ARC_MAX_CHAIN_ATTEMPTS", 5),
         max_coder_retries_per_level=_int_from_env("ARC_MAX_CODER_RETRIES", 5),
         max_solver_retries_per_level=_int_from_env("ARC_MAX_SOLVER_RETRIES", 5),
-        max_explorer_probe_actions_per_level=_int_from_env("ARC_MAX_EXPLORER_PROBES", 8),
+        max_explorer_probe_actions_per_level=_int_from_env("ARC_MAX_EXPLORER_PROBES", 30),
         max_total_llm_calls_per_level=_int_from_env("ARC_MAX_TOTAL_LLM_CALLS_PER_LEVEL", 15),
         max_candidates_per_solver_package=_int_from_env("ARC_MAX_CANDIDATES_PER_PACKAGE", 4),
-        max_steps_per_candidate=_int_from_env("ARC_MAX_STEPS_PER_CANDIDATE", 20),
+        max_steps_per_candidate=_int_from_env("ARC_MAX_STEPS_PER_CANDIDATE", 30),
         execute_one_step_at_a_time=_bool_from_env("ARC_EXECUTE_ONE_STEP_AT_A_TIME", True),
         sandbox_enabled=_bool_from_env("ARC_SANDBOX_ENABLED", True),
         sandbox_max_cpu_seconds=_float_from_env("ARC_SANDBOX_MAX_CPU_SECONDS", 10.0),
@@ -339,6 +378,11 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         vllm_speculative_model=resolved_spec_model,
         vllm_speculative_config=resolved_spec_config,
         vllm_speculative_cli_format=resolved_spec_format,
+        vllm_enable_prefix_caching=_bool_from_env("ARC_VLLM_ENABLE_PREFIX_CACHING", False),
+        vllm_enable_chunked_prefill=_bool_from_env("ARC_VLLM_ENABLE_CHUNKED_PREFILL", True),
+        vllm_async_scheduling=_bool_from_env("ARC_VLLM_ASYNC_SCHEDULING", True),
+        vllm_no_enable_log_requests=_bool_from_env("ARC_VLLM_NO_ENABLE_LOG_REQUESTS", True),
+        vllm_disable_uvicorn_access_log=_bool_from_env("ARC_VLLM_DISABLE_UVICORN_ACCESS_LOG", True),
         enable_persistent_tracker=_bool_from_env("ARC_ENABLE_PERSISTENT_TRACKER", True),
         track_match_threshold=_float_from_env("ARC_TRACK_MATCH_THRESHOLD", 0.45),
         track_max_age=_int_from_env("ARC_TRACK_MAX_AGE", 5),
@@ -354,6 +398,26 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
     if overrides:
         cfg.update_runtime(overrides)
     return cfg
+
+
+def build_vllm_server_flags(cfg: V10Config | None = None) -> list[str]:
+    """Build standardized CLI flags for vLLM API server execution."""
+    if cfg is None:
+        cfg = config_from_env()
+    flags: list[str] = []
+    if cfg.vllm_enable_prefix_caching:
+        flags.append("--enable-prefix-caching")
+    else:
+        flags.append("--no-enable-prefix-caching")
+    if cfg.vllm_enable_chunked_prefill:
+        flags.append("--enable-chunked-prefill")
+    if cfg.vllm_async_scheduling:
+        flags.append("--async-scheduling")
+    if cfg.vllm_no_enable_log_requests:
+        flags.append("--no-enable-log-requests")
+    if cfg.vllm_disable_uvicorn_access_log:
+        flags.append("--disable-uvicorn-access-log")
+    return flags
 
 
 def build_vllm_speculative_args(

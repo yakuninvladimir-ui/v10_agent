@@ -136,7 +136,12 @@ class LayeredVerifier:
             c_sign = 1 if dc >= move_thresh else (-1 if dc <= -move_thresh else 0)
 
             props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="row_delta", value=r_sign))
+            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="delta_r", value=r_sign))
+            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="dy", value=r_sign))
+
             props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="col_delta", value=c_sign))
+            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="delta_c", value=c_sign))
+            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="dx", value=c_sign))
 
             # Attribute deltas
             props.append(AtomicProposition(family="attribute_delta", subject_id=b_obj.id, predicate="color", value=best_match.color))
@@ -281,6 +286,13 @@ class LayeredVerifier:
         after_levels = int(after_obs.get("levels_completed", 0) or 0)
         before_levels = int(getattr(before_snapshot, "levels_completed", 0) or 0)
 
+        before_grid = getattr(before_snapshot, "grid", None)
+        if before_grid is None and hasattr(planning_set, "grid"):
+            before_grid = planning_set.grid
+        zero_delta = (before_grid is not None and raw_grid and before_grid == raw_grid)
+        is_effective = bool(not zero_delta or after_levels > before_levels)
+        act_dict = action_dict or {}
+
         # 1. Tier 1: Terminal Victory or Level Completed (Follow)
         if state in {"WIN", "WON", "DONE", "VICTORY"} or after_levels > before_levels:
             return BrusentsovJudgment(
@@ -290,6 +302,8 @@ class LayeredVerifier:
                 expected_propositions=step.expected_propositions,
                 observed_propositions=observed,
                 explanation=f"Step {step.step_id} ({step.dsl_function}): Level/game advance confirmed (levels {before_levels} -> {after_levels}, state={state}). Brusentsov follow xy.",
+                action_dict=act_dict,
+                is_effective=True,
             )
 
         # 2. Tier 2: Terminal Failure Contradiction (Nullity)
@@ -301,6 +315,8 @@ class LayeredVerifier:
                 expected_propositions=step.expected_propositions,
                 observed_propositions=observed,
                 explanation=f"Step {step.step_id} ({step.dsl_function}): Terminal failure contradiction: entered state {state}. Brusentsov nullity xy'_0.",
+                action_dict=act_dict,
+                is_effective=False,
             )
 
         enable_undecided = getattr(self.config, "enable_undecided_verdict", True)
@@ -319,6 +335,8 @@ class LayeredVerifier:
                 observed_propositions=observed,
                 explanation=f"Step {step.step_id} ({step.dsl_function}): Low confidence grounded step. Epistemic signal seek evidence.",
                 evidence_hint="probe_environment",
+                action_dict=act_dict,
+                is_effective=is_effective,
             )
 
         # (b) Ambiguous tracker matching (difference between top candidates < matching_ambiguity_threshold)
@@ -339,6 +357,8 @@ class LayeredVerifier:
                     ambiguity_score=active_tracker.last_ambiguity_score,
                     evidence_hint="probe_motion",
                     matching_candidates=[active_tracker.last_ambiguous_track] if getattr(active_tracker, "last_ambiguous_track", None) else [],
+                    action_dict=act_dict,
+                    is_effective=is_effective,
                 )
 
         # (c) Low tracking confidence on any participating object
@@ -378,6 +398,8 @@ class LayeredVerifier:
                         ),
                         evidence_hint="probe_tracking",
                         track_confidence_min=trk.confidence,
+                        action_dict=act_dict,
+                        is_effective=is_effective,
                     )
 
         # 3. Tier 3: Explicit EXPECT Contradiction Check (Physical contradiction: implies_brusentsov == FALSE)
@@ -395,6 +417,8 @@ class LayeredVerifier:
                         f"Step {step.step_id} ({step.dsl_function}): Step proposition contradiction: "
                         f"asserted expected propositions physically refuted by observation. Brusentsov nullity xy'_0."
                     ),
+                    action_dict=act_dict,
+                    is_effective=is_effective,
                 )
 
         # 4. Tier 4: Explicit EXPECT Necessary Containment (Follow: implies_brusentsov == TRUE)
@@ -409,14 +433,11 @@ class LayeredVerifier:
                     f"Step {step.step_id} ({step.dsl_function}): Expected consequence necessarily contained in observation. "
                     f"Brusentsov follow xy."
                 ),
+                action_dict=act_dict,
+                is_effective=True,
             )
 
         # 5. Tier 5: Zero Grid Delta on a Confirmed Motion Action (Nullity)
-        before_grid = getattr(before_snapshot, "grid", None)
-        if before_grid is None and hasattr(planning_set, "grid"):
-            before_grid = planning_set.grid
-        zero_delta = (before_grid is not None and raw_grid and before_grid == raw_grid)
-
         act_id = ""
         if action_dict:
             act_id = str(action_dict.get("action_id") or action_dict.get("id") or "").upper()
@@ -447,11 +468,11 @@ class LayeredVerifier:
                     f"Step {step.step_id} ({step.dsl_function} / {act_id}): "
                     f"Motion action produced zero grid delta (obstacle or boundary collision). Brusentsov nullity xy'_0."
                 ),
+                action_dict=act_dict,
+                is_effective=False,
             )
 
         # 6. Tier 6: UNDECIDED conditions
-        enable_undecided = getattr(self.config, "enable_undecided_verdict", True)
-
         # 6a. Zero grid delta on an unconfirmed action carrying non-empty EXPECT
         if (
             zero_delta
@@ -470,19 +491,23 @@ class LayeredVerifier:
                 observed_propositions=observed,
                 explanation=f"Step {step.step_id} ({step.dsl_function} / {act_id}): Zero grid delta on non-confirmed action with expected effects. Epistemic signal seek evidence.",
                 evidence_hint=f"probe_{act_id}" if act_id else "probe_motion",
+                action_dict=act_dict,
+                is_effective=False,
             )
 
-
-        # 7. Tier 7: Positive certificate from GameMemory
+        # 7. Tier 7: Positive certificate from GameMemory (verified by non-zero delta)
         if act_id and confirmed_eff:
-            return BrusentsovJudgment(
-                trajectory_id=step.step_id,
-                step_id=step.step_id,
-                verdict=Verdict.FOLLOW,
-                expected_propositions=step.expected_propositions,
-                observed_propositions=observed,
-                explanation=f"Step {step.step_id} ({step.dsl_function} / {act_id}): Certified action effect verified against GameMemory. Brusentsov follow xy.",
-            )
+            if not zero_delta:
+                return BrusentsovJudgment(
+                    trajectory_id=step.step_id,
+                    step_id=step.step_id,
+                    verdict=Verdict.FOLLOW,
+                    expected_propositions=step.expected_propositions,
+                    observed_propositions=observed,
+                    explanation=f"Step {step.step_id} ({step.dsl_function} / {act_id}): Certified action effect verified against GameMemory. Brusentsov follow xy.",
+                    action_dict=act_dict,
+                    is_effective=True,
+                )
 
         # 8. Tier 8: Default Fallthrough (ISO-10)
         # If expected propositions were inessential or omitted without physical contradiction -> OMIT
@@ -497,17 +522,21 @@ class LayeredVerifier:
                     f"Step {step.step_id} ({step.dsl_function}): Expected consequence was inessential / omitted. "
                     f"Brusentsov omit x'y'."
                 ),
+                action_dict=act_dict,
+                is_effective=is_effective,
             )
 
-        # Approved trajectory step executed without step-by-step metric interruptions
+        # Tier 8: Default Fallthrough (ISO-10) - strictly return Verdict.OMIT for benign passive transitions
         return BrusentsovJudgment(
             trajectory_id=step.step_id,
             step_id=step.step_id,
-            verdict=Verdict.FOLLOW,
+            verdict=Verdict.OMIT,
             expected_propositions=step.expected_propositions,
             observed_propositions=observed,
             explanation=(
-                f"Step {step.step_id} ({step.dsl_function}): Executed as part of approved full trajectory "
-                f"without step-by-step metric interruptions. Brusentsov follow xy."
+                f"Step {step.step_id} ({step.dsl_function}): Executed without necessary containment proof. "
+                f"Tier 8 default fallback / benign passive transition. Brusentsov omit x'y'."
             ),
+            action_dict=act_dict,
+            is_effective=is_effective,
         )

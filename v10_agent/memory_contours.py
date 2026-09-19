@@ -215,7 +215,7 @@ class EpistemicMemory:
                 expl = pat.sub("[REDACTED SYNTAX]", expl)
                 object.__setattr__(judgment, "explanation", expl)
 
-        # ISO-9: UNDECIDED epistemic signals are kept in epistemic_signals
+        # ISO-9: UNDECIDED epistemic signals are kept in epistemic_signals, not committed judgments
         from v10_agent.brusentsov_logic import Verdict
         if judgment.verdict == Verdict.UNDECIDED:
             self.epistemic_signals.append(judgment)
@@ -333,10 +333,11 @@ class EpistemicMemory:
 
 TIER_RULES = [
     # (tier, pattern, description/type)
+    (3, re.compile(r"\b(?:\[goal\]|win_condition|level victory)\b", re.IGNORECASE), "goal"),
     (1, re.compile(r"\b(?:symmetr\w*|mirror\w*|axis|axes|reflect\w*|axial_symmetry)", re.IGNORECASE), "symmetry"),
-    (1, re.compile(r"\b(?:mov\w*|displace\w*|dy=|dx=|step_size|boundary|collision|wall|blocked)", re.IGNORECASE), "kinematics"),
+    (1, re.compile(r"\b(?:mov\w*|displace\w*|dy=|dx=|step_size|boundary|collision|wall|blocked|physics|gravity|momentum)", re.IGNORECASE), "kinematics"),
     (2, re.compile(r"\b(?:select\w*|toggl\w*|switch\w*|cycl\w*|ACTION5)", re.IGNORECASE), "control"),
-    (2, re.compile(r"\b(?:click\w*|trigger\w*|interact\w*|socket|touch\w*)", re.IGNORECASE), "interaction"),
+    (2, re.compile(r"\b(?:click\w*|trigger\w*|interact\w*|socket|touch\w*|cover\w*)", re.IGNORECASE), "interaction"),
     (2, re.compile(r"\b(?:color\w*|palette|indicator\w*)", re.IGNORECASE), "palette"),
 ]
 
@@ -402,11 +403,12 @@ class GameMemory:
     structured_invariants: list[StructuredInvariant] = field(default_factory=list)
     last_discovered_invariants: list[Any] = field(default_factory=list)
     invalidated_invariants: list[dict[str, Any]] = field(default_factory=list)
+    confirmed_actor_ids: set[str] = field(default_factory=set)
 
     @property
     def confirmed_actors(self) -> set[str]:
         """Return set of object IDs empirically observed to move or receive selection indicators."""
-        actors: set[str] = set()
+        actors: set[str] = set(self.confirmed_actor_ids)
         for note in self.selection_mechanics:
             for oid in re.findall(r"obj_[a-zA-Z0-9_]+", note):
                 actors.add(oid)
@@ -444,21 +446,25 @@ class GameMemory:
         return role_map
 
     def _generalize_text(self, text: str) -> str:
-        """Replace specific object IDs with functional role markers.
+        r"""Replace specific object IDs with functional role markers and strip level-local colors (ISO-8).
 
         Confirmed actors → [ACTOR], destinations → [TARGET],
         collision objects → [OBSTACLE], unknown → [ENTITY].
+        Also strips specific (color N) and color_\d+ literals so palettes don't contaminate new levels.
         """
         for obj_id, role in self._build_role_map().items():
             text = text.replace(obj_id, f"[{role}]")
         # Any remaining unknown obj_... replaced by [ENTITY]
         text = re.sub(r"obj_[a-zA-Z0-9_]+", "[ENTITY]", text)
+        # ISO-8: Strip concrete color specifications across level transitions
+        text = re.sub(r"\b(?:color\s+\d+|color_\d+)\b", "[COLOR]", text, flags=re.IGNORECASE)
+        text = re.sub(r"\(color\s+\d+\)", "[COLOR]", text, flags=re.IGNORECASE)
         return text
 
     def _is_level_specific(self, text: str) -> bool:
-        """Check if an invariant rule is bound to a specific level index or transient coordinate."""
+        """Check if an invariant rule is explicitly tagged as specific to a single level."""
         return bool(re.search(
-            r"\b(rows?|cols?)\s*\d+|\(\d+\s*,\s*\d+\)|\b\d+\s*steps\b|Level\s+(?:\d+|level_\d+)\s+specific|Level\s+(?:\d+|level_\d+)\s+invariant",
+            r"\b(?:only\s+on\s+level\s+\d+|level_\d+\s+transient|level\s+\d+\s+specific\s+obstacle|temporary\s+level\s+rule)\b",
             text,
             re.IGNORECASE,
         ))
@@ -528,10 +534,10 @@ class GameMemory:
             metadata["axis_steps"] = int(m_ax.group(1))
             metadata["piece_steps"] = int(m_pc.group(1))
 
-        if re.search(r"internal dots moved from\s+(obj_[a-zA-Z0-9_]+)", note) or \
-           any(kw in note.lower() for kw in ("toggle", "switch", "action5", "active entity toggled")):
-            metadata["init_actor"] = "axis"
-        
+        m_src = re.search(r"internal dots moved from\s+(obj_[a-zA-Z0-9_]+)", note)
+        if m_src:
+            metadata["init_source_entity"] = m_src.group(1)
+
         m_act = re.search(r"(ACTION\d+)", note, re.IGNORECASE)
         if m_act:
             metadata["action_id"] = m_act.group(1).upper()
@@ -623,7 +629,7 @@ class GameMemory:
             })
             if winning_macro and not re.search(r"action\d+\(\)", winning_macro, re.IGNORECASE):
                 self.record_stratified_invariant(
-                    f"Level {level_id} invariant: {invariant_rule} (macro: {winning_macro})",
+                    f"Goal invariant ({level_id}): {invariant_rule} (macro: {winning_macro})",
                     tier=3,
                     invariant_type="goal",
                     confidence=0.8,
@@ -632,7 +638,7 @@ class GameMemory:
                 )
             else:
                 self.record_stratified_invariant(
-                    f"Level {level_id} invariant: {invariant_rule}",
+                    f"Goal invariant ({level_id}): {invariant_rule}",
                     tier=3,
                     invariant_type="goal",
                     confidence=0.8,
@@ -739,11 +745,24 @@ class GameMemory:
                 if action_match and action_match.group(0).lower() in rule_clean.lower():
                     self.invalidated_invariants.remove(inv_rec)
 
-            # Record revised invariant into structured tiers
-            tier = 3 if outcome == "WIN" else 2
+            # Route based on explicit category tag or classifier
+            r_lower = rule_clean.lower()
+            if r_lower.startswith("[physics]") or any(kw in r_lower for kw in ("displacement", "velocity", "kinematic effect", "collision", "wall")):
+                tier = 1
+                inv_type = "kinematics"
+            elif r_lower.startswith("[control]") or r_lower.startswith("[entities]") or r_lower.startswith("[structure]"):
+                tier = 2
+                inv_type = "control" if "control" in r_lower else "topology"
+            elif r_lower.startswith("[goal]"):
+                tier = 3
+                inv_type = "goal"
+            else:
+                tier, inv_type = _classify_tier(rule_clean)
+
             self.record_stratified_invariant(
                 rule=rule_clean,
                 tier=tier,
+                invariant_type=inv_type,
                 confidence=0.85 if outcome == "WIN" else 0.75,
                 source=f"solver_revision_{outcome.lower()}",
             )
@@ -886,6 +905,10 @@ class GameMemory:
 
         def is_level_transient(text: str) -> bool:
             t_low = text.lower()
+            if "displacement of dy=" in t_low or "displacement of" in t_low:
+                return False
+            if "moves entity" in t_low or "kinematic effect" in t_low:
+                return False
             transient_patterns = [
                 r"\brows?\s*\d+",
                 r"\bcols?\s*\d+",
@@ -898,6 +921,7 @@ class GameMemory:
                 r"\btook\s+\d+\s*steps\b",
                 r"\bin\s+\d+\s*steps\b",
                 r"\bwithin\s+\d+\s*steps\b",
+                r"\bneed\s+\d+\s*steps\b",
             ]
             return any(re.search(p, t_low) for p in transient_patterns)
 

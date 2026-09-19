@@ -96,6 +96,13 @@ class BrusentsovJudgment:
     evidence_hint: str | None = None
     matching_candidates: list[str] = field(default_factory=list)
     track_confidence_min: float | None = None
+    action_dict: dict[str, Any] = field(default_factory=dict)
+    is_effective: bool = False
+
+    @property
+    def ternary_verdict(self) -> Verdict | Ternary:
+        """Compatibility property matching Solver epistemic prompt expectations."""
+        return self.verdict
 
     def to_dict(self) -> dict[str, Any]:
         v_name = self.verdict.name if hasattr(self.verdict, "name") else str(self.verdict)
@@ -109,7 +116,10 @@ class BrusentsovJudgment:
             "observed_count": len(self.observed_propositions),
             "explanation": self.explanation,
             "timestamp": self.timestamp,
+            "is_effective": self.is_effective,
         }
+        if self.action_dict:
+            d["action_dict"] = dict(self.action_dict)
         if self.ambiguity_score is not None:
             d["ambiguity_score"] = self.ambiguity_score
         if self.evidence_hint is not None:
@@ -143,17 +153,22 @@ def contradicts(expected: AtomicProposition, observed: AtomicProposition) -> boo
     # 3. Metric Sign contradiction:
     # Expected change in a specific direction (+1 or -1), but observed opposite direction
     if expected.family == "metric_sign" and observed.family == "metric_sign":
-        if expected.subject_id == observed.subject_id and expected.predicate == observed.predicate:
+        # Match predicates accounting for aliases (row_delta/delta_r/dy and col_delta/delta_c/dx)
+        exp_p = expected.predicate.lower()
+        obs_p = observed.predicate.lower()
+        p_matches = (
+            exp_p == obs_p
+            or (exp_p in ("row_delta", "delta_r", "dy") and obs_p in ("row_delta", "delta_r", "dy"))
+            or (exp_p in ("col_delta", "delta_c", "dx") and obs_p in ("col_delta", "delta_c", "dx"))
+        )
+        if p_matches and (expected.subject_id == observed.subject_id or not expected.subject_id):
             if expected.secondary_id == observed.secondary_id:
                 try:
                     exp_sign = int(expected.value)
                     obs_sign = int(observed.value)
-                    # Contradiction if opposite sign (e.g. expected +1, observed -1)
+                    # Contradiction strictly when opposite directions are observed (e.g. expected +1, observed -1)
+                    # Note: zero displacement is an inessential missing effect (OMIT/UNDECIDED), not a physical contradiction.
                     if exp_sign != 0 and obs_sign != 0 and exp_sign != obs_sign:
-                        return True
-                    # If strictly non-zero expected delta was anticipated, but movement was strictly zero and blocked
-                    if exp_sign != 0 and obs_sign == 0 and expected.predicate.endswith("_delta"):
-                        # Zero displacement when non-zero was expected = physical wall/blockage = NULLITY
                         return True
                 except (ValueError, TypeError):
                     pass
@@ -244,8 +259,8 @@ def implies_brusentsov(expected: PropositionSet, observed: PropositionSet) -> Te
       IRRELEVANT (0) : The expected set is not implied, yet no incompatibility exists (inessential missing effect).
     """
     if len(expected) == 0:
-        # Trivial fulfillment
-        return Ternary.TRUE
+        # Trivial fulfillment / silence is inessential neutrality (x'y'), NOT necessary consequence (xy)
+        return Ternary.IRRELEVANT
 
     # 1. Incompatibility check (NULL check)
     for e in expected:
@@ -273,15 +288,56 @@ def implies_brusentsov(expected: PropositionSet, observed: PropositionSet) -> Te
     return Ternary.IRRELEVANT
 def evaluate_invariant_across_levels(
     invariant: "StructuredInvariant",
-    current_level_observations: PropositionSet,
+    current_level_observations: Any,
 ) -> Ternary:
     """Evaluate whether an invariant holds in a new level context.
     
+    Supports PropositionSet, PlanningSet, or raw observation dictionary.
     TRUE: observations directly confirm the invariant
     FALSE: observations directly contradict the invariant  
     IRRELEVANT: insufficient observations to confirm or deny
     """
-    if not current_level_observations or not current_level_observations.propositions:
+    if current_level_observations is None:
+        return Ternary.IRRELEVANT
+
+    props: list[AtomicProposition] = []
+    if isinstance(current_level_observations, PropositionSet):
+        props = list(current_level_observations.propositions)
+    elif hasattr(current_level_observations, "propositions"):
+        props = list(current_level_observations.propositions)
+    elif hasattr(current_level_observations, "objects") and hasattr(current_level_observations, "relations"):
+        # Extracted directly from PlanningSet
+        for obj in current_level_observations.objects:
+            props.append(AtomicProposition(family="object_identity", subject_id=obj.id, predicate="preserved"))
+            props.append(AtomicProposition(family="attribute_delta", subject_id=obj.id, predicate="color", value=obj.color))
+            props.append(AtomicProposition(family="attribute_delta", subject_id=obj.id, predicate="area", value=obj.area))
+            props.append(AtomicProposition(family="spatial_position", subject_id=obj.id, predicate="centroid", value=(obj.centroid.row, obj.centroid.col)))
+        for rel in current_level_observations.relations:
+            props.append(AtomicProposition(
+                family="relation_existence",
+                subject_id=rel.subject_id,
+                predicate=rel.relation_type,
+                value=True,
+                secondary_id=rel.target_id,
+            ))
+    elif isinstance(current_level_observations, dict) and "grid" in current_level_observations:
+        from v10_agent.arga_lite import extract_arga_snapshot
+        snap = extract_arga_snapshot(current_level_observations["grid"])
+        for obj in snap.objects:
+            props.append(AtomicProposition(family="object_identity", subject_id=obj.id, predicate="preserved"))
+            props.append(AtomicProposition(family="attribute_delta", subject_id=obj.id, predicate="color", value=obj.color))
+            props.append(AtomicProposition(family="attribute_delta", subject_id=obj.id, predicate="area", value=obj.area))
+            props.append(AtomicProposition(family="spatial_position", subject_id=obj.id, predicate="centroid", value=(obj.centroid.row, obj.centroid.col)))
+        for rel in snap.relations:
+            props.append(AtomicProposition(
+                family="relation_existence",
+                subject_id=rel.subject_id,
+                predicate=rel.relation_type,
+                value=True,
+                secondary_id=rel.target_id,
+            ))
+
+    if not props:
         return Ternary.IRRELEVANT
 
     inv_type = invariant.invariant_type.lower()
@@ -299,7 +355,7 @@ def evaluate_invariant_across_levels(
                 act_id = raw_act if raw_act.startswith("ACTION") else f"ACTION{raw_act}"
 
         relevant_metric_props = [
-            p for p in current_level_observations.propositions
+            p for p in props
             if p.family in ("metric_sign", "attribute_delta")
         ]
 
@@ -308,11 +364,11 @@ def evaluate_invariant_across_levels(
 
         # Check for blocked or zero displacement contradiction
         has_motion = any(
-            p.family == "metric_sign" and p.predicate.endswith("_delta") and p.value not in (0, None)
+            p.family == "metric_sign" and (p.predicate.endswith("_delta") or p.predicate in ("dy", "dx", "delta_r", "delta_c")) and p.value not in (0, None)
             for p in relevant_metric_props
         )
         has_blocked_zero = any(
-            p.family == "metric_sign" and p.predicate.endswith("_delta") and p.value == 0
+            p.family == "metric_sign" and (p.predicate.endswith("_delta") or p.predicate in ("dy", "dx", "delta_r", "delta_c")) and p.value == 0
             for p in relevant_metric_props
         )
 
@@ -327,13 +383,13 @@ def evaluate_invariant_across_levels(
     # 2. Area conservation invariants
     if inv_type in ("area_conservation", "topology") or "area" in desc:
         area_props = [
-            p for p in current_level_observations.propositions
+            p for p in props
             if p.predicate == "area" or p.family == "area_conservation"
         ]
         if area_props:
             has_destroyed = any(
                 p.family == "object_identity" and p.predicate in ("destroyed", "vanished")
-                for p in current_level_observations.propositions
+                for p in props
             )
             if has_destroyed and "conserv" in desc:
                 return Ternary.FALSE
@@ -343,7 +399,7 @@ def evaluate_invariant_across_levels(
     p_pos = meta.get("target_position")
     if inv_type in ("spatial_position", "positional_pattern") or p_pos:
         pos_props = [
-            p for p in current_level_observations.propositions
+            p for p in props
             if p.family == "spatial_position"
         ]
         if pos_props:
@@ -354,14 +410,57 @@ def evaluate_invariant_across_levels(
                     return Ternary.FALSE
 
     # 4. Symmetry and relational invariants
-    if inv_type in ("symmetry", "axial_symmetry_vertical", "axial_symmetry_horizontal", "socket_coverage"):
+    if inv_type in ("symmetry", "axial_symmetry_vertical", "axial_symmetry_horizontal", "socket_coverage", "alignment"):
         rel_props = [
-            p for p in current_level_observations.propositions
+            p for p in props
             if p.family == "relation_existence"
         ]
         if rel_props:
-            for p in rel_props:
-                if inv_type in str(p.predicate).lower() or inv_type in str(p.value).lower():
-                    return Ternary.TRUE if p.value else Ternary.FALSE
+            matching = any(
+                inv_type in str(p.predicate).lower() or str(p.predicate).lower() in inv_type
+                for p in rel_props if p.value
+            )
+            if matching:
+                return Ternary.TRUE
+
+    # 5. Goal & Victory Invariants
+    if inv_type in ("goal", "victory", "win_condition") or "win" in desc or "goal" in desc:
+        term_props = [
+            p for p in props
+            if p.family == "terminal_outcome" or p.predicate in ("won", "lost", "in_progress")
+        ]
+        if term_props:
+            for p in term_props:
+                if p.predicate == "won" and ("win" in desc or "goal" in desc):
+                    return Ternary.TRUE
+                elif p.predicate == "lost" and ("win" in desc or "goal" in desc):
+                    return Ternary.FALSE
+
+    # 6. Control & Selection Invariants
+    if inv_type in ("control", "selection", "modality") or "toggle" in desc or "switch" in desc:
+        ctrl_props = [
+            p for p in props
+            if p.family in ("control_scheme", "selection_mechanics") or "toggle" in str(p.predicate)
+        ]
+        if ctrl_props:
+            return Ternary.TRUE
+
+    # 7. Palette & Color/Role Invariants
+    if inv_type in ("palette", "color_role") or "color" in desc or "palette" in desc:
+        color_props = [
+            p for p in props
+            if p.family == "attribute_delta" and p.predicate == "color"
+        ]
+        if color_props:
+            return Ternary.TRUE
+
+    # 8. Transformation & State Change Invariants
+    if inv_type in ("transformation", "state_flip", "rotation") or "rotate" in desc or "flip" in desc:
+        tf_props = [
+            p for p in props
+            if p.family in ("transformation", "attribute_delta", "object_identity")
+        ]
+        if tf_props:
+            return Ternary.TRUE
 
     return Ternary.IRRELEVANT

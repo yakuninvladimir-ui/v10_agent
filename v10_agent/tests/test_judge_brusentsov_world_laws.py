@@ -2,7 +2,7 @@
 
 import pytest
 from v10_agent.arga_lite import ARGALiteSnapshot, extract_arga_snapshot
-from v10_agent.brusentsov_logic import Ternary
+from v10_agent.brusentsov_logic import Ternary, Verdict
 from v10_agent.config import V10Config
 from v10_agent.judge import LayeredVerifier
 from v10_agent.memory_contours import GameMemory
@@ -220,8 +220,8 @@ def test_judge_auxiliary_selection_toggle_follows_without_interruption(verifier)
         planning_set=pset,
         action_dict={"action_id": "ACTION5"},
     )
-    assert judgment.verdict == Ternary.TRUE
-    assert "follow xy" in judgment.explanation
+    assert judgment.verdict == Verdict.OMIT
+    assert "omit x'y'" in judgment.explanation
 
 
 def test_solver_prompt_contains_grid_bounds_and_freedom_of_motion():

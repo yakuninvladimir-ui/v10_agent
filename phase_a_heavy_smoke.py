@@ -282,6 +282,19 @@ def start_vllm_server(
     log_path = get_vllm_log_path()
     _vllm_log_file = log_path.open("w", encoding="utf-8")
 
+    try:
+        from v10_agent.config import build_vllm_server_flags, config_from_env
+        _cfg = config_from_env()
+        server_flags = build_vllm_server_flags(_cfg)
+    except Exception:
+        server_flags = [
+            "--no-enable-prefix-caching",
+            "--enable-chunked-prefill",
+            "--async-scheduling",
+            "--no-enable-log-requests",
+            "--disable-uvicorn-access-log",
+        ]
+
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", str(model_path),
@@ -296,7 +309,7 @@ def start_vllm_server(
         "--enable-auto-tool-choice",
         "--tool-call-parser", "qwen3_coder",
         "--reasoning-parser", "qwen3",
-        "--enable-prefix-caching",
+        *server_flags,
         "--mm-processor-cache-gb", "0",
         "--gpu-memory-utilization", "0.95",
         "--attention-backend", "FLASH_ATTN",

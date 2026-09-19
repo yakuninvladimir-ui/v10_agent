@@ -79,6 +79,17 @@ from v10_agent.trajectory import CandidateTrajectory, TrajectoryPool
 from v10_agent.fallback_symbolic import SymbolicFallbackEngine
 from v10_agent.logging import AuditRecord, StructuredAuditLogger
 from v10_agent.session import GameSession
+from v10_agent.serving_setup import ServingSetup, create_setup
+from v10_agent.serving_teardown import teardown_serving, wait_for_port_closed
+from v10_agent.vllm_server_watchdog import (
+    ServerWatchdog,
+    WatchdogConfig,
+    load_setup,
+    start_background,
+    stop_background,
+    is_healthy,
+    get_status,
+)
 
 __version__ = "10.0.0"
 
@@ -155,4 +166,15 @@ __all__ = [
     "AuditRecord",
     "StructuredAuditLogger",
     "GameSession",
+    "ServingSetup",
+    "create_setup",
+    "teardown_serving",
+    "wait_for_port_closed",
+    "ServerWatchdog",
+    "WatchdogConfig",
+    "load_setup",
+    "start_background",
+    "stop_background",
+    "is_healthy",
+    "get_status",
 ]

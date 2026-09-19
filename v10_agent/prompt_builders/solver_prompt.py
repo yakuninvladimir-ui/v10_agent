@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from v10_agent.brusentsov_logic import Ternary
 from v10_agent.memory_contours import EpistemicMemory
 from v10_agent.planning_set import PlanningSet
 
@@ -21,7 +22,11 @@ RULES:
 2. All object arguments MUST strictly use IDs from the provided `planning_objects`. Do not invent IDs.
 3. Check `past_failed_sequences` and `structured_failures`. DO NOT repeat them. Formulate alternative hypotheses.
 4. Respect grid boundaries and object freedom of motion limits.
-5. Provide up to 3 distinct candidate trajectories.
+5. Provide up to 4 distinct candidate trajectories.
+6. TRAJECTORY HORIZON & REPETITION SYNTAX (count=N):
+   - Level solutions typically require extended trajectories (often 20 to 30 sequential actions).
+   - Use the repetition parameter `count=N` to repeat an action N times cleanly: e.g. `action1(count=15)` executes 15 consecutive moves (up to 30).
+   - Do not artificially truncate to micro-probes; plan the full sequence needed to reach the target winning configuration.
 
 TERNARY EVALUATION SEMANTICS:
 Your trajectories will be evaluated step-by-step using Brusentsov ternary logic:
@@ -42,20 +47,21 @@ You must structure your response using the following XML tags:
 </invariant_analysis>
 
 <trajectory_1>
-[Sequence of DSL function calls, e.g.:
- action1() EXPECT: dy=-3, dx=0
- action6(x=5, y=10)
- action2()
-Optional `EXPECT: prop=val` clauses allow the Brusentsov judge to verify step consequences.]
+[Full trajectory plan for candidate 1 using DSL function calls, e.g. action1(count=12), action6(x=5, y=10), action2(count=8)]
+[Optional `EXPECT: prop=val` clauses allow the Brusentsov judge to verify step consequences.]
 </trajectory_1>
 
 <trajectory_2>
-[Alternative sequence of DSL function calls]
+[Alternative full trajectory plan for candidate 2]
 </trajectory_2>
 
 <trajectory_3>
-[Optional third sequence]
+[Alternative full trajectory plan for candidate 3]
 </trajectory_3>
+
+<trajectory_4>
+[Alternative full trajectory plan for candidate 4]
+</trajectory_4>
 """
 
 
@@ -63,24 +69,23 @@ def _build_phase_instruction(level_index: int, total_levels: int = 6) -> str:
     """Build progressive strategic instructions adapting to game learning phases."""
     if level_index <= 1:
         return (
-            "CURRENT PHASE: EXPLORATION PHASE (Level index <= 1)\n"
+            "CURRENT PHASE: INITIAL EXPLORATION PHASE (Level index <= 1)\n"
             "Aim to generate complete winning trajectories from the very first attempt.\n"
             "Do not artificially truncate your plans into short probes or incremental tests. "
             "Formulate complete multi-step candidates that transform the initial state directly into the winning configuration."
         )
     elif level_index <= 3:
         return (
-            "CURRENT PHASE: CONFIRMATION PHASE (Level index 2-3)\n"
-            "You have partial knowledge of this game's mechanics.\n"
-            "Apply confirmed invariants. Use shorter, more targeted trajectories. "
-            "If a confirmed pattern doesn't work, flag it as potentially falsified."
+            "CURRENT PHASE: PROGRESSIVE CONFIRMATION PHASE (Level index 2-3)\n"
+            "Apply confirmed invariants from the game model. "
+            "Formulate complete winning plans while remaining alert to level-specific variations, new colors, or obstacles. "
+            "If an invariant is challenged by the environment, adapt your hypothesis."
         )
     else:
         return (
             "CURRENT PHASE: EXPLOITATION PHASE (Level index >= 4)\n"
-            "The game model is mostly confirmed.\n"
-            "Execute optimal trajectories based on confirmed invariants. "
-            "Minimize unnecessary exploration. Trust confirmed physics."
+            "Execute optimal trajectories based on synthesized domain invariants across earlier levels to achieve direct level victory. "
+            "Check for any new colors, shapes, or obstacles introduced at higher difficulty, and navigate around them."
         )
 
 
@@ -280,19 +285,21 @@ def build_solver_prompts(
     if epistemic_memory:
         for j in epistemic_memory.judgments:
             v = getattr(j, "ternary_verdict", None)
-            v_val = getattr(v, "value", str(v)) if v is not None else ""
+            v_name = str(getattr(v, "name", getattr(v, "value", str(v))))
+            is_true = (v == Ternary.TRUE) or ("TRUE" in v_name) or ("FOLLOW" in v_name) or bool(getattr(j, "is_effective", False))
+            is_irr = (v == Ternary.IRRELEVANT) or ("IRRELEVANT" in v_name) or ("OMIT" in v_name)
             act = getattr(j, "action_dict", {}) or {}
             data = act.get("data", {}) if isinstance(act, dict) else {}
             if "x" in data and "y" in data:
                 try:
                     coord = (int(data["x"]), int(data["y"]))
-                    if "TRUE" in v_val or "FOLLOW" in v_val or getattr(j, "is_effective", False):
+                    if is_true:
                         interactive_coords.add(coord)
-                    elif "IRRELEVANT" in v_val or "OMIT" in v_val:
+                    elif is_irr:
                         non_interactive_coords.add(coord)
                 except (ValueError, TypeError):
                     pass
-            if "TRUE" in v_val or "FOLLOW" in v_val or getattr(j, "is_effective", False):
+            if is_true:
                 confirmed_effective.append(j.to_dict())
 
     trial_summary: dict[str, Any] = {
@@ -397,7 +404,6 @@ def build_solver_prompts(
         return f"{name}({', '.join(p_strs)})"
 
     fn_0_ex = format_fn_call_example(functions_summary[0]) if len(functions_summary) > 0 else "action1()"
-    fn_1_ex = format_fn_call_example(functions_summary[1]) if len(functions_summary) > 1 else fn_0_ex
 
     image_note = (
         "solver_raw_frame.png is the exact same frame as solver_annotated_frame.png, but without object annotations.\n\n"
@@ -409,8 +415,16 @@ def build_solver_prompts(
 {image_note}Current Problem State & Available DSL Functions:
 {json.dumps(user_payload, indent=2)}
 
-Formulate 1 to 3 candidate trajectories using the available DSL functions.
-Provide your response using XML tags:
+Formulate up to 4 distinct candidate trajectories using the available DSL functions.
+Provide complete, full-length trajectories aimed at solving the level directly.
+Level solutions typically require extended sequences (20 to 30 sequential actions).
+
+SYNTAX & REPETITION (count=N):
+- Call DSL functions directly (e.g. `{fn_0_ex}`).
+- You can specify repeat counts to avoid repetitive lines: e.g. `action1(count=15)` repeats action1 15 times (maximum 30).
+- Optional `EXPECT: prop=val` clauses allow the Brusentsov judge to verify step consequences: e.g. `action1(count=10) EXPECT: dy=-10, dx=0`.
+
+Provide your response strictly using XML tags:
 
 <invariant_analysis>
 1. Likely level goal: ...
@@ -420,14 +434,20 @@ Provide your response using XML tags:
 </invariant_analysis>
 
 <trajectory_1>
-1. {fn_0_ex}
-2. {fn_0_ex}
+[Full trajectory plan for candidate 1]
 </trajectory_1>
 
 <trajectory_2>
-1. {fn_1_ex}
-2. {fn_0_ex}
+[Full trajectory plan for candidate 2]
 </trajectory_2>
+
+<trajectory_3>
+[Full trajectory plan for candidate 3]
+</trajectory_3>
+
+<trajectory_4>
+[Full trajectory plan for candidate 4]
+</trajectory_4>
 """
 
     effective_level_index = level_index if level_index is not None else getattr(game_memory, "completed_levels", 0)

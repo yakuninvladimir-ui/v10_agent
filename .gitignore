@@ -1,4 +1,4 @@
-﻿# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -14,6 +14,16 @@ local_harness_run*.json
 # Notebook build outputs
 notebooks/
 *.ipynb
+
+# Archives
+*.zip
+*.7z
+*.tar.gz
+
+# Scratch and backups
+scratch/
+backups*/
+local_env_test/
 
 # OS artifacts
 .DS_Store

@@ -124,6 +124,9 @@ def run_direct_game(
     delegate = ARC_AGI_Agent(config)
 
     game_wall_limit = max(0.0, float(os.getenv("LCLD_GAME_WALL_CLOCK_LIMIT_SECONDS", "5000")))
+    if game_wall_limit > 0 and hasattr(delegate, "_session") and hasattr(delegate._session, "config"):
+        delegate._session.config.set_deadline(game_wall_limit)
+
     started = time.monotonic()
     accepted_actions = 0
     proposed_actions = 0
@@ -158,6 +161,18 @@ def run_direct_game(
                     "accepted_actions": accepted_actions,
                 })
                 break
+
+            if hasattr(delegate, "_session") and hasattr(delegate._session, "config"):
+                reserve_sec = getattr(delegate._session.config, "deadline_reserve_seconds", 15.0)
+                if delegate._session.config.is_deadline_exceeded(reserve_seconds=reserve_sec):
+                    stop_reason = "deadline_reserve"
+                    delegate.record_orchestration_termination(stop_reason, {
+                        "elapsed_seconds": elapsed,
+                        "limit_seconds": game_wall_limit,
+                        "remaining_seconds": delegate._session.config.remaining_time_seconds(),
+                        "accepted_actions": accepted_actions,
+                    })
+                    break
 
             state_name = _state(latest)
             observation = _observation(latest, frame_index, game_id)

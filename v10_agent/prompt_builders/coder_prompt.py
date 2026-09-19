@@ -58,6 +58,13 @@ def build_coder_prompts(
     if "coordinate_affordances" in compact_spec and len(compact_spec["coordinate_affordances"]) > 20:
         compact_spec["coordinate_affordances"] = compact_spec["coordinate_affordances"][:20]
 
+    # ISO-2 Quarantine: ensure no goal rules or win conditions ever reach Coder prompt
+    if "invariants" in compact_spec and isinstance(compact_spec["invariants"], list):
+        compact_spec["invariants"] = [
+            inv for inv in compact_spec["invariants"]
+            if isinstance(inv, str) and not any(kw in inv.lower() for kw in ("goal", "win", "target", "curriculum"))
+        ]
+
     # Resolve ground-truth available actions from planning_set or env_spec
     available_actions: list[str] = []
     if planning_set is not None and getattr(planning_set, "allowed_action_ids", None):

@@ -87,6 +87,21 @@ def parse_text_trajectory(
     elif isinstance(manifest_or_funcs, (set, list, tuple)):
         valid_func_names = set(manifest_or_funcs)
 
+    lower_manifest_map = {k.lower(): v for k, v in manifest_map.items()}
+    lower_valid_funcs = {name.lower(): name for name in valid_func_names}
+
+    def canonicalize_func_name(name: str) -> str:
+        if name in valid_func_names:
+            return name
+        nl = name.lower()
+        if nl in lower_valid_funcs:
+            return lower_valid_funcs[nl]
+        if re.match(r"^action\d+$", name, re.IGNORECASE):
+            if nl in lower_valid_funcs:
+                return lower_valid_funcs[nl]
+            return nl
+        return name
+
     # 0. Invariant / Hypothesis extraction (supports both XML <invariant_analysis> and markdown [HYPOTHESIS])
     inv_evo_text = ""
     hypothesis_text = ""
@@ -156,7 +171,7 @@ def parse_text_trajectory(
         atem_invokes = list(re.finditer(r'<atem:invoke\s+name=["\'](?:api\.)?([a-zA-Z0-9_]+)["\']>(.*?)(?:</atem:invoke>|\Z)', chunk_text, re.DOTALL))
         if atem_invokes:
             for aim in atem_invokes:
-                fn = aim.group(1).split(".")[-1]
+                fn = canonicalize_func_name(aim.group(1).split(".")[-1])
                 body = aim.group(2).strip()
                 args: dict[str, Any] = {}
                 param_matches = list(re.finditer(r'<atem:parameter\s+name=["\']([a-zA-Z0-9_]+)["\']>(.*?)</atem:parameter>', body, re.DOTALL))
@@ -192,7 +207,8 @@ def parse_text_trajectory(
                     parsed_arr = json.loads(json_arr_m.group(0))
                     if isinstance(parsed_arr, list) and parsed_arr and isinstance(parsed_arr[0], dict):
                         for item in parsed_arr:
-                            fn = item.get("dsl_function") or item.get("action") or item.get("name") or "step"
+                            raw_fn = item.get("dsl_function") or item.get("action") or item.get("name") or "step"
+                            fn = canonicalize_func_name(raw_fn)
                             if not valid_func_names or fn in valid_func_names:
                                 cand_steps.append({
                                     "step_id": f"s{step_idx}",
@@ -250,11 +266,12 @@ def parse_text_trajectory(
                 if m:
                     call_match = m.group(0)
                     fn, args = _parse_fn_call_args(call_match)
+                    fn = canonicalize_func_name(fn)
                     arg_str = m.group(2)
                     if not valid_func_names or fn in valid_func_names:
                         if not args and arg_str.strip():
                             pos_vals = [x.strip().strip("\"'") for x in arg_str.split(",") if x.strip()]
-                            fn_meta = manifest_map.get(fn, {})
+                            fn_meta = manifest_map.get(fn) or lower_manifest_map.get(fn.lower(), {})
                             fn_params = [p for p in fn_meta.get("parameters", []) if p.get("name") != "api"]
                             for p_idx, val in enumerate(pos_vals):
                                 if p_idx < len(fn_params):
@@ -539,7 +556,7 @@ class SolverAgent:
             outcome_header = (
                 f"[EXECUTION OUTCOME: LEVEL WON]\n"
                 f"Your proposed trajectory ({cand_id}) successfully solved this level and achieved victory!\n"
-                f"Summary of executed transitions: {exec_desc}\n"
+                f"Outcome: {exec_desc}\n"
                 f"Your original hypothesis: {hyp}\n"
             )
         else:
@@ -548,7 +565,7 @@ class SolverAgent:
                 f"[EXECUTION OUTCOME: ATTEMPT FAILED / CONTRADICTION DETECTED]\n"
                 f"Your proposed trajectory ({cand_id}) did not succeed.\n"
                 f"Failure reason: {fail_desc}\n"
-                f"Summary of executed transitions: {exec_desc}\n"
+                f"Summary: {exec_desc}\n"
                 f"Your original hypothesis: {hyp}\n"
             )
 
@@ -602,18 +619,19 @@ class SolverAgent:
             f"1. NO coordinates, row/column numbers, bounding boxes, or grid dimensions (these change every level).\n"
             f"2. NO step counts or action repetition numbers (distances vary across levels).\n"
             f"3. NO literal button sequences or macros like 'action1 -> action5' (order of actions varies).\n"
-            f"4. Use applicable categories from:\n"
-            f"   - [PHYSICS]: How objects move, collide, and interact with boundaries\n"
-            f"   - [STRUCTURE]: Persistent spatial relationships (symmetry, containment, alignment)\n"
-            f"   - [GOAL]: What constitutes success (abstractly, not as coordinates)\n"
-            f"   - [CONTROL]: How entity selection/switching operates\n"
-            f"   - [PALETTE]: Color-to-role mapping IF clearly observed\n"
-            f"   - [CONSTRAINTS]: What is forbidden or impossible\n\n"
+            f"4. Mandatorily structure your revised invariants using these standard categories:\n"
+            f"   - [PALETTE & ROLES]: Abstract color-to-role relationships\n"
+            f"   - [GOAL]: Abstract win conditions and alignment criteria\n"
+            f"   - [ENTITIES]: Persistent entity types, symmetries, and structures\n"
+            f"   - [CONTROL]: How actions and entity toggling/selection operate\n"
+            f"   - [PHYSICS]: Kinematics, movement displacement, walls, boundaries, and collisions\n\n"
             f"Format your revised invariant list strictly inside <revised_invariants>...</revised_invariants> with bullet points:\n"
             f"<revised_invariants>\n"
             f"- [PHYSICS]: ...\n"
-            f"- [STRUCTURE]: ...\n"
+            f"- [CONTROL]: ...\n"
+            f"- [ENTITIES]: ...\n"
             f"- [GOAL]: ...\n"
+            f"- [PALETTE & ROLES]: ...\n"
             f"</revised_invariants>"
         )
 
@@ -651,7 +669,7 @@ class SolverAgent:
             line_s = re.sub(r"<[^>]+>", "", line_s).strip()
             if not line_s:
                 continue
-            # Filter out any accidentally leaked button macros, coordinates or code blocks
+            # Filter out leaked button macro chains and bad-tagged transient rules
             if re.search(r"action\d+\s*[-→>]+\s*action\d+", line_s, re.IGNORECASE):
                 continue
             if re.search(r"action\d+\(\)\s*[-→>]+\s*action\d+\(\)", line_s, re.IGNORECASE):
@@ -660,7 +678,11 @@ class SolverAgent:
                 continue
             if re.search(r"action\d+\(\)", line_s, re.IGNORECASE) and any(arrow in line_s for arrow in ("->", "→", ">")):
                 continue
-            if re.search(r"\b(?:dx|dy)\s*=\s*-?\d+", line_s, re.IGNORECASE):
+            if re.search(r"^bad\s+(?:macro|rule|coordinate)\b", line_s, re.IGNORECASE):
+                continue
+            if re.search(r"^bad\s+.*(?:dx=|action)", line_s, re.IGNORECASE):
+                continue
+            if re.search(r"\b(?:dx|dy)\s*=\s*-?\d+.*(?:at\s+row|row=)", line_s, re.IGNORECASE):
                 continue
             if line_s.startswith("```") or line_s.endswith("```"):
                 continue

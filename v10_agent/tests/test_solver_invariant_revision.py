@@ -58,7 +58,10 @@ def test_solver_revise_invariants_win_flow():
     # Verify GameMemory integration
     gm = GameMemory(game_id="test_game")
     gm.apply_invariant_revision(revised, outcome="WIN", level_id="level_1")
-    assert len(gm.tier3_level_rules) == 3
+    assert len(gm.structured_invariants) == 3
+    assert len(gm.tier1_kinematics_and_topology) >= 1
+    assert len(gm.tier2_interactions) >= 1
+    assert len(gm.tier3_level_rules) >= 1
 
 
 def test_solver_revise_invariants_failure_flow():
@@ -117,8 +120,8 @@ def test_solver_revise_invariants_failure_flow():
     gm.apply_invariant_revision(revised, outcome="FAILURE", level_id="level_0")
     # Action ACTION1 was reformulated in rule, so it should be resolved from invalidated_invariants
     assert len(gm.invalidated_invariants) == 0
-    # And recorded into tier 2
-    assert len(gm.tier2_interactions) >= 1
+    # And recorded into tier 1 kinematics/constraints
+    assert len(gm.tier1_kinematics_and_topology) >= 1
 
 
 def test_session_triggers_revision_on_win_and_failure():
@@ -165,7 +168,7 @@ def test_session_triggers_revision_on_win_and_failure():
     session.act(obs)
 
     assert session._last_attempt_failed is False
-    assert any("matching color only" in r for r in gm.tier2_interactions)
+    assert any("matching color only" in r for r in gm.tier3_level_rules)
 
     # 2. Simulate level win
     advisor.set_response(

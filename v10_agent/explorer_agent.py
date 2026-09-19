@@ -212,14 +212,17 @@ class ExplorerAgent:
                     entry["confidence"] = max(float(entry.get("confidence", 0.0) or 0.0), 0.95)
                     entry["contradicted"] = False
 
-        # Accumulate confirmed invariants across levels
-        invariants_list = spec.get("invariants", [])
-        if not isinstance(invariants_list, list):
-            invariants_list = []
+        # Accumulate confirmed invariants across levels (Strict ISO-2: kinematics and topology ONLY, no goals)
+        invariants_list = [
+            inv for inv in spec.get("invariants", [])
+            if isinstance(inv, str) and not any(kw in inv.lower() for kw in ("goal", "win", "target", "curriculum"))
+        ]
         if game_memory is not None:
-            for inv_rule in getattr(game_memory, "invariant_rules", []):
-                if inv_rule not in invariants_list:
-                    invariants_list.append(inv_rule)
+            tier1_2 = list(getattr(game_memory, "tier1_kinematics_and_topology", [])) + list(getattr(game_memory, "tier2_interactions", []))
+            for inv_rule in tier1_2:
+                if isinstance(inv_rule, str) and not any(kw in inv_rule.lower() for kw in ("goal", "win", "target", "curriculum")):
+                    if inv_rule not in invariants_list:
+                        invariants_list.append(inv_rule)
         spec["invariants"] = invariants_list
 
         # Accumulate confirmed selection mechanics in action_surface_notes

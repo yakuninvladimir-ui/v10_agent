@@ -454,7 +454,7 @@ class VirtualKinematicSandbox:
             if not is_baseline_symmetry and total_dist <= TOLERANCE:
                 if goal_reached_idx < 0:
                     goal_reached_idx = len(repaired_steps)
-                if not has_multi_actor and len(steps) <= 20:
+                if not has_multi_actor and len(steps) <= 30:
                     logger.info(f"Sandbox: Invariant satisfaction achieved at step {goal_reached_idx} ({chosen_inv.description})! Trimming remaining steps.")
                     break
                 else:
@@ -678,11 +678,12 @@ class VirtualKinematicSandbox:
         if not has_directional_primitives:
             return None
 
-        # Find available discrete functions
+        # Directional and toggle primitives
         up_fn = next((f for f, m in manifest_functions.items() if "up" in f.lower() or "up" in m.get("docstring", "").lower()), "action1")
         down_fn = next((f for f, m in manifest_functions.items() if "down" in f.lower() or "down" in m.get("docstring", "").lower()), "action2")
         left_fn = next((f for f, m in manifest_functions.items() if "left" in f.lower() or "left" in m.get("docstring", "").lower()), "action3")
         right_fn = next((f for f, m in manifest_functions.items() if "right" in f.lower() or "right" in m.get("docstring", "").lower()), "action4")
+
         has_selection_toggle = bool(
             self.game_memory and any(
                 any(k in m.lower() for k in ("toggle", "switch", "action5", "active entity toggled"))
@@ -694,142 +695,121 @@ class VirtualKinematicSandbox:
             if has_selection_toggle else None
         )
 
-        def find_best_action(oid: str | None, req_dr: int, req_dc: int) -> str | None:
-            if oid and oid in self.object_action_vectors:
-                for act, (dy, dx) in self.object_action_vectors[oid].items():
-                    if (req_dr > 0 and dy > 0) or (req_dr < 0 and dy < 0):
-                        return act
-                    if (req_dc > 0 and dx > 0) or (req_dc < 0 and dx < 0):
-                        return act
-            for act, (dy, dx) in self.action_vectors.items():
-                if (req_dr > 0 and dy > 0) or (req_dr < 0 and dy < 0):
-                    return act
-                if (req_dc > 0 and dx > 0) or (req_dc < 0 and dx < 0):
-                    return act
-            if req_dr < 0:
-                return up_fn
-            if req_dr > 0:
-                return down_fn
-            if req_dc < 0:
-                return left_fn
-            if req_dc > 0:
-                return right_fn
-            return None
+        # Controllable entities in the search graph
+        controllable_objects: list[Any] = []
+        if axis is not None:
+            controllable_objects.append(axis)
+        if sub is not None and sub.id not in [o.id for o in controllable_objects]:
+            controllable_objects.append(sub)
+        if not controllable_objects:
+            controllable_objects = [sub]
 
-        steps: list[dict[str, Any]] = []
-
-        if inv.invariant_type == "axial_symmetry_vertical" and axis:
-            req_axis_c = (tgt.centroid.col + sub.centroid.col) / 2.0
-            d_axis_c = req_axis_c - axis.centroid.col
-            d_piece_r = tgt.centroid.row - sub.centroid.row
-            ax_steps = int(round(d_axis_c / step_sz))
-            pc_steps = int(round(d_piece_r / step_sz))
-
-            # Check if kinematics specifies confirmed step offsets
-            if (ax_steps == 0 and pc_steps == 0) and self.game_memory:
-                kinematics_inv = self.game_memory.get_invariants_by_type("kinematics")
-                for inv in kinematics_inv:
-                    ax_s = inv.metadata.get("axis_steps")
-                    pc_s = inv.metadata.get("piece_steps")
-                    if ax_s is not None and pc_s is not None:
-                        ax_steps = ax_s
-                        pc_steps = pc_s
-                        break
-
-            # Determine initial active actor
-            init_actor = "piece"
-            if self.game_memory:
-                for inv in self.game_memory.get_invariants_by_type("kinematics"):
-                    if inv.metadata.get("init_actor") == "axis":
+        # Determine initial active actor
+        init_actor = "piece"
+        if self.game_memory and self.game_memory.selection_mechanics:
+            for note in self.game_memory.selection_mechanics:
+                m = re.search(r"internal dots moved from\s+(obj_[a-zA-Z0-9_]+)", note)
+                if m:
+                    src_id = m.group(1)
+                    if axis and src_id == axis.id:
                         init_actor = "axis"
                         break
-                    # Fallback logic if metadata not present but action5 is toggled
-                    if inv.metadata.get("action_id") == "ACTION5":
-                        if axis and ((axis.height >= 10 and axis.width <= 4) or (axis.width >= 10 and axis.height <= 4)):
-                            init_actor = "axis"
-                            break
-
-            if init_actor == "axis":
-                ax_fn = find_best_action(axis.id if axis else None, 0, int(round(d_axis_c))) or (left_fn if ax_steps < 0 else right_fn)
-                for _ in range(abs(ax_steps)):
-                    steps.append({"dsl_function": ax_fn, "arguments": {}})
-                if toggle_fn and pc_steps != 0:
-                    steps.append({"dsl_function": toggle_fn, "arguments": {}})
-                pc_fn = find_best_action(sub.id, int(round(d_piece_r)), 0) or (up_fn if pc_steps < 0 else down_fn)
-                for _ in range(abs(pc_steps)):
-                    steps.append({"dsl_function": pc_fn, "arguments": {}})
-            else:
-                pc_fn = find_best_action(sub.id, int(round(d_piece_r)), 0) or (up_fn if pc_steps < 0 else down_fn)
-                for _ in range(abs(pc_steps)):
-                    steps.append({"dsl_function": pc_fn, "arguments": {}})
-                if toggle_fn and ax_steps != 0:
-                    steps.append({"dsl_function": toggle_fn, "arguments": {}})
-                ax_fn = find_best_action(axis.id if axis else None, 0, int(round(d_axis_c))) or (left_fn if ax_steps < 0 else right_fn)
-                for _ in range(abs(ax_steps)):
-                    steps.append({"dsl_function": ax_fn, "arguments": {}})
-
-        elif inv.invariant_type == "axial_symmetry_horizontal" and axis:
-            req_axis_r = (tgt.centroid.row + sub.centroid.row) / 2.0
-            d_axis_r = req_axis_r - axis.centroid.row
-            d_piece_c = tgt.centroid.col - sub.centroid.col
-            ax_steps = int(round(d_axis_r / step_sz))
-            pc_steps = int(round(d_piece_c / step_sz))
-
-            # Check if selection_mechanics specifies confirmed step offsets from probe observation
-            if (ax_steps == 0 and pc_steps == 0) and self.game_memory and self.game_memory.selection_mechanics:
-                for note in self.game_memory.selection_mechanics:
-                    m_ax = re.search(r"axis_steps=([+-]?\d+)", note)
-                    m_pc = re.search(r"piece_steps=([+-]?\d+)", note)
-                    if m_ax and m_pc:
-                        ax_steps = int(m_ax.group(1))
-                        pc_steps = int(m_pc.group(1))
-                        break
-
-            # Determine initial active actor
-            init_actor = "piece"
-            if self.game_memory and self.game_memory.selection_mechanics:
-                for note in self.game_memory.selection_mechanics:
-                    m = re.search(r"internal dots moved from\s+(obj_[a-zA-Z0-9_]+)", note)
-                    if m and (m.group(1) == axis.id or (axis.width >= 10 and axis.height <= 4)):
+                if any(kw in note.lower() for kw in ("toggle", "switch", "action5", "active entity toggled")):
+                    if axis and ((axis.height >= 10 and axis.width <= 4) or (axis.width >= 10 and axis.height <= 4)):
                         init_actor = "axis"
                         break
-                    if any(kw in note.lower() for kw in ("toggle", "switch", "action5", "active entity toggled")):
-                        if axis and ((axis.height >= 10 and axis.width <= 4) or (axis.width >= 10 and axis.height <= 4)):
-                            init_actor = "axis"
-                            break
 
-            if init_actor == "axis":
-                ax_fn = find_best_action(axis.id if axis else None, int(round(d_axis_r)), 0) or (up_fn if ax_steps < 0 else down_fn)
-                for _ in range(abs(ax_steps)):
-                    steps.append({"dsl_function": ax_fn, "arguments": {}})
-                if toggle_fn and pc_steps != 0:
-                    steps.append({"dsl_function": toggle_fn, "arguments": {}})
-                pc_fn = find_best_action(sub.id, 0, int(round(d_piece_c))) or (left_fn if pc_steps < 0 else right_fn)
-                for _ in range(abs(pc_steps)):
-                    steps.append({"dsl_function": pc_fn, "arguments": {}})
+        init_act_idx = 0
+        for i, obj in enumerate(controllable_objects):
+            if (init_actor == "axis" and axis and obj.id == axis.id) or (init_actor == "piece" and obj.id == sub.id):
+                init_act_idx = i
+                break
+
+        def get_displacement(act_name: str, obj: Any) -> tuple[int, int]:
+            act_doc = str(manifest_functions.get(act_name, {}).get("docstring", ""))
+            a_type = "axis" if (axis and obj.id == axis.id) else "piece"
+            return self._get_displacement(obj.id, act_name, act_doc, actor_type=a_type)
+
+        # Initial entity positions: (row, col)
+        init_pos = tuple((float(obj.centroid.row), float(obj.centroid.col)) for obj in controllable_objects)
+
+        # Check goal satisfaction and heuristic distance
+        def eval_feature_delta(positions: tuple[tuple[float, float], ...]) -> tuple[bool, float]:
+            pos_map = {obj.id: pos for obj, pos in zip(controllable_objects, positions)}
+            sub_pos = pos_map.get(sub.id, (float(sub.centroid.row), float(sub.centroid.col)))
+            if inv.invariant_type == "axial_symmetry_vertical":
+                axis_val = pos_map[axis.id][1] if axis else (inv.axis_coordinate or 0.0)
+            elif inv.invariant_type == "axial_symmetry_horizontal":
+                axis_val = pos_map[axis.id][0] if axis else (inv.axis_coordinate or 0.0)
             else:
-                pc_fn = find_best_action(sub.id, 0, int(round(d_piece_c))) or (left_fn if pc_steps < 0 else right_fn)
-                for _ in range(abs(pc_steps)):
-                    steps.append({"dsl_function": pc_fn, "arguments": {}})
-                if toggle_fn and ax_steps != 0:
-                    steps.append({"dsl_function": toggle_fn, "arguments": {}})
-                ax_fn = find_best_action(axis.id if axis else None, int(round(d_axis_r)), 0) or (up_fn if ax_steps < 0 else down_fn)
-                for _ in range(abs(ax_steps)):
-                    steps.append({"dsl_function": ax_fn, "arguments": {}})
+                axis_val = None
 
-        elif inv.invariant_type in ("socket_coverage", "spatial_contact"):
-            dr = tgt.centroid.row - sub.centroid.row
-            dc = tgt.centroid.col - sub.centroid.col
-            r_steps = int(round(dr / step_sz))
-            c_steps = int(round(dc / step_sz))
-            r_fn = find_best_action(sub.id, int(round(dr)), 0) if r_steps != 0 else None
-            c_fn = find_best_action(sub.id, 0, int(round(dc))) if c_steps != 0 else None
-            if r_fn:
-                for _ in range(abs(r_steps)):
-                    steps.append({"dsl_function": r_fn, "arguments": {}})
-            if c_fn:
-                for _ in range(abs(c_steps)):
-                    steps.append({"dsl_function": c_fn, "arguments": {}})
+            dist = compute_invariant_distance(
+                subject_r=sub_pos[0],
+                subject_c=sub_pos[1],
+                axis_val=axis_val,
+                target_r=float(tgt.centroid.row),
+                target_c=float(tgt.centroid.col),
+                invariant_type=inv.invariant_type,
+            )
+            tol = 1.0 if inv.invariant_type in ("axial_symmetry_vertical", "axial_symmetry_horizontal") else 0.2
+            return dist <= tol, dist / step_sz
 
-        return steps if steps else None
+        # Generalized A* search over object feature delta space
+        import heapq
+
+        start_satisfied, start_h = eval_feature_delta(init_pos)
+        if start_satisfied:
+            return []
+
+        dir_actions = [up_fn, down_fn, left_fn, right_fn]
+
+        counter = 0
+        open_set = [(start_h, 0, counter, init_pos, init_act_idx, [])]
+        best_g = {(init_pos, init_act_idx): 0}
+        max_expansions = 1500
+
+        while open_set and max_expansions > 0:
+            max_expansions -= 1
+            f, g, _, curr_pos, curr_act_idx, path = heapq.heappop(open_set)
+
+            if g > best_g.get((curr_pos, curr_act_idx), float("inf")):
+                continue
+
+            satisfied, _ = eval_feature_delta(curr_pos)
+            if satisfied:
+                return [{"dsl_function": fn, "arguments": {}} for fn in path]
+
+            curr_obj = controllable_objects[curr_act_idx]
+
+            # 1. Branch on directional movements of active entity
+            for act_fn in dir_actions:
+                dr, dc = get_displacement(act_fn, curr_obj)
+                if dr == 0 and dc == 0:
+                    continue
+
+                new_pos_list = list(curr_pos)
+                new_pos_list[curr_act_idx] = (curr_pos[curr_act_idx][0] + dr, curr_pos[curr_act_idx][1] + dc)
+                new_pos_tuple = tuple(new_pos_list)
+
+                sat, h = eval_feature_delta(new_pos_tuple)
+                new_g = g + 1
+                state_key = (new_pos_tuple, curr_act_idx)
+                if new_g < best_g.get(state_key, float("inf")):
+                    best_g[state_key] = new_g
+                    counter += 1
+                    heapq.heappush(open_set, (new_g + h, new_g, counter, new_pos_tuple, curr_act_idx, path + [act_fn]))
+
+            # 2. Branch on entity selection toggle (if available)
+            if toggle_fn and len(controllable_objects) > 1:
+                next_act_idx = (curr_act_idx + 1) % len(controllable_objects)
+                sat, h = eval_feature_delta(curr_pos)
+                new_g = g + 1
+                state_key = (curr_pos, next_act_idx)
+                if new_g < best_g.get(state_key, float("inf")):
+                    best_g[state_key] = new_g
+                    counter += 1
+                    heapq.heappush(open_set, (new_g + h, new_g, counter, curr_pos, next_act_idx, path + [toggle_fn]))
+
+        return None
 

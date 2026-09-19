@@ -281,7 +281,22 @@ class VLLMAdvisor(BaseLLMAdvisor):
             method="POST",
         )
 
-        timeout = getattr(config, "timeout_seconds", config.qwen_timeout_seconds) or 700
+        # Deadline reserve check (Flash Loop Recovery port)
+        if hasattr(config, "is_deadline_exceeded") and config.is_deadline_exceeded():
+            logger.warning(
+                f"Aborting LLM request for role {agent_role!r}: remaining time ({config.remaining_time_seconds():.1f}s) "
+                f"is within deadline reserve threshold ({config.deadline_reserve_seconds}s)."
+            )
+            return "{}"
+
+        base_timeout = getattr(config, "timeout_seconds", config.qwen_timeout_seconds) or 700
+        rem = config.remaining_time_seconds() if hasattr(config, "remaining_time_seconds") else None
+        if rem is not None:
+            available_for_req = max(2.0, rem - getattr(config, "deadline_reserve_seconds", 15.0))
+            timeout = min(float(base_timeout), available_for_req)
+        else:
+            timeout = float(base_timeout)
+
         for attempt in range(2):
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as response:

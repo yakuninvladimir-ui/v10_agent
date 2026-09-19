@@ -46,6 +46,18 @@ def default_config() -> dict[str, Any]:
         "vllm_speculative_method": cfg.vllm_speculative_method,
         "vllm_speculative_model": cfg.vllm_speculative_model,
         "vllm_speculative_config": cfg.vllm_speculative_config,
+        "deadline_reserve_seconds": cfg.deadline_reserve_seconds,
+        "notebook_reserve_seconds": cfg.notebook_reserve_seconds,
+        "enable_cycle_detector": cfg.enable_cycle_detector,
+        "cycle_detector_min_actions": cfg.cycle_detector_min_actions,
+        "cycle_detector_max_period": cfg.cycle_detector_max_period,
+        "cycle_detector_min_cycles": cfg.cycle_detector_min_cycles,
+        "cycle_detector_per_level_limit": cfg.cycle_detector_per_level_limit,
+        "vllm_enable_prefix_caching": cfg.vllm_enable_prefix_caching,
+        "vllm_enable_chunked_prefill": cfg.vllm_enable_chunked_prefill,
+        "vllm_async_scheduling": cfg.vllm_async_scheduling,
+        "vllm_no_enable_log_requests": cfg.vllm_no_enable_log_requests,
+        "vllm_disable_uvicorn_access_log": cfg.vllm_disable_uvicorn_access_log,
     })
     return cfg_dict
 

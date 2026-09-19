@@ -27,6 +27,7 @@ from v10_agent.symbolic_executor import SymbolicTrajectoryExecutor
 from v10_agent.trajectory import TrajectoryPool
 from v10_agent.types import EffectDeclaration, Grid2D
 from v10_agent.verification import GroundedStep, GroundingError, VerificationBinder
+from v10_agent.cycle_detector import VisibleCycle, _hash_grid
 
 logger = logging.getLogger(__name__)
 
@@ -150,15 +151,22 @@ class GameSession:
         self.evidence_probes_remaining: int = getattr(self.config, "max_evidence_probes_per_level", 2)
         self.undecided_streak: int = 0
         self.pending_step_snapshot: GroundedStep | None = None
-        self.tracker: PersistentObjectTracker | None = (
-            PersistentObjectTracker(self.config) if getattr(self.config, "enable_persistent_tracker", True) else None
-        )
+        self.tracker: PersistentObjectTracker | None = getattr(self.verifier, "tracker", None)
+        self.pending_cross_level_re_evaluation: bool = False
+        self.last_engine_action_source: str = ""
 
         # V10.1 Telemetry counters
         self.undecided_count: int = 0
         self.undecided_resolved_by_probe: int = 0
         self.undecided_fallback_to_null: int = 0
         self.evidence_probes_executed: int = 0
+
+        # Flash-Next Loop Recovery (VisibleCycle detector)
+        min_act = getattr(self.config, "cycle_detector_min_actions", 24)
+        max_per = getattr(self.config, "cycle_detector_max_period", 8)
+        min_cyc = getattr(self.config, "cycle_detector_min_cycles", 4)
+        self.cycle_detector = VisibleCycle(min_actions=min_act, max_period=max_per, min_cycles=min_cyc)
+        self.cycle_interventions_this_level: int = 0
 
     def transition_to(self, new_phase: SessionPhase, reason: str = "") -> None:
         """Explicit state machine transition enforcing allowed lifecycle progression."""
@@ -207,7 +215,7 @@ class GameSession:
                 if a and a.upper() not in ("RESET", "ACTION7")
             ]
             exec_summary = (
-                f"{len(executed_steps)} actions executed: {', '.join(executed_steps[:12])}"
+                f"Level solved successfully with {len(executed_steps)} coordinated actions."
                 if executed_steps
                 else "Direct candidate completion"
             )
@@ -236,19 +244,8 @@ class GameSession:
                 winning_macro="",  # Omitted to prevent button-sequence pollution in cross-level memory
             )
 
-            # Track discovered invariants across level transitions
-            if self.last_planning_set:
-                try:
-                    from v10_agent.universal_invariants import discover_invariants
-                    new_invs = discover_invariants(self.last_planning_set, confirmed_actors=game_mem.confirmed_actors)
-                    inv_diff = game_mem.compare_and_record_invariants(new_invs)
-                    re_eval_stats = game_mem.re_evaluate_invariants(self.last_planning_set, level_id=new_level_id)
-                    logger.info(
-                        f"Cross-level invariant re-evaluation: {re_eval_stats['confirmed']} confirmed, "
-                        f"{re_eval_stats['falsified']} falsified, {re_eval_stats['unchanged']} unchanged."
-                    )
-                except Exception as exc:
-                    logger.debug(f"Cross-level invariant comparison skipped: {exc}")
+            # Mark cross-level invariant discovery & re-evaluation to execute on the pristine initial frame of the new level
+            self.pending_cross_level_re_evaluation = True
 
         self.level_executed_actions.clear()
 
@@ -289,6 +286,9 @@ class GameSession:
         self._last_failure_summary = ""
         self.level_initial_grid = None
         self.level_initial_grid_hash = None
+        if hasattr(self, "cycle_detector"):
+            self.cycle_detector.clear()
+        self.cycle_interventions_this_level = 0
         self.memory_manager.handle_level_transition(new_level_id)
         if hasattr(self.explorer, "probe_manager") and hasattr(self.explorer.probe_manager, "handle_level_transition"):
             self.explorer.probe_manager.handle_level_transition(game_mem.confirmed_action_effects)
@@ -316,6 +316,14 @@ class GameSession:
         self.solver_reset_reason = None
         self.level_initial_grid = None
         self.level_initial_grid_hash = None
+        self.pending_cross_level_re_evaluation = False
+        self.last_engine_action = ""
+        self.last_engine_action_source = ""
+        if hasattr(self, "cycle_detector") and self.cycle_detector:
+            self.cycle_detector.clear()
+        self.cycle_interventions_this_level = 0
+        if self.tracker is not None:
+            self.tracker.reset()
         self.known_actions = set()
         from v10_agent.explorer_agent import PrimitiveProbeManager
         self.explorer.probe_manager = PrimitiveProbeManager(max_probes=self.config.max_primitive_probes_per_level)
@@ -334,6 +342,11 @@ class GameSession:
 
     def act(self, raw_observation: Mapping[str, Any]) -> dict[str, Any]:
         """Propose the single next environment action."""
+        raw_game_id = raw_observation.get("game_id")
+        if raw_game_id and raw_game_id != self.current_game_id:
+            logger.info(f"Game transition detected: {self.current_game_id} -> {raw_game_id}")
+            self.handle_game_transition(raw_game_id)
+
         obs = normalize_observation(
             raw_observation,
             frame_index=self.accepted_action_count,
@@ -345,7 +358,7 @@ class GameSession:
 
         # 1. Exact Tufa GAME_OVER single RESET Invariant / Resets disabled / 5-attempt budget
         if state_name == "GAME_OVER":
-            if self.last_engine_action == "RESET":
+            if self.last_engine_action == "RESET" and getattr(self, "last_engine_action_source", "") == "tufa_auto_reset":
                 logger.error("GAME_OVER persisted after single RESET. Forcing loop break.")
                 raise RuntimeError("GAME_OVER persisted after single RESET")
 
@@ -366,8 +379,6 @@ class GameSession:
                 )
 
             self.game_over_reset_count += 1
-            self.replan_requested = True
-            self.active_pool = None
             self._last_attempt_failed = True
             self._last_failure_reason = "GAME_OVER encountered during candidate execution."
             executed_steps = [a for a in self.level_executed_actions if a and a.upper() not in ("RESET", "ACTION7")]
@@ -377,6 +388,23 @@ class GameSession:
                 else "Immediate GAME_OVER on action"
             )
             self.level_executed_actions.clear()
+
+            # Sever current active candidate
+            if self.active_pool and self.active_pool.has_active_candidate():
+                active_c = self.active_pool.active_candidate()
+                if active_c:
+                    self.active_pool.sever(active_c.trajectory_id, "GAME_OVER during execution")
+
+            if self.active_pool and self.active_pool.has_active_candidate():
+                logger.info(
+                    f"GAME_OVER severed candidate. Retaining active_pool with remaining candidate: "
+                    f"{self.active_pool.active_candidate().trajectory_id}"
+                )
+                self.replan_requested = False
+            else:
+                self.replan_requested = True
+                self.active_pool = None
+
             reset_action = {
                 "id": "RESET",
                 "action_id": "RESET",
@@ -389,7 +417,10 @@ class GameSession:
             }
             self.pending_action = reset_action
             self.last_engine_action = "RESET"
+            self.last_engine_action_source = "tufa_auto_reset"
             self.pending_step = None
+            if self.tracker is not None:
+                self.tracker.reset()
             return reset_action
 
         # Check for level change (multi-signal detection)
@@ -431,7 +462,23 @@ class GameSession:
             self.level_initial_grid = [list(row) for row in grid]
             self.level_initial_grid_hash = planning_set.grid_hash
             logger.info(f"Recorded pristine level initial frame for {self.current_level_id} (hash={planning_set.grid_hash[:8]}).")
+            if getattr(self, "pending_cross_level_re_evaluation", False):
+                self.pending_cross_level_re_evaluation = False
+                game_mem = self.memory_manager.get_game_memory("session")
+                try:
+                    from v10_agent.universal_invariants import discover_invariants
+                    new_invs = discover_invariants(planning_set, confirmed_actors=game_mem.confirmed_actors)
+                    inv_diff = game_mem.compare_and_record_invariants(new_invs)
+                    re_eval_stats = game_mem.re_evaluate_invariants(planning_set, level_id=self.current_level_id)
+                    logger.info(
+                        f"Cross-level invariant re-evaluation on pristine frame: {re_eval_stats['confirmed']} confirmed, "
+                        f"{re_eval_stats['falsified']} falsified, {re_eval_stats['unchanged']} unchanged."
+                    )
+                except Exception as exc:
+                    logger.warning(f"Cross-level invariant re-evaluation on pristine frame skipped: {exc}")
         elif self.last_engine_action == "RESET" and self.level_initial_grid_hash is not None:
+            if self.tracker is not None:
+                self.tracker.reset()
             if planning_set.grid_hash == self.level_initial_grid_hash:
                 logger.info(f"Verified post-reset frame strictly matches initial level frame (hash={planning_set.grid_hash[:8]}).")
             else:
@@ -499,6 +546,9 @@ class GameSession:
             self.last_planning_set = planning_set
             self.pending_action = reset_action
             self.last_engine_action = "RESET"
+            self.last_engine_action_source = "solver_clean_reset"
+            if self.tracker is not None:
+                self.tracker.reset()
             self.pending_step = None
             self.level_executed_actions.clear()
             self.audit_logger.log(
@@ -728,6 +778,9 @@ class GameSession:
                         self.pending_action = reset_action
                         self.pending_step = None
                         self.last_engine_action = "RESET"
+                        self.last_engine_action_source = "probe_phase_reset"
+                        if self.tracker is not None:
+                            self.tracker.reset()
                         self.level_executed_actions.clear()
                         self.audit_logger.log(
                             "action_emitted",
@@ -771,6 +824,9 @@ class GameSession:
                         self.pending_action = reset_action
                         self.pending_step = None
                         self.last_engine_action = "RESET"
+                        self.last_engine_action_source = "explorer_retry_clean_state"
+                        if self.tracker is not None:
+                            self.tracker.reset()
                         self.level_executed_actions.clear()
                         self.audit_logger.log(
                             "action_emitted",
@@ -795,6 +851,9 @@ class GameSession:
             self.last_planning_set = planning_set
             self.pending_action = reset_action
             self.last_engine_action = "RESET"
+            self.last_engine_action_source = "solver_clean_state_reset"
+            if self.tracker is not None:
+                self.tracker.reset()
             self.pending_step = None
             self.level_executed_actions.clear()
             self.audit_logger.log(
@@ -981,13 +1040,13 @@ class GameSession:
                     planning_set=planning_set,
                     game_memory=game_mem,
                     epistemic_memory=ep_mem,
-                    action_budget=max(1, self.config.max_actions_per_level - self.accepted_action_count),
+                    action_budget=max(1, self.config.max_actions_per_level - len(self.level_executed_actions)),
                 )
                 pkg = self.solver.generate_trajectory_package(
                     manifest=self.active_manifest or {},
                     planning_set=planning_set,
                     epistemic_memory=ep_mem,
-                    budget=max(1, self.config.max_actions_per_level - self.accepted_action_count),
+                    budget=max(1, self.config.max_actions_per_level - len(self.level_executed_actions)),
                     image_png=solver_images,
                     game_memory=game_mem,
                 )
@@ -1064,6 +1123,9 @@ class GameSession:
                     }
                     self.pending_action = reset_action
                     self.last_engine_action = "RESET"
+                    self.last_engine_action_source = "circuit_breaker_reset"
+                    if self.tracker is not None:
+                        self.tracker.reset()
                     self.pending_step = None
                     self.level_executed_actions.clear()
                     return reset_action
@@ -1107,6 +1169,7 @@ class GameSession:
         self.pending_step = grounded_step
         self.pending_action = action_dict
         self.last_engine_action = action_decl.action_id
+        self.last_engine_action_source = "candidate" if grounded_step else "fallback"
         self.level_executed_actions.append(action_decl.action_id)
 
         self.audit_logger.log(
@@ -1168,46 +1231,9 @@ class GameSession:
                             after_pset = build_planning_set(after_snap, available_actions=list(self.known_actions))
                             from v10_agent.universal_invariants import discover_invariants
                             invs = discover_invariants(after_pset)
-                            # Dynamically determine step size from confirmed action effects
-                            step_sz = 1.0
-                            if game_mem and getattr(game_mem, "confirmed_action_effects", None):
-                                import re
-                                for eff in game_mem.confirmed_action_effects.values():
-                                    nums = [abs(int(x)) for x in re.findall(r'd[yx]=([+-]?\d+)', eff)]
-                                    if nums and max(nums) > 0:
-                                        step_sz = float(max(nums))
-                                        break
-
-                            for inv in invs:
-                                if inv.invariant_type == "axial_symmetry_vertical" and inv.axis_id:
-                                    sub = after_pset.get_object(inv.subject_id)
-                                    tgt = after_pset.get_object(inv.target_id)
-                                    ax = after_pset.get_object(inv.axis_id)
-                                    if sub and tgt and ax:
-                                        req_c = (tgt.centroid.col + sub.centroid.col) / 2.0
-                                        d_ax = req_c - ax.centroid.col
-                                        d_pc = tgt.centroid.row - sub.centroid.row
-                                        ax_s = int(round(d_ax / step_sz))
-                                        pc_s = int(round(d_pc / step_sz))
-                                        if ax_s != 0 or pc_s != 0:
-                                            offset_note = f" (axis_steps={ax_s}, piece_steps={pc_s})"
-                                            break
-                                elif inv.invariant_type == "axial_symmetry_horizontal" and inv.axis_id:
-                                    sub = after_pset.get_object(inv.subject_id)
-                                    tgt = after_pset.get_object(inv.target_id)
-                                    ax = after_pset.get_object(inv.axis_id)
-                                    if sub and tgt and ax:
-                                        req_r = (tgt.centroid.row + sub.centroid.row) / 2.0
-                                        d_ax = req_r - ax.centroid.row
-                                        d_pc = tgt.centroid.col - sub.centroid.col
-                                        ax_s = int(round(d_ax / step_sz))
-                                        pc_s = int(round(d_pc / step_sz))
-                                        if ax_s != 0 or pc_s != 0:
-                                            offset_note = f" (axis_steps={ax_s}, piece_steps={pc_s})"
-                                            break
                     except Exception as exc:
                         logger.warning(f"Failed to extract post-toggle invariants: {exc}")
-                    game_mem.record_selection_mechanic(f"{act_desc}: {rec.observed_effect}{offset_note}")
+                    game_mem.record_selection_mechanic(f"{act_desc}: {rec.observed_effect}")
                     game_mem.record_action_effect(action_id, rec.observed_effect)
                     self.known_actions.add(action_id)
                     if self.active_module is not None:
@@ -1218,7 +1244,10 @@ class GameSession:
                     game_mem.record_action_effect(action_id, rec.observed_effect)
                     self.known_actions.add(action_id)
                 else:
-                    game_mem.record_unconfirmed_action(action_id, rec.observed_effect)
+                    if action_id.upper() != "ACTION6":
+                        game_mem.record_unconfirmed_action(action_id, rec.observed_effect)
+                    else:
+                        logger.info(f"ACTION6 coordinate probe at {action_data} produced no effect; not quarantining ACTION6.")
 
                 # Trigger dynamic reprobes if this action altered state or toggled selection
                 reprobes = self.explorer.probe_manager.get_dynamic_reprobes(action_id, rec.observed_effect)
@@ -1239,7 +1268,7 @@ class GameSession:
                 if re_eval.verdict == Verdict.UNDECIDED or re_eval.evidence_needed:
                     self.undecided_streak += 1
                     max_streak = getattr(self.config, "max_undecided_streak", 2)
-                    budget_rem = getattr(self.config, "max_level_actions", 120) - len(self.level_executed_actions)
+                    budget_rem = getattr(self.config, "max_actions_per_level", 250) - len(self.level_executed_actions)
                     if self.evidence_probes_remaining > 0 and self.undecided_streak < max_streak and budget_rem >= 25:
                         probe_act = {"id": "ACTION1", "action_id": "ACTION1", "data": {}, "reasoning": {"source": "evidence_seeking"}}
                         if re_eval.evidence_hint and re_eval.evidence_hint.startswith("probe_ACTION"):
@@ -1286,7 +1315,7 @@ class GameSession:
                 self.undecided_count += 1
                 self.undecided_streak = 1
                 max_streak = getattr(self.config, "max_undecided_streak", 2)
-                budget_rem = getattr(self.config, "max_level_actions", 120) - len(self.level_executed_actions)
+                budget_rem = getattr(self.config, "max_actions_per_level", 250) - len(self.level_executed_actions)
                 if self.evidence_probes_remaining > 0 and self.undecided_streak <= max_streak and budget_rem >= 25:
                     self.evidence_seeking_active = True
                     self.pending_step_snapshot = self.pending_step
@@ -1378,6 +1407,47 @@ class GameSession:
                 if next_cand is not None:
                     self._last_trajectory_id = next_cand.trajectory_id
 
+        # C. Visible Cycle Detection (Flash Loop Recovery port)
+        if (
+            getattr(self.config, "enable_cycle_detector", True)
+            and hasattr(self, "cycle_detector")
+            and self.cycle_detector is not None
+            and self.last_snapshot is not None
+            and self.pending_action is not None
+        ):
+            act_name = (
+                (self.pending_action.get("id") or self.pending_action.get("action_id") or "")
+                if isinstance(self.pending_action, dict)
+                else str(self.pending_action)
+            )
+            before_grid = getattr(self.last_snapshot, "grid", None)
+            after_grid = norm_after.get("grid")
+            if before_grid is not None and after_grid is not None and act_name:
+                cycle_info = self.cycle_detector.observe(before_grid, act_name, after_grid)
+                per_level_limit = getattr(self.config, "cycle_detector_per_level_limit", 2)
+                if cycle_info is not None and self.cycle_interventions_this_level < per_level_limit:
+                    self.cycle_interventions_this_level += 1
+                    logger.warning(
+                        f"Session: Visible action cycle detected (period={cycle_info['period']}, "
+                        f"repetitions={cycle_info['repetitions']}, pattern={cycle_info['action_pattern']}). "
+                        f"Triggering loop recovery intervention ({self.cycle_interventions_this_level}/{per_level_limit})."
+                    )
+                    # Sever active candidate if one exists
+                    if self.active_pool and self.active_pool.active_candidate():
+                        self.active_pool.active_candidate().sever()
+                    self.replan_requested = True
+                    self._last_attempt_failed = True
+                    self._last_failure_reason = f"Visible cycle detected in state transitions with period {cycle_info['period']}."
+                    ep_mem = self.memory_manager.get_epistemic_memory("session")
+                    if hasattr(ep_mem, "record_attempt_feedback"):
+                        ep_mem.record_attempt_feedback(
+                            hypothesis="Visible action cycle loop",
+                            trajectory_summary=f"Cycle period {cycle_info['period']} with pattern {cycle_info['action_pattern']}",
+                            status="CYCLE_REJECTED",
+                            reason=self._last_failure_reason,
+                        )
+                    self.solver_reset_pending = True
+                    self.solver_reset_reason = "loop_recovery_cycle_reset"
 
         # Clear pending action references for next cycle
         self.pending_action = None
@@ -1407,4 +1477,5 @@ class GameSession:
             "undecided_fallback_to_null": self.undecided_fallback_to_null,
             "evidence_probes_executed": self.evidence_probes_executed,
             "epistemic_signals_count": len(getattr(ep_mem, "epistemic_signals", [])),
+            "cycle_interventions_count": getattr(self, "cycle_interventions_this_level", 0),
         }

@@ -112,7 +112,7 @@ def step_action(api, obj):
     syntax_mem = session.memory_manager.get_syntax_error_memory("session")
     ep_mem = session.memory_manager.get_epistemic_memory("session")
 
-    # EpistemicMemory received the Brusentsov judgment
-    assert len(ep_mem.judgments) == 1
+    # EpistemicMemory received the Brusentsov judgment (either committed or epistemic signal)
+    assert len(ep_mem.judgments) + len(ep_mem.epistemic_signals) == 1
     # SyntaxErrorMemory was NOT touched
     assert len(syntax_mem.entries) == 0
