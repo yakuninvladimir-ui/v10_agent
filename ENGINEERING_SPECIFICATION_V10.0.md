@@ -669,14 +669,15 @@ def act(self, raw_observation: Mapping[str, Any]) -> dict[str, Any]:
     if self.evidence_seeking_active:
         if self.probe_queue:
             probe_act = self.probe_queue.pop(0)
-            return self._emit_action(probe_act, source="evidence_seeking_probe")
-        # If probe queue empty during active evidence-seeking, emit deterministic NOOP
-        return {
-            "id": "NOOP",
-            "action_id": "NOOP",
-            "data": {},
-            "reasoning": {"source": "evidence_seeking", "status": "blocked_awaiting_resolution"},
-        }
+        # If probe queue empty during active evidence-seeking: fall back to NULL + clean RESET (strict NOOP prohibition)
+        self.evidence_seeking_active = False
+        self.undecided_streak = 0
+        self.pending_step_snapshot = None
+        if self.active_pool and self.active_pool.active_candidate():
+            self.active_pool.active_candidate().sever(reason="evidence_probe_budget_exhausted")
+        self.solver_reset_pending = True
+        self.solver_reset_reason = "evidence_probe_exhausted_fallback_null"
+        return self._emit_reset(reason="evidence_probe_exhausted_fallback_null")
 
     # 6. Fallback Pipeline
     if self.in_persistent_fallback:

@@ -191,7 +191,7 @@ When `Verdict.UNDECIDED` is emitted, candidate trajectory execution is suspended
 2. **Blocking `act()` Action Arbitration**:
    - While `evidence_seeking_active` is true, `act()` is strictly blocked from advancing the trajectory or invoking the Solver.
    - If `evidence_probes_remaining > 0`, a targeted probe action (derived from `judgment.evidence_hint` or a generic diagnostic pulse) is placed at the head of `probe_queue` and emitted.
-   - If `probe_queue` is exhausted, `act()` emits a deterministic `NOOP` action (`action_id="NOOP"`), preventing arbitrary exploration during verification.
+   - If `probe_queue` is exhausted or evidence probe budget is exceeded, the orchestrator immediately falls back to `Verdict.NULL`, severs the candidate, and triggers a clean `RESET` $\to S_0$. Pseudo-actions like `NOOP` are **strictly prohibited** by competition environment contracts.
 
 3. **Post-Probe Re-evaluation Semantics**:
    - Upon observing the post-probe state, the transition is **not** re-applied from the pre-probe state.
