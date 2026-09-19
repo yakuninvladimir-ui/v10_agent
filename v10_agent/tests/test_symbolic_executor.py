@@ -413,3 +413,112 @@ def move_down(api):
     assert "approved" in reason.lower()
 
 
+def test_pre_verification_blocks_only_full_trajectory_match():
+    """Pre-verification blocks ONLY exact full trajectory matches, not prefixes or isolated steps.
+
+    Factor 3 regression test:
+    - Trajectory 'action3 -> action3' previously completed without winning and was severed.
+    - Action 'action2' previously failed from initial coordinates (NULL contradiction).
+    - An exact duplicate 2-step candidate 'action3 -> action3' MUST be blocked.
+    - A 1-step candidate 'action2' MUST be blocked.
+    - But a longer candidate 'action3 -> action3 -> action2 -> action2' MUST NOT be blocked:
+      its prefix 'action3 -> action3' does not block it, and its subsequent 'action2' step
+      is permitted to execute at new coordinates.
+    """
+    config = V10Config()
+    executor = SandboxExecutor()
+    binder = VerificationBinder()
+    verifier = LayeredVerifier(config)
+    sym_exec = SymbolicTrajectoryExecutor(config, executor, binder, verifier)
+
+    # 10x10 grid with actor at (5, 5) so 4 moves stay comfortably in bounds
+    grid = [[0] * 10 for _ in range(10)]
+    grid[5][5] = 1
+    snapshot = extract_arga_snapshot(grid)
+    pset = build_planning_set(snapshot, ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "RESET"])
+
+    ep_mem = EpistemicMemory(level_id="l0")
+    syntax_mem = SyntaxErrorMemory(level_id="l0")
+
+    # Record severed signatures: a completed non-winning 2-step trajectory and a failed initial step
+    ep_mem.sever_branch("action3 -> action3")
+    ep_mem.sever_branch("action2")
+
+    code = """
+def action3(api):
+    return api.declare_environment_action("ACTION3")
+
+def action2(api):
+    return api.declare_environment_action("ACTION2")
+"""
+    manifest = {
+        "functions": [
+            {"name": "action3", "parameters": []},
+            {"name": "action2", "parameters": []},
+        ]
+    }
+    module = executor.load_module(code, manifest)
+
+    # 1. Exact full match duplicate: candidate with exactly 'action3 -> action3' -> BLOCKED
+    cand_exact = CandidateTrajectory(
+        trajectory_id="c_exact",
+        steps=[
+            {"step_id": "s1", "dsl_function": "action3", "arguments": {}},
+            {"step_id": "s2", "dsl_function": "action3", "arguments": {}},
+        ],
+    )
+    pool_exact = TrajectoryPool(proposal_id="p_exact", candidates=[cand_exact])
+    res_exact = sym_exec.prepare_and_execute_step(pool_exact, pset, module, ep_mem, syntax_mem)
+    assert res_exact.verdict == StepExecutionVerdict.PRE_VERIFICATION_FAILED
+    assert res_exact.circuit_broken is True
+    assert not cand_exact.active
+
+    # 2. Exact single-step match: candidate with exactly 'action2' -> BLOCKED
+    cand_single = CandidateTrajectory(
+        trajectory_id="c_single",
+        steps=[
+            {"step_id": "s1", "dsl_function": "action2", "arguments": {}},
+        ],
+    )
+    pool_single = TrajectoryPool(proposal_id="p_single", candidates=[cand_single])
+    res_single = sym_exec.prepare_and_execute_step(pool_single, pset, module, ep_mem, syntax_mem)
+    assert res_single.verdict == StepExecutionVerdict.PRE_VERIFICATION_FAILED
+    assert res_single.circuit_broken is True
+    assert not cand_single.active
+
+    # 3. Longer candidate: 'action3 -> action3 -> action2 -> action2' (4 steps) -> NOT BLOCKED!
+    cand_long = CandidateTrajectory(
+        trajectory_id="c_long",
+        steps=[
+            {"step_id": "s1", "dsl_function": "action3", "arguments": {}},
+            {"step_id": "s2", "dsl_function": "action3", "arguments": {}},
+            {"step_id": "s3", "dsl_function": "action2", "arguments": {}},
+            {"step_id": "s4", "dsl_function": "action2", "arguments": {}},
+        ],
+    )
+    pool_long = TrajectoryPool(proposal_id="p_long", candidates=[cand_long])
+
+    # Step 0: action3
+    res_step0 = sym_exec.prepare_and_execute_step(pool_long, pset, module, ep_mem, syntax_mem)
+    assert res_step0.verdict == StepExecutionVerdict.SUCCESS
+    assert cand_long.active
+    cand_long.advance()
+
+    # Step 1: action3 (prefix 'action3 -> action3' must NOT trigger circuit breaker!)
+    res_step1 = sym_exec.prepare_and_execute_step(pool_long, pset, module, ep_mem, syntax_mem)
+    assert res_step1.verdict == StepExecutionVerdict.SUCCESS
+    assert cand_long.active
+    cand_long.advance()
+
+    # Step 2: action2 ('action2' step must NOT be blocked at new coordinates!)
+    res_step2 = sym_exec.prepare_and_execute_step(pool_long, pset, module, ep_mem, syntax_mem)
+    assert res_step2.verdict == StepExecutionVerdict.SUCCESS
+    assert cand_long.active
+    cand_long.advance()
+
+    # Step 3: action2
+    res_step3 = sym_exec.prepare_and_execute_step(pool_long, pset, module, ep_mem, syntax_mem)
+    assert res_step3.verdict == StepExecutionVerdict.SUCCESS
+    assert cand_long.active
+
+

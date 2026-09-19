@@ -189,21 +189,22 @@ class SymbolicTrajectoryExecutor:
         step_id = str(step_dict.get("step_id", "s0"))
         fn_name = str(step_dict.get("dsl_function", ""))
         step_sig = format_step_signature(step_dict)
-        seq_sig = format_sequence_signature(candidate.steps[:candidate.cursor + 1])
+        full_traj_sig = format_sequence_signature(candidate.steps)
 
         # 1. Pre-execution Verification
-        # 1a. Check if candidate or branch signature is already severed in EpistemicMemory
+        # 1a. Check if candidate or full trajectory is already severed in EpistemicMemory.
+        # Strict invariant: ONLY exact full matches of completed trajectories are blocked.
+        # Sub-sequences / prefixes and isolated step signatures must NOT block longer candidates.
         if (
             not candidate.active
             or epistemic_memory.is_severed(candidate.trajectory_id)
-            or epistemic_memory.is_severed(seq_sig)
-            or epistemic_memory.is_severed(step_sig)
+            or epistemic_memory.is_severed(full_traj_sig)
         ):
-            logger.info(f"SymbolicExecutor: Candidate {candidate.trajectory_id} or branch {seq_sig!r} is severed; severing candidate.")
+            logger.info(f"SymbolicExecutor: Candidate {candidate.trajectory_id} (full trajectory {full_traj_sig!r}) is severed; severing candidate.")
             candidate.sever()
             return StepExecutionResult(
                 verdict=StepExecutionVerdict.PRE_VERIFICATION_FAILED,
-                error_message=f"Candidate or branch previously severed",
+                error_message=f"Candidate or full trajectory previously severed: {full_traj_sig}",
                 circuit_broken=True,
             )
 
@@ -231,7 +232,8 @@ class SymbolicTrajectoryExecutor:
         except GroundingError as ge:
             logger.warning(f"SymbolicExecutor: Grounding error for step {step_id}: {ge}; severing candidate.")
             candidate.sever()
-            epistemic_memory.sever_branch(seq_sig)
+            epistemic_memory.sever_branch(full_traj_sig)
+            epistemic_memory.sever_branch(candidate.trajectory_id)
             return StepExecutionResult(
                 verdict=StepExecutionVerdict.PRE_VERIFICATION_FAILED,
                 error_message=str(ge),
@@ -267,7 +269,8 @@ class SymbolicTrajectoryExecutor:
             )
             # Circuit breaker: sever candidate immediately so it is never repeated
             candidate.sever()
-            epistemic_memory.sever_branch(seq_sig)
+            epistemic_memory.sever_branch(full_traj_sig)
+            epistemic_memory.sever_branch(candidate.trajectory_id)
             return StepExecutionResult(
                 verdict=StepExecutionVerdict.SANDBOX_EXECUTION_FAILED,
                 error_message=f"{type(exc).__name__}: {exc}",
@@ -396,8 +399,11 @@ class SymbolicTrajectoryExecutor:
             # NULL: Sever branch & trigger candidate reset
             if active_cand is not None:
                 active_cand.sever()
+                full_sig = format_sequence_signature(active_cand.steps)
                 seq_sig = format_sequence_signature(active_cand.steps[:active_cand.cursor + 1])
+                epistemic_memory.sever_branch(full_sig)
                 epistemic_memory.sever_branch(seq_sig)
+                epistemic_memory.sever_branch(active_cand.trajectory_id)
             else:
                 epistemic_memory.sever_branch(pending_step.step_id)
             cand_advanced = False
@@ -453,8 +459,9 @@ class SymbolicTrajectoryExecutor:
                         ),
                     )
                 else:
-                    traj_sig = " -> ".join(steps_repr)
+                    traj_sig = format_sequence_signature(active_cand.steps)
                     epistemic_memory.sever_branch(traj_sig)
+                    epistemic_memory.sever_branch(active_cand.trajectory_id)
                     epistemic_memory.record_attempt_feedback(
                         hypothesis=f"Candidate {active_cand.trajectory_id}",
                         trajectory_summary=traj_sig,
