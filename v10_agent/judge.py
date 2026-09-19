@@ -292,6 +292,24 @@ class LayeredVerifier:
         zero_delta = (before_grid is not None and raw_grid and before_grid == raw_grid)
         is_effective = bool(not zero_delta or after_levels > before_levels)
         act_dict = action_dict or {}
+        act_id = ""
+        if action_dict:
+            act_id = str(action_dict.get("action_id") or action_dict.get("id") or "").upper()
+        if not act_id:
+            import re
+            m = re.search(r"action(\d+)", step.dsl_function, re.IGNORECASE)
+            if m:
+                act_id = f"ACTION{m.group(1)}"
+
+        confirmed_eff = ""
+        if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
+            confirmed_eff = game_memory.confirmed_action_effects.get(act_id, "")
+
+        eff_lower = confirmed_eff.lower()
+        is_confirmed_motion = (
+            any(k in eff_lower for k in ("dy=", "dx=", "moved", "displace"))
+            and not any(k in eff_lower for k in ("blocked", "wall", "no_effect", "null"))
+        )
 
         # 1. Tier 1: Terminal Victory or Level Completed (Follow)
         if state in {"WIN", "WON", "DONE", "VICTORY"} or after_levels > before_levels:
@@ -319,9 +337,27 @@ class LayeredVerifier:
                 is_effective=False,
             )
 
+        # 3. Tier 3: Zero Grid Delta on a Confirmed Motion Action (Nullity)
+        # Global environment fact: an action confirmed to produce physical motion produced zero grid change.
+        # Boundary/obstacle collision overrides tracking uncertainty.
+        if zero_delta and is_confirmed_motion and act_id not in ("ACTION5", "ACTION6", "RESET"):
+            return BrusentsovJudgment(
+                trajectory_id=step.step_id,
+                step_id=step.step_id,
+                verdict=Verdict.NULL,
+                expected_propositions=step.expected_propositions,
+                observed_propositions=observed,
+                explanation=(
+                    f"Step {step.step_id} ({step.dsl_function} / {act_id}): "
+                    f"Motion action produced zero grid delta (obstacle or boundary collision). Brusentsov nullity xy'_0."
+                ),
+                action_dict=act_dict,
+                is_effective=False,
+            )
+
         enable_undecided = getattr(self.config, "enable_undecided_verdict", True)
 
-        # Epistemic Uncertainty Short-Circuits (Contract line 179 & line 455):
+        # 4. Tier 4: Epistemic Uncertainty & Multi-Frame Tracking Ambiguity (UNDECIDED)
         # When observations or track identities are ambiguous / low confidence, EXPECT matching is unreliable.
 
         # (a) Upstream low confidence grounded step or ambiguous matching status
@@ -402,7 +438,7 @@ class LayeredVerifier:
                         is_effective=is_effective,
                     )
 
-        # 3. Tier 3: Explicit EXPECT Contradiction Check (Physical contradiction: implies_brusentsov == FALSE)
+        # 5. Tier 5: Explicit EXPECT Contradiction Check (Physical contradiction: implies_brusentsov == FALSE)
         prop_verdict = None
         if len(step.expected_propositions) > 0:
             prop_verdict = implies_brusentsov(step.expected_propositions, observed)
@@ -421,7 +457,7 @@ class LayeredVerifier:
                     is_effective=is_effective,
                 )
 
-        # 4. Tier 4: Explicit EXPECT Necessary Containment (Follow: implies_brusentsov == TRUE)
+        # 6. Tier 6: Explicit EXPECT Necessary Containment (Follow: implies_brusentsov == TRUE)
         if prop_verdict == Ternary.TRUE:
             return BrusentsovJudgment(
                 trajectory_id=step.step_id,
@@ -437,43 +473,8 @@ class LayeredVerifier:
                 is_effective=True,
             )
 
-        # 5. Tier 5: Zero Grid Delta on a Confirmed Motion Action (Nullity)
-        act_id = ""
-        if action_dict:
-            act_id = str(action_dict.get("action_id") or action_dict.get("id") or "").upper()
-        if not act_id:
-            import re
-            m = re.search(r"action(\d+)", step.dsl_function, re.IGNORECASE)
-            if m:
-                act_id = f"ACTION{m.group(1)}"
-
-        confirmed_eff = ""
-        if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
-            confirmed_eff = game_memory.confirmed_action_effects.get(act_id, "")
-
-        eff_lower = confirmed_eff.lower()
-        is_confirmed_motion = (
-            any(k in eff_lower for k in ("dy=", "dx=", "moved", "displace"))
-            and not any(k in eff_lower for k in ("blocked", "wall", "no_effect", "null"))
-        )
-
-        if zero_delta and is_confirmed_motion and act_id not in ("ACTION5", "ACTION6", "RESET"):
-            return BrusentsovJudgment(
-                trajectory_id=step.step_id,
-                step_id=step.step_id,
-                verdict=Verdict.NULL,
-                expected_propositions=step.expected_propositions,
-                observed_propositions=observed,
-                explanation=(
-                    f"Step {step.step_id} ({step.dsl_function} / {act_id}): "
-                    f"Motion action produced zero grid delta (obstacle or boundary collision). Brusentsov nullity xy'_0."
-                ),
-                action_dict=act_dict,
-                is_effective=False,
-            )
-
-        # 6. Tier 6: UNDECIDED conditions
-        # 6a. Zero grid delta on an unconfirmed action carrying non-empty EXPECT
+        # 7. Tier 7: Unconfirmed Zero Delta or Low Metric Delta (< min_reliable_delta)
+        # 7a. Zero grid delta on an unconfirmed action carrying non-empty EXPECT
         if (
             zero_delta
             and act_id
@@ -495,7 +496,47 @@ class LayeredVerifier:
                 is_effective=False,
             )
 
-        # 7. Tier 7: Positive certificate from GameMemory (verified by non-zero delta)
+        # 7b. Low metric delta: detected changes exist, but all displacements < min_reliable_delta (0.8 px)
+        min_reliable = getattr(self.config, "min_reliable_delta", 0.8)
+        if not zero_delta and state not in {"WIN", "WON", "DONE", "VICTORY", "GAME_OVER", "LOST", "FAILED"}:
+            max_disp = 0.0
+            has_displacement_data = False
+
+            if active_tracker is not None:
+                for trk in active_tracker.get_tracked():
+                    speed = math.hypot(trk.velocity[0], trk.velocity[1])
+                    if speed > max_disp:
+                        max_disp = speed
+                    has_displacement_data = True
+
+            if before_snapshot and after_snapshot:
+                for b_obj in before_snapshot.objects:
+                    for a_obj in after_snapshot.objects:
+                        if b_obj.color == a_obj.color:
+                            d = math.hypot(a_obj.centroid.row - b_obj.centroid.row, a_obj.centroid.col - b_obj.centroid.col)
+                            if d < 5.0:
+                                if d > max_disp:
+                                    max_disp = d
+                                has_displacement_data = True
+
+            if has_displacement_data and 0.0 < max_disp < min_reliable and len(step.expected_propositions) > 0:
+                u_verdict = Verdict.UNDECIDED if enable_undecided else Verdict.OMIT
+                return BrusentsovJudgment(
+                    trajectory_id=step.step_id,
+                    step_id=step.step_id,
+                    verdict=u_verdict,
+                    expected_propositions=step.expected_propositions,
+                    observed_propositions=observed,
+                    explanation=(
+                        f"Step {step.step_id} ({step.dsl_function}): Low metric delta detected "
+                        f"(max displacement {max_disp:.2f} < {min_reliable}). Epistemic signal seek evidence."
+                    ),
+                    evidence_hint="probe_motion",
+                    action_dict=act_dict,
+                    is_effective=is_effective,
+                )
+
+        # 8. Tier 8: Positive certificate from GameMemory (verified by non-zero delta)
         if act_id and confirmed_eff:
             if not zero_delta:
                 return BrusentsovJudgment(
@@ -509,7 +550,7 @@ class LayeredVerifier:
                     is_effective=True,
                 )
 
-        # 8. Tier 8: Default Fallthrough (ISO-10)
+        # Default Fallthrough (ISO-10)
         # If expected propositions were inessential or omitted without physical contradiction -> OMIT
         if len(step.expected_propositions) > 0 and prop_verdict == Ternary.IRRELEVANT:
             return BrusentsovJudgment(

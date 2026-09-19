@@ -173,8 +173,9 @@ In real ARC-AGI-3 environments, observations are subject to **partial observabil
      a) Bipartite track matching cost difference between best and second-best candidate is $< \text{matching\_ambiguity\_threshold}$ (0.15).
      b) Any participating `TrackedObject` exhibits confidence $< \text{track\_confidence\_threshold}$ (0.60).
      c) Zero grid delta observed on a non-confirmed action carrying a non-empty `EXPECT` set.
-     d) Detected change metrics have magnitudes $< \text{min\_reliable\_delta}$ (0.8 px) without terminal completion.
-   - **Ablation Invariant**: When `enable_undecided_verdict = False`, all four conditions above map conservatively to `Verdict.OMIT`, maintaining classic 3-valued operation.
+     d) Detected change metrics have magnitudes $< \text{min\_reliable\_delta}$ (0.8 px) with non-empty `EXPECT` and without terminal completion.
+     e) Upstream `GroundedStep` or binder sets `confidence == "low"` or `matching_status == "ambiguous"`.
+   - **Ablation Invariant**: When `enable_undecided_verdict = False`, all conditions above map conservatively to `Verdict.OMIT`, maintaining classic 3-valued operation.
 
 ---
 

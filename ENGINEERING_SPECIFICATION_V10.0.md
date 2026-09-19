@@ -619,17 +619,23 @@ The `LayeredVerifier` evaluates state transition $(S_{t-1}, a_t, S_t)$ against p
 ```
 Tier 1: Terminal Win Condition (WIN / levels_completed increase) ───────────> FOLLOW
 Tier 2: Terminal Loss Condition (GAME_OVER / LOST / FAILED) ───────────────> NULL
-Tier 3: Multi-Frame Tracking & Low Confidence Checks:
+Tier 3: Zero Grid Delta on Confirmed Motion Action (Wall Collision) ────────> NULL
+Tier 4: Epistemic Uncertainty & Multi-Frame Tracking Ambiguity:
+        - Upstream GroundedStep confidence == 'low' / ambiguous status ─────> UNDECIDED
         - Ambiguity diff < matching_ambiguity_threshold (0.15) ─────────────> UNDECIDED
         - Participating TrackedObject confidence < threshold (0.60) ────────> UNDECIDED
-Tier 4: Explicit EXPECT Contradiction (implies_brusentsov == FALSE) ─────────> NULL
-Tier 5: Explicit EXPECT Necessary Containment (implies_brusentsov == TRUE) ──> FOLLOW
-Tier 6: Zero Grid Delta on Confirmed Motion Action ─────────────────────────> NULL
-Tier 7: Zero Delta on Unconfirmed Action / Low Metric Delta (< 0.8) ─────────> UNDECIDED
-Tier 8: Default Non-Contradictory Transition (ISO-10 Non-Severance) ─────────> OMIT
+Tier 5: Explicit EXPECT Contradiction (implies_brusentsov == FALSE) ─────────> NULL
+Tier 6: Explicit EXPECT Necessary Containment (implies_brusentsov == TRUE) ──> FOLLOW
+Tier 7: Unconfirmed Zero Delta or Low Metric Delta:
+        - Zero Delta on Unconfirmed Action with EXPECT ─────────────────────> UNDECIDED
+        - Low Metric Delta: 0 < max displacement < min_reliable_delta (0.8) ─> UNDECIDED
+Tier 8: Positive Certificate from GameMemory (FOLLOW) & Default (ISO-10) ───> OMIT
 ```
 
-* **Ablation Semantics (`enable_undecided_verdict = False`)**: All conditions that would have produced `Verdict.UNDECIDED` (Tiers 3 and 7) map conservatively to `Verdict.OMIT`, maintaining classic 3-valued operation.
+* **Priority of Physical Boundary Collisions (Tier 3)**: A confirmed motion action producing zero grid delta is an undeniable physical fact of the entire environment (obstacle/wall collision). It takes precedence over object-level tracking uncertainty, preventing wasted evidence probes.
+* **Tracking Uncertainty Safeguard (Tier 4)**: Evaluated before proposition-level EXPECT comparisons. If object tracking is ambiguous or low-confidence, individual propositions cannot be reliably attributed, preventing false candidate severance (ISO-10).
+* **Low Metric Delta Check (Tier 7b)**: When non-zero grid changes occur but maximum object displacement is sub-pixel noise ($0 < \Delta < 0.8$ px), `Verdict.UNDECIDED` schedules empirical probing rather than prematurely committing the step.
+* **Ablation Semantics (`enable_undecided_verdict = False`)**: All conditions that would have produced `Verdict.UNDECIDED` (Tiers 4 and 7) map conservatively to `Verdict.OMIT`, maintaining classic 3-valued operation.
 * **Confirmed Motion Contract**: Checked against stored confirmed effects using the *"compatible effect signature"* rule (`dy=`, `dx=`, `moved`, `displace` without `blocked`, `wall`, `no_effect`, `null`).
 * **Candidate Safety (ISO-10)**: `Verdict.OMIT` **never severs** the active candidate trajectory. Execution proceeds to the next step.
 

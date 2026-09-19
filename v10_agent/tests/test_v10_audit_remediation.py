@@ -148,3 +148,92 @@ def test_remediation_notebook_gpu_metadata():
     """build_notebook_v10.py must configure isGpuEnabled=True in notebook metadata."""
     build_script = Path("build_notebook_v10.py").read_text(encoding="utf-8")
     assert '"isGpuEnabled": True' in build_script
+
+
+def test_tier3_confirmed_motion_zero_delta_overrides_low_track_confidence():
+    """Zero grid delta on confirmed motion action must return Verdict.NULL immediately, even with low tracking confidence."""
+    cfg = V10Config(
+        enable_persistent_tracker=True,
+        enable_undecided_verdict=True,
+        track_confidence_threshold=0.8,
+    )
+    verifier = LayeredVerifier(cfg)
+    grid = [[0, 2, 0], [0, 0, 0]]
+    snap = extract_arga_snapshot(grid)
+    pset = build_planning_set(snap, ["ACTION1"], tracker=verifier.tracker)
+
+    # Force tracker tracks to have low confidence
+    if verifier.tracker:
+        verifier.tracker.update(snap, frame_index=0)
+        for t in verifier.tracker.tracks.values():
+            t.confidence = 0.35
+
+    gmem = GameMemory(game_id="g1")
+    gmem.record_action_effect("ACTION1", "Object moved UP dy=-1")
+
+    step = GroundedStep(
+        step_id="s1",
+        dsl_function="action1",
+        arguments={},
+        expected_propositions=PropositionSet.from_iterable([
+            AtomicProposition(family="metric_sign", subject_id="obj_0", predicate="delta_r", value=-1)
+        ]),
+    )
+
+    judgment = verifier.evaluate_transition(
+        step=step,
+        before_snapshot=snap,
+        after_obs={"grid": grid, "state": "IN_PROGRESS"},
+        planning_set=pset,
+        game_memory=gmem,
+        action_dict={"action_id": "ACTION1"},
+    )
+
+    # Must be NULL (Tier 3: obstacle/boundary collision), NOT UNDECIDED!
+    assert judgment.verdict == Verdict.NULL
+    assert "Motion action produced zero grid delta" in judgment.explanation
+
+
+def test_tier7_low_metric_delta_triggers_undecided():
+    """Detected displacement < min_reliable_delta (0.8 px) with active EXPECT triggers Verdict.UNDECIDED."""
+    cfg = V10Config(
+        enable_persistent_tracker=True,
+        enable_undecided_verdict=True,
+        min_reliable_delta=0.8,
+    )
+    verifier = LayeredVerifier(cfg)
+
+    grid1 = [[0] * 10 for _ in range(10)]
+    grid1[5][5] = 2
+    snap1 = extract_arga_snapshot(grid1)
+    pset = build_planning_set(snap1, ["ACTION1"], tracker=verifier.tracker)
+
+    if verifier.tracker:
+        verifier.tracker.update(snap1, frame_index=0)
+        for t in verifier.tracker.tracks.values():
+            t.confidence = 0.95
+            t.velocity = (0.2, 0.3)  # magnitude ~ 0.36 < 0.8
+
+    grid2 = [[0] * 10 for _ in range(10)]
+    grid2[5][5] = 2
+    grid2[0][0] = 1  # subtle non-zero delta in grid
+
+    step = GroundedStep(
+        step_id="s1",
+        dsl_function="action1",
+        arguments={},
+        expected_propositions=PropositionSet.from_iterable([
+            AtomicProposition(family="metric_sign", subject_id="obj_0", predicate="delta_r", value=1)
+        ]),
+    )
+
+    judgment = verifier.evaluate_transition(
+        step=step,
+        before_snapshot=snap1,
+        after_obs={"grid": grid2, "state": "IN_PROGRESS"},
+        planning_set=pset,
+    )
+
+    assert judgment.verdict == Verdict.UNDECIDED
+    assert "Low metric delta detected" in judgment.explanation
+
