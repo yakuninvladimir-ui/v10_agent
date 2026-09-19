@@ -1,4 +1,4 @@
-﻿"""Comprehensive unit tests validating Stage 3: Prompts & Domain-General Distillation."""
+"""Comprehensive unit tests validating Stage 3: Prompts & Domain-General Distillation."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def test_progressive_phase_instructions():
     """3.1: Test _build_phase_instruction returns Exploration, Confirmation, and Exploitation phases."""
     phase_0 = _build_phase_instruction(0)
     assert "EXPLORATION PHASE" in phase_0
-    assert "SHORT diverse trajectories" in phase_0
+    assert "complete winning trajectories" in phase_0
 
     phase_1 = _build_phase_instruction(1)
     assert "EXPLORATION PHASE" in phase_1

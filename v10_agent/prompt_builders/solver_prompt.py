@@ -29,7 +29,7 @@ Your trajectories will be evaluated step-by-step using Brusentsov ternary logic:
 - IRRELEVANT (OMIT): No contradiction, but expected effect not observed -> trajectory paused.
 - FALSE (NULL): Physical contradiction detected (wall, collision, boundary blockage) -> trajectory permanently terminated.
 
-Design trajectories that minimize FALSE outcomes. Prefer safe, incremental steps.
+Design complete, goal-oriented trajectories aimed directly at achieving the level win condition from attempt 1. Do not artificially truncate to micro-probes; plan the full sequence needed to reach the target winning configuration.
 
 OUTPUT FORMAT:
 You must structure your response using the following XML tags:
@@ -64,9 +64,9 @@ def _build_phase_instruction(level_index: int, total_levels: int = 6) -> str:
     if level_index <= 1:
         return (
             "CURRENT PHASE: EXPLORATION PHASE (Level index <= 1)\n"
-            "This is an early level. The game mechanics are not yet confirmed.\n"
-            "Prioritize SHORT diverse trajectories to test hypotheses. "
-            "Try different actions and directions to discover the fundamental rules."
+            "Aim to generate complete winning trajectories from the very first attempt.\n"
+            "Do not artificially truncate your plans into short probes or incremental tests. "
+            "Formulate complete multi-step candidates that transform the initial state directly into the winning configuration."
         )
     elif level_index <= 3:
         return (
