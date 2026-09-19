@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from v10_agent.brusentsov_logic import BrusentsovJudgment, Ternary
+from v10_agent.brusentsov_logic import BrusentsovJudgment, Ternary, Verdict
 from v10_agent.config import V10Config
 from v10_agent.judge import LayeredVerifier
 from v10_agent.memory_contours import BranchSignature, EpistemicMemory, SyntaxErrorRecord, SyntaxErrorMemory
@@ -63,7 +63,7 @@ class StepExecutionResult:
 
 @dataclass
 class TransitionEvaluationResult:
-    verdict: Ternary
+    verdict: Any
     judgment: BrusentsovJudgment
     candidate_advanced: bool = False
     candidate_severed: bool = False
@@ -71,6 +71,8 @@ class TransitionEvaluationResult:
     reset_needed: bool = False
     falsification_detected: bool = False
     falsified_action: str | None = None
+    evidence_needed: bool = False
+    evidence_hint: str | None = None
 
 
 class SymbolicTrajectoryExecutor:
@@ -404,6 +406,24 @@ class SymbolicTrajectoryExecutor:
                 level_completed = True
 
         cand_finished = False
+
+        if judgment.verdict == Verdict.UNDECIDED:
+            # UNDECIDED: Epistemic signal seek evidence.
+            # Do NOT advance cursor, do NOT sever candidate, do NOT trigger RESET.
+            logger.info(
+                f"SymbolicExecutor: Step {pending_step.step_id} received UNDECIDED: {judgment.explanation}. "
+                f"Evidence probe needed."
+            )
+            return TransitionEvaluationResult(
+                verdict=Verdict.UNDECIDED,
+                judgment=judgment,
+                candidate_advanced=False,
+                candidate_severed=False,
+                replan_needed=False,
+                reset_needed=False,
+                evidence_needed=True,
+                evidence_hint=judgment.evidence_hint,
+            )
 
         if judgment.verdict == Ternary.TRUE:
             # FOLLOW: Advance cursor

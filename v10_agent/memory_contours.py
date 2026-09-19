@@ -201,10 +201,11 @@ class EpistemicMemory:
     severed_null_signatures: set[str] = field(default_factory=set)
     failed_completed_trajectories: list[tuple[str, ...]] = field(default_factory=list)
     current_level_attempts: list[dict[str, Any]] = field(default_factory=list)
+    epistemic_signals: list[BrusentsovJudgment] = field(default_factory=list)
     max_entries: int = 50
 
     def record_judgment(self, judgment: BrusentsovJudgment) -> None:
-        """Record a Brusentsov transition judgment, strictly asserting ISO-1."""
+        """Record a Brusentsov transition judgment, strictly asserting ISO-1 and ISO-9."""
         expl = judgment.explanation or ""
         for pat in FORBIDDEN_SYNTAX_PATTERNS_IN_SOLVER:
             if pat.search(expl):
@@ -213,6 +214,14 @@ class EpistemicMemory:
                 )
                 expl = pat.sub("[REDACTED SYNTAX]", expl)
                 object.__setattr__(judgment, "explanation", expl)
+
+        # ISO-9: UNDECIDED epistemic signals are kept in epistemic_signals
+        from v10_agent.brusentsov_logic import Verdict
+        if judgment.verdict == Verdict.UNDECIDED:
+            self.epistemic_signals.append(judgment)
+            if len(self.epistemic_signals) > self.max_entries:
+                self.epistemic_signals.pop(0)
+            return
 
         self.judgments.append(judgment)
         if len(self.judgments) > self.max_entries:
@@ -315,6 +324,7 @@ class EpistemicMemory:
 
     def clear(self) -> None:
         self.judgments.clear()
+        self.epistemic_signals.clear()
         self.live_omit_branches.clear()
         self.severed_null_signatures.clear()
         self.current_level_attempts.clear()

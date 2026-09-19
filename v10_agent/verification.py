@@ -19,17 +19,24 @@ class GroundedStep:
     step_id: str
     dsl_function: str
     arguments: dict[str, Any]
-    expected_propositions: PropositionSet
+    expected_propositions: PropositionSet = field(default_factory=PropositionSet.empty)
     abort_if: tuple[str, ...] = ()
+    confidence: str | None = None
+    matching_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "step_id": self.step_id,
             "dsl_function": self.dsl_function,
             "arguments": dict(self.arguments),
             "expected_propositions": self.expected_propositions.to_list(),
             "abort_if": list(self.abort_if),
         }
+        if self.confidence is not None:
+            d["confidence"] = self.confidence
+        if self.matching_status is not None:
+            d["matching_status"] = self.matching_status
+        return d
 
 
 class VerificationBinder:

@@ -38,6 +38,8 @@ class PlanningObject:
     multi_dir_relative: dict[str, float] = field(default_factory=dict)
     freedom_of_motion: dict[str, Any] = field(default_factory=dict)
     chiral_features: dict[str, Any] = field(default_factory=dict)
+    persistent_id: str | None = None
+    track_confidence: float = 1.0
 
     def __post_init__(self) -> None:
         if self.width == 0 and self.bbox is not None:
@@ -63,6 +65,8 @@ class PlanningObject:
             "aspect_ratio": self.aspect_ratio,
             "shape_type": self.shape_type,
             "shape_signature": self.shape_signature,
+            "persistent_id": self.persistent_id,
+            "track_confidence": self.track_confidence,
         }
         if self.normalized_centroid != (0.0, 0.0):
             d["normalized_centroid"] = {

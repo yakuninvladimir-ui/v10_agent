@@ -44,15 +44,18 @@ class PlanningSet:
     grid_dims: tuple[int, int] = (0, 0)
 
     def resolve_object_id(self, key: str) -> PlanningObjectId | None:
-        """Resolve a real object ID or an alias label to the canonical object ID."""
+        """Resolve a real object ID, alias label, or persistent_id to the canonical object ID."""
         if key in self.object_real_to_alias:
             return key
         if key in self.object_alias_to_real:
             return self.object_alias_to_real[key]
+        for obj in self.objects:
+            if obj.persistent_id is not None and obj.persistent_id == key:
+                return obj.id
         return None
 
     def get_object(self, key: str) -> PlanningObject | None:
-        """Retrieve PlanningObject by canonical ID or alias."""
+        """Retrieve PlanningObject by canonical ID, alias, or persistent ID."""
         canonical_id = self.resolve_object_id(key)
         if canonical_id is None:
             return None
@@ -90,8 +93,12 @@ def build_planning_set(
     available_actions: Sequence[str],
     snapshot_id: str | None = None,
     grid_hex_rows: Sequence[str] | None = None,
+    tracker: Any | None = None,
 ) -> PlanningSet:
     """Build a certified PlanningSet adhering to Invariants I1-I8."""
+    if tracker is not None and hasattr(tracker, "update"):
+        tracker.update(snapshot.objects, getattr(tracker, "frame_index", 0))
+
     sid = snapshot_id or str(uuid.uuid4())
     objects = tuple(snapshot.objects)
     object_ids = tuple(obj.id for obj in objects)

@@ -8,8 +8,9 @@ from typing import Any, Mapping
 
 from v10_agent.action_adapter import to_native_action
 from v10_agent.arga_lite import ARGALiteSnapshot, extract_arga_snapshot
-from v10_agent.brusentsov_logic import Ternary
+from v10_agent.brusentsov_logic import Ternary, Verdict
 from v10_agent.config import V10Config, config_from_mapping
+from v10_agent.tracker import PersistentObjectTracker
 from v10_agent.dsl_coder import DSLCoder
 from v10_agent.explorer_agent import ExplorerAgent, compute_probe_effect
 from v10_agent.fallback_symbolic import SymbolicFallbackEngine
@@ -144,6 +145,21 @@ class GameSession:
         self._last_failure_reason: str = ""
         self._last_failure_summary: str = ""
 
+        # V10.1 Evidence-seeking loop fields
+        self.evidence_seeking_active: bool = False
+        self.evidence_probes_remaining: int = getattr(self.config, "max_evidence_probes_per_level", 2)
+        self.undecided_streak: int = 0
+        self.pending_step_snapshot: GroundedStep | None = None
+        self.tracker: PersistentObjectTracker | None = (
+            PersistentObjectTracker(self.config) if getattr(self.config, "enable_persistent_tracker", True) else None
+        )
+
+        # V10.1 Telemetry counters
+        self.undecided_count: int = 0
+        self.undecided_resolved_by_probe: int = 0
+        self.undecided_fallback_to_null: int = 0
+        self.evidence_probes_executed: int = 0
+
     def transition_to(self, new_phase: SessionPhase, reason: str = "") -> None:
         """Explicit state machine transition enforcing allowed lifecycle progression."""
         if not PhaseTransition.can_transition(self.current_phase, new_phase):
@@ -262,6 +278,12 @@ class GameSession:
         self.solver_reset_reason = None
         self._level_win_handled = False
         self._last_trajectory_id = None
+        self.evidence_seeking_active = False
+        self.evidence_probes_remaining = getattr(self.config, "max_evidence_probes_per_level", 2)
+        self.undecided_streak = 0
+        self.pending_step_snapshot = None
+        if self.tracker is not None:
+            self.tracker.reset()
         self._last_attempt_failed = False
         self._last_failure_reason = ""
         self._last_failure_summary = ""
@@ -488,6 +510,43 @@ class GameSession:
                 level_id=self.current_level_id,
             )
             return reset_action
+
+        # 3.8. V10.1 Evidence-Seeking Blocking Dispatch
+        if self.evidence_seeking_active:
+            if self.probe_queue:
+                probe_action_item = self.probe_queue.pop(0)
+                probe_action = (
+                    probe_action_item.to_dict()
+                    if hasattr(probe_action_item, "to_dict")
+                    else dict(probe_action_item)
+                )
+                self.last_probe_action = probe_action
+                self.last_snapshot = snapshot
+                self.last_planning_set = planning_set
+                self.pending_action = probe_action
+                self.pending_step = None
+                self.last_engine_action = str(probe_action.get("action_id") or probe_action.get("id") or "ACTION1").upper()
+                self.evidence_probes_executed += 1
+                self.audit_logger.log(
+                    "action_emitted",
+                    action=self.last_engine_action,
+                    data=probe_action.get("data", {}),
+                    strategy="evidence_probe",
+                    grid_hash=planning_set.grid_hash,
+                    level_id=self.current_level_id,
+                )
+                return probe_action
+            else:
+                # Probe queue exhausted: fall through to NULL (sever candidate + clean reset)
+                logger.info("Session: Evidence seeking probe queue exhausted. Falling through to NULL.")
+                self.undecided_fallback_to_null += 1
+                self.evidence_seeking_active = False
+                self.undecided_streak = 0
+                self.pending_step_snapshot = None
+                if self.active_pool and self.active_pool.active_candidate():
+                    self.active_pool.active_candidate().sever()
+                self.solver_reset_pending = True
+                self.solver_reset_reason = "evidence_probe_exhausted_null"
 
         # 4. Pipeline Determination & Probing Phase
         if self.probing_phase:
@@ -1166,6 +1225,46 @@ class GameSession:
                 if reprobes:
                     self.probe_queue.extend(reprobes)
 
+            if self.evidence_seeking_active and self.pending_step_snapshot is not None:
+                re_eval = self.symbolic_executor.evaluate_transition(
+                    pending_step=self.pending_step_snapshot,
+                    before_snapshot=self.last_snapshot,
+                    after_obs=norm_after,
+                    planning_set=self.last_planning_set,
+                    active_pool=None,  # Do not advance candidate during evidence probe
+                    epistemic_memory=self.memory_manager.get_epistemic_memory("session"),
+                    game_memory=self.memory_manager.get_game_memory("session"),
+                    action_dict=rec.action,
+                )
+                if re_eval.verdict == Verdict.UNDECIDED or re_eval.evidence_needed:
+                    self.undecided_streak += 1
+                    max_streak = getattr(self.config, "max_undecided_streak", 2)
+                    budget_rem = getattr(self.config, "max_level_actions", 120) - len(self.level_executed_actions)
+                    if self.evidence_probes_remaining > 0 and self.undecided_streak < max_streak and budget_rem >= 25:
+                        probe_act = {"id": "ACTION1", "action_id": "ACTION1", "data": {}, "reasoning": {"source": "evidence_seeking"}}
+                        if re_eval.evidence_hint and re_eval.evidence_hint.startswith("probe_ACTION"):
+                            act_str = re_eval.evidence_hint.replace("probe_", "").upper()
+                            if act_str in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"):
+                                probe_act = {"id": act_str, "action_id": act_str, "data": {}, "reasoning": {"source": "evidence_seeking"}}
+                        self.probe_queue.insert(0, probe_act)
+                        self.evidence_probes_remaining -= 1
+                    else:
+                        logger.info(f"Session: UNDECIDED streak limit ({self.undecided_streak}) or budget exhausted. Treating as NULL.")
+                        self.undecided_fallback_to_null += 1
+                        self.evidence_seeking_active = False
+                        self.undecided_streak = 0
+                        self.pending_step_snapshot = None
+                        if self.active_pool and self.active_pool.active_candidate():
+                            self.active_pool.active_candidate().sever()
+                        self.solver_reset_pending = True
+                        self.solver_reset_reason = "undecided_streak_exhausted_null"
+                else:
+                    logger.info("Session: Epistemic ambiguity resolved by evidence probe.")
+                    self.undecided_resolved_by_probe += 1
+                    self.evidence_seeking_active = False
+                    self.undecided_streak = 0
+                    self.pending_step_snapshot = None
+
             self.last_probe_action = None
 
         # B. Evaluate transition if a grounded solver step was pending
@@ -1183,7 +1282,35 @@ class GameSession:
                 action_dict=self.pending_action,
             )
 
-            if eval_res.falsification_detected:
+            if eval_res.verdict == Verdict.UNDECIDED or eval_res.evidence_needed:
+                self.undecided_count += 1
+                self.undecided_streak = 1
+                max_streak = getattr(self.config, "max_undecided_streak", 2)
+                budget_rem = getattr(self.config, "max_level_actions", 120) - len(self.level_executed_actions)
+                if self.evidence_probes_remaining > 0 and self.undecided_streak <= max_streak and budget_rem >= 25:
+                    self.evidence_seeking_active = True
+                    self.pending_step_snapshot = self.pending_step
+                    probe_act = {"id": "ACTION1", "action_id": "ACTION1", "data": {}, "reasoning": {"source": "evidence_seeking"}}
+                    hint = eval_res.evidence_hint or ""
+                    if hint.startswith("probe_ACTION"):
+                        act_str = hint.replace("probe_", "").upper()
+                        if act_str in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"):
+                            probe_act = {"id": act_str, "action_id": act_str, "data": {}, "reasoning": {"source": "evidence_seeking"}}
+                    self.probe_queue.insert(0, probe_act)
+                    self.evidence_probes_remaining -= 1
+                    logger.info(f"Session: Evidence seeking active on step {self.pending_step.step_id}. Enqueued probe {probe_act.get('id')}.")
+                else:
+                    logger.info(f"Session: Step {self.pending_step.step_id} UNDECIDED but probe budget exhausted. Treating as NULL.")
+                    self.undecided_fallback_to_null += 1
+                    self.evidence_seeking_active = False
+                    self.undecided_streak = 0
+                    self.pending_step_snapshot = None
+                    if self.active_pool and self.active_pool.active_candidate():
+                        self.active_pool.active_candidate().sever()
+                    self.solver_reset_pending = True
+                    self.solver_reset_reason = "undecided_budget_exhausted_null"
+
+            elif eval_res.falsification_detected:
                 falsified = eval_res.falsified_action or "initial_motion"
                 logger.warning(
                     f"Session: Действие {falsified} не валидно при текущих координатах объекта. "
@@ -1275,4 +1402,9 @@ class GameSession:
             "active_pipeline": self.active_pipeline,
             "probing_phase": self.probing_phase,
             "probe_queue_length": len(self.probe_queue),
+            "undecided_count": self.undecided_count,
+            "undecided_resolved_by_probe": self.undecided_resolved_by_probe,
+            "undecided_fallback_to_null": self.undecided_fallback_to_null,
+            "evidence_probes_executed": self.evidence_probes_executed,
+            "epistemic_signals_count": len(getattr(ep_mem, "epistemic_signals", [])),
         }

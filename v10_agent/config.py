@@ -125,6 +125,19 @@ class V10Config:
     vllm_speculative_config: str | None = None
     vllm_speculative_cli_format: str = "auto"  # "auto" | "config_json" | "spec_tokens" | "speculative_model"
 
+    # V10.1 Persistent Object Tracker & Four-valued Verdict Knobs
+    enable_persistent_tracker: bool = True
+    track_match_threshold: float = 0.45
+    track_max_age: int = 5
+    matching_ambiguity_threshold: float = 0.15
+    min_reliable_delta: float = 0.8
+    track_confidence_threshold: float = 0.6
+    occlusion_radius: int = 3
+    cumulative_window: int = 3
+    enable_undecided_verdict: bool = True
+    max_undecided_streak: int = 2
+    max_evidence_probes_per_level: int = 2
+
     @property
     def model_name(self) -> str:
         return self.model_path
@@ -326,6 +339,17 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         vllm_speculative_model=resolved_spec_model,
         vllm_speculative_config=resolved_spec_config,
         vllm_speculative_cli_format=resolved_spec_format,
+        enable_persistent_tracker=_bool_from_env("ARC_ENABLE_PERSISTENT_TRACKER", True),
+        track_match_threshold=_float_from_env("ARC_TRACK_MATCH_THRESHOLD", 0.45),
+        track_max_age=_int_from_env("ARC_TRACK_MAX_AGE", 5),
+        matching_ambiguity_threshold=_float_from_env("ARC_MATCHING_AMBIGUITY_THRESHOLD", 0.15),
+        min_reliable_delta=_float_from_env("ARC_MIN_RELIABLE_DELTA", 0.8),
+        track_confidence_threshold=_float_from_env("ARC_TRACK_CONFIDENCE_THRESHOLD", 0.6),
+        occlusion_radius=_int_from_env("ARC_OCCLUSION_RADIUS", 3),
+        cumulative_window=_int_from_env("ARC_CUMULATIVE_WINDOW", 3),
+        enable_undecided_verdict=_bool_from_env("ARC_ENABLE_UNDECIDED_VERDICT", True),
+        max_undecided_streak=_int_from_env("ARC_MAX_UNDECIDED_STREAK", 2),
+        max_evidence_probes_per_level=_int_from_env("ARC_MAX_EVIDENCE_PROBES", 2),
     )
     if overrides:
         cfg.update_runtime(overrides)

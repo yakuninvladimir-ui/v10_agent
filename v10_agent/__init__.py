@@ -28,7 +28,9 @@ from v10_agent.verifier_packet import build_verifier_packet
 
 from v10_agent.brusentsov_logic import (
     BrusentsovJudgment,
+    EpistemicSignal,
     Ternary,
+    Verdict,
     contradicts,
     implies_brusentsov,
     is_necessarily_contained,
@@ -44,6 +46,10 @@ from v10_agent.memory_contours import (
     StructuredInvariant,
     SyntaxErrorMemory,
     SyntaxErrorRecord,
+)
+from v10_agent.tracker import (
+    PersistentObjectTracker,
+    TrackedObject,
 )
 from v10_agent.sandbox import (
     SandboxAPI,
@@ -107,6 +113,7 @@ __all__ = [
     "render_dual_frame_png",
     "build_verifier_packet",
     "Ternary",
+    "Verdict",
     "BrusentsovJudgment",
     "implies_brusentsov",
     "contradicts",
@@ -114,6 +121,7 @@ __all__ = [
     "EnvironmentSpecMemory",
     "SyntaxErrorMemory",
     "EpistemicMemory",
+    "EpistemicSignal",
     "GameMemory",
     "MemoryContourManager",
     "IsolationViolationError",
@@ -121,6 +129,8 @@ __all__ = [
     "StructuredInvariant",
     "SyntaxErrorRecord",
     "BranchSignature",
+    "PersistentObjectTracker",
+    "TrackedObject",
     "SandboxAPI",
     "SandboxExecutor",
     "SandboxedModule",

@@ -134,6 +134,8 @@ REGISTERED_PROPOSITION_FAMILIES = frozenset({
     "affordance_flag",
     "spatial_position",
     "area_conservation",
+    "cumulative_motion",
+    "shape_stability",
 })
 
 PropositionFamily = str
@@ -176,6 +178,10 @@ class AtomicProposition:
 class PropositionSet:
     """An immutable set of AtomicPropositions."""
     propositions: frozenset[AtomicProposition] = field(default_factory=frozenset)
+
+    @classmethod
+    def empty(cls) -> PropositionSet:
+        return cls(frozenset())
 
     @classmethod
     def from_iterable(cls, items: Iterable[AtomicProposition]) -> PropositionSet:

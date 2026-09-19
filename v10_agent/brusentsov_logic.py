@@ -26,29 +26,99 @@ class Ternary(Enum):
     FALSE = -1        # NULL: Hard contradiction; branch severed.
     IRRELEVANT = 0    # OMIT: Inessential / passive outcome; branch paused.
 
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, Verdict):
+            return other == self
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        return super().__hash__()
+
+
+class EpistemicSignal(Enum):
+    """Controller signals. Not truth values."""
+    SEEK_EVIDENCE = 1
+
+
+class Verdict(Enum):
+    """Full judge verdict = logical value or epistemic signal."""
+    FOLLOW = "FOLLOW"        # maps to Ternary.TRUE
+    NULL = "NULL"            # maps to Ternary.FALSE
+    OMIT = "OMIT"            # maps to Ternary.IRRELEVANT
+    UNDECIDED = "UNDECIDED"  # maps to EpistemicSignal.SEEK_EVIDENCE
+
+    @property
+    def ternary(self) -> Ternary | None:
+        if self is Verdict.FOLLOW:
+            return Ternary.TRUE
+        if self is Verdict.NULL:
+            return Ternary.FALSE
+        if self is Verdict.OMIT:
+            return Ternary.IRRELEVANT
+        return None
+
+    @classmethod
+    def from_ternary(cls, t: Ternary) -> "Verdict":
+        if t is Ternary.TRUE:
+            return cls.FOLLOW
+        if t is Ternary.FALSE:
+            return cls.NULL
+        if t is Ternary.IRRELEVANT:
+            return cls.OMIT
+        raise ValueError(f"Cannot map {t} to Verdict")
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, Ternary):
+            if self is Verdict.FOLLOW:
+                return other is Ternary.TRUE
+            if self is Verdict.NULL:
+                return other is Ternary.FALSE
+            if self is Verdict.OMIT:
+                return other is Ternary.IRRELEVANT
+            return False
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        return super().__hash__()
+
 
 @dataclass(frozen=True)
 class BrusentsovJudgment:
     """Auditable transition evaluation judgment grounded on Brusentsov logic."""
     trajectory_id: str
     step_id: str
-    verdict: Ternary
+    verdict: Verdict | Ternary
     expected_propositions: PropositionSet
     observed_propositions: PropositionSet
     explanation: str = ""
     timestamp: float = field(default_factory=time.time)
+    ambiguity_score: float | None = None
+    evidence_hint: str | None = None
+    matching_candidates: list[str] = field(default_factory=list)
+    track_confidence_min: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        v_name = self.verdict.name if hasattr(self.verdict, "name") else str(self.verdict)
+        v_val = self.verdict.value if hasattr(self.verdict, "value") else str(self.verdict)
+        d: dict[str, Any] = {
             "trajectory_id": self.trajectory_id,
             "step_id": self.step_id,
-            "verdict": self.verdict.name,
-            "verdict_value": self.verdict.value,
+            "verdict": v_name,
+            "verdict_value": v_val,
             "expected_count": len(self.expected_propositions),
             "observed_count": len(self.observed_propositions),
             "explanation": self.explanation,
             "timestamp": self.timestamp,
         }
+        if self.ambiguity_score is not None:
+            d["ambiguity_score"] = self.ambiguity_score
+        if self.evidence_hint is not None:
+            d["evidence_hint"] = self.evidence_hint
+        if self.matching_candidates:
+            d["matching_candidates"] = list(self.matching_candidates)
+        if self.track_confidence_min is not None:
+            d["track_confidence_min"] = self.track_confidence_min
+        return d
 
 
 def contradicts(expected: AtomicProposition, observed: AtomicProposition) -> bool:

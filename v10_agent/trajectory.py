@@ -32,6 +32,10 @@ class CandidateTrajectory:
         """Permanently sever this trajectory upon NULL verdict."""
         self.active = False
 
+    @property
+    def is_severed(self) -> bool:
+        return not self.active
+
     def is_finished(self) -> bool:
         return self.cursor >= len(self.steps) or not self.active
 
