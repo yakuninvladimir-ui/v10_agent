@@ -210,7 +210,6 @@ class SymbolicTrajectoryExecutor:
 
         if (
             not candidate.active
-            or epistemic_memory.is_severed(candidate.trajectory_id)
             or epistemic_memory.is_severed(full_traj_sig)
             or is_subsumed
         ):
@@ -255,7 +254,6 @@ class SymbolicTrajectoryExecutor:
             logger.warning(f"SymbolicExecutor: Grounding error for step {step_id}: {ge}; severing candidate.")
             candidate.sever()
             epistemic_memory.sever_branch(full_traj_sig)
-            epistemic_memory.sever_branch(candidate.trajectory_id)
             return StepExecutionResult(
                 verdict=StepExecutionVerdict.PRE_VERIFICATION_FAILED,
                 error_message=str(ge),
@@ -292,7 +290,6 @@ class SymbolicTrajectoryExecutor:
             # Circuit breaker: sever candidate immediately so it is never repeated
             candidate.sever()
             epistemic_memory.sever_branch(full_traj_sig)
-            epistemic_memory.sever_branch(candidate.trajectory_id)
             return StepExecutionResult(
                 verdict=StepExecutionVerdict.SANDBOX_EXECUTION_FAILED,
                 error_message=f"{type(exc).__name__}: {exc}",
@@ -427,7 +424,6 @@ class SymbolicTrajectoryExecutor:
                 seq_tuple = get_trajectory_signature_tuple(active_cand.steps[:active_cand.cursor + 1])
                 epistemic_memory.sever_branch(full_sig)
                 epistemic_memory.sever_branch(seq_sig)
-                epistemic_memory.sever_branch(active_cand.trajectory_id)
                 if hasattr(epistemic_memory, "record_failed_completed_trajectory"):
                     epistemic_memory.record_failed_completed_trajectory(full_tuple)
                     epistemic_memory.record_failed_completed_trajectory(seq_tuple)
@@ -489,7 +485,6 @@ class SymbolicTrajectoryExecutor:
                     traj_sig = format_sequence_signature(active_cand.steps)
                     traj_tuple = get_trajectory_signature_tuple(active_cand.steps)
                     epistemic_memory.sever_branch(traj_sig)
-                    epistemic_memory.sever_branch(active_cand.trajectory_id)
                     if hasattr(epistemic_memory, "record_failed_completed_trajectory"):
                         epistemic_memory.record_failed_completed_trajectory(traj_tuple)
                     epistemic_memory.record_attempt_feedback(

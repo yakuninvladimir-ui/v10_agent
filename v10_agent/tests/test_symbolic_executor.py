@@ -632,3 +632,100 @@ def action6(api):
     assert cand_interior.active
 
 
+def test_reused_trajectory_id_with_different_steps_not_severed():
+    """Verify that a candidate trajectory ID (e.g. 'traj_text_01') reused in a new attempt
+
+    is NOT rejected if its action sequence is new, even if a candidate with the same
+    ID was previously severed on a prior attempt.
+    """
+    config = V10Config()
+    executor = SandboxExecutor()
+    binder = VerificationBinder()
+    verifier = LayeredVerifier(config)
+    sym_exec = SymbolicTrajectoryExecutor(config, executor, binder, verifier)
+
+    grid = [[0] * 30 for _ in range(30)]
+    grid[15][15] = 1
+    snapshot = extract_arga_snapshot(grid)
+    pset = build_planning_set(
+        snapshot,
+        ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "RESET"],
+    )
+
+    ep_mem = EpistemicMemory(level_id="l0")
+    syntax_mem = SyntaxErrorMemory(level_id="l0")
+
+    code = """
+def action1(api):
+    return api.declare_environment_action("ACTION1")
+def action2(api):
+    return api.declare_environment_action("ACTION2")
+def action5(api):
+    return api.declare_environment_action("ACTION5")
+"""
+    manifest = {
+        "functions": [
+            {"name": "action1", "parameters": []},
+            {"name": "action2", "parameters": []},
+            {"name": "action5", "parameters": []},
+        ]
+    }
+    module = executor.load_module(code, manifest)
+
+    # Attempt 1: traj_text_01 runs action1 -> action2, fails and is severed
+    cand_att1 = CandidateTrajectory(
+        trajectory_id="traj_text_01",
+        steps=[
+            {"step_id": "s1", "dsl_function": "action1", "arguments": {}},
+            {"step_id": "s2", "dsl_function": "action2", "arguments": {}},
+        ],
+    )
+    pool1 = TrajectoryPool(proposal_id="p1", candidates=[cand_att1])
+    # Execute first step of pool1
+    res1 = sym_exec.prepare_and_execute_step(pool1, pset, module, ep_mem, syntax_mem)
+    assert res1.verdict == StepExecutionVerdict.SUCCESS
+
+    # Simulate transition evaluation where attempt 1 candidate fails and is severed
+    from unittest.mock import MagicMock
+    from v10_agent.judge import BrusentsovJudgment
+    from v10_agent.brusentsov_logic import Ternary, PropositionSet
+    step_grounded = res1.grounded_step
+    fake_judgment_false = BrusentsovJudgment(
+        trajectory_id="traj_text_01",
+        step_id=step_grounded.step_id,
+        verdict=Ternary.FALSE,
+        explanation="Collision detected",
+        expected_propositions=PropositionSet(),
+        observed_propositions=PropositionSet(),
+    )
+    sym_exec.verifier.evaluate_transition = MagicMock(return_value=fake_judgment_false)
+    # Call evaluate_transition resulting in severance of candidate 1
+    eval_res = sym_exec.evaluate_transition(
+        pending_step=step_grounded,
+        before_snapshot=snapshot,
+        after_obs={"grid": grid, "levels_completed": 0, "state": "IN_PROGRESS"},
+        planning_set=pset,
+        active_pool=pool1,
+        epistemic_memory=ep_mem,
+    )
+    assert eval_res.reset_needed is True
+    assert cand_att1.active is False
+
+    # Attempt 2: Model generates new candidate also named "traj_text_01", but with action5 -> action2
+    cand_att2 = CandidateTrajectory(
+        trajectory_id="traj_text_01",
+        steps=[
+            {"step_id": "s3", "dsl_function": "action5", "arguments": {}},
+            {"step_id": "s4", "dsl_function": "action2", "arguments": {}},
+        ],
+    )
+    pool2 = TrajectoryPool(proposal_id="p2", candidates=[cand_att2])
+
+    # Pre-verification on Attempt 2 MUST NOT reject traj_text_01 just because of ID collision!
+    res2 = sym_exec.prepare_and_execute_step(pool2, pset, module, ep_mem, syntax_mem)
+    assert res2.verdict == StepExecutionVerdict.SUCCESS
+    assert res2.circuit_broken is False
+    assert cand_att2.active is True
+
+
+
