@@ -509,41 +509,112 @@ class SolverAgent:
 
         return None
 
-    def distill_level_win_invariants(
+    def revise_invariants(
         self,
-        winning_candidate: dict[str, Any] | None = None,
+        outcome: str = "WIN",
         execution_summary: str = "",
+        failure_reason: str = "",
+        active_invariants: list[dict[str, Any]] | list[str] | None = None,
+        invalidated_invariants: list[dict[str, Any]] | None = None,
+        winning_candidate: dict[str, Any] | None = None,
     ) -> list[str]:
-        """Turn 2: Follow-up reflection asking the Solver to distill domain-general invariants after a win."""
-        cand_id = winning_candidate.get("trajectory_id", "winning_candidate") if winning_candidate else "winning_candidate"
+        """Turn 2: Follow-up reflection asking the Solver to revise domain-general invariants after win or failure."""
+        cand_id = (
+            winning_candidate.get("trajectory_id", "winning_candidate")
+            if winning_candidate
+            else (
+                self.last_package.get("candidates", [{}])[0].get("trajectory_id", "candidate")
+                if self.last_package and self.last_package.get("candidates")
+                else "candidate"
+            )
+        )
         hyp = self.last_hypothesis or "Target coverage via spatial coordination"
-        exec_desc = execution_summary or "Candidate successfully reached win condition"
+        exec_desc = execution_summary or (
+            "Candidate successfully reached win condition"
+            if outcome.upper() == "WIN"
+            else "Candidate halted before reaching win condition"
+        )
+
+        if outcome.upper() == "WIN":
+            outcome_header = (
+                f"[EXECUTION OUTCOME: LEVEL WON]\n"
+                f"Your proposed trajectory ({cand_id}) successfully solved this level and achieved victory!\n"
+                f"Summary of executed transitions: {exec_desc}\n"
+                f"Your original hypothesis: {hyp}\n"
+            )
+        else:
+            fail_desc = failure_reason or "Candidate failed to achieve level goal or violated physical constraints."
+            outcome_header = (
+                f"[EXECUTION OUTCOME: ATTEMPT FAILED / CONTRADICTION DETECTED]\n"
+                f"Your proposed trajectory ({cand_id}) did not succeed.\n"
+                f"Failure reason: {fail_desc}\n"
+                f"Summary of executed transitions: {exec_desc}\n"
+                f"Your original hypothesis: {hyp}\n"
+            )
+
+        active_lines: list[str] = []
+        if active_invariants:
+            for item in active_invariants:
+                if isinstance(item, dict):
+                    rule_text = item.get("rule") or item.get("name") or str(item)
+                    reason = item.get("inclusion_reason") or f"Confidence: {item.get('confidence', 1.0)}"
+                    active_lines.append(f"- {rule_text} [Reason: {reason}]")
+                elif isinstance(item, str) and item.strip():
+                    active_lines.append(f"- {item.strip()}")
+
+        if active_lines:
+            active_section = (
+                "\n--- CURRENT ACTIVE INVARIANTS (with reasons for inclusion) ---\n"
+                + "\n".join(active_lines)
+                + "\n"
+            )
+        else:
+            active_section = "\n--- CURRENT ACTIVE INVARIANTS ---\n(None currently established)\n"
+
+        invalidated_lines: list[str] = []
+        if invalidated_invariants:
+            for item in invalidated_invariants:
+                if isinstance(item, dict):
+                    rule_text = item.get("rule") or item.get("id") or str(item)
+                    reason = item.get("invalidation_reason") or item.get("reason") or "Falsified by environment transition"
+                    invalidated_lines.append(f"- {rule_text} [Removed/Invalidated reason: {reason}]")
+                elif isinstance(item, str) and item.strip():
+                    invalidated_lines.append(f"- {item.strip()}")
+
+        invalidated_section = ""
+        if invalidated_lines:
+            invalidated_section = (
+                "\n--- INVALIDATED / REMOVED RULES (with reasons for removal) ---\n"
+                + "\n".join(invalidated_lines)
+                + "\n"
+            )
 
         followup_user_prompt = (
-            f"[EXECUTION OUTCOME: LEVEL WON]\n"
-            f"Your proposed trajectory ({cand_id}) successfully solved this level and achieved victory!\n"
-            f"Summary of executed transitions: {exec_desc}\n"
-            f"Your original hypothesis: {hyp}\n\n"
-            f"Now, reflect on this victory, your hypothesis, and the physical mechanisms observed.\n"
-            f"Formulate 2-4 domain-general invariants for subsequent levels.\n\n"
+            f"{outcome_header}"
+            f"{active_section}"
+            f"{invalidated_section}\n"
+            f"TASK: Conduct a comprehensive revision of the domain invariants for subsequent levels.\n"
+            f"Analyze the outcome, current active invariants, and reasons behind any invalidations:\n"
+            f"- Retain and reinforce invariants that remain empirically sound.\n"
+            f"- If an invariant was invalidated or removed by the symbolic engine, reformulate it into a valid version that accounts for the observed constraints (e.g. boundary conditions, obstacles, specific prerequisites), or discard it if fundamentally flawed.\n"
+            f"- Introduce new domain invariants based on observed physical mechanics, spatial structures, or goal semantics.\n\n"
             f"CRITICAL RULES FOR INVARIANTS:\n"
             f"1. NO coordinates, row/column numbers, bounding boxes, or grid dimensions (these change every level).\n"
             f"2. NO step counts or action repetition numbers (distances vary across levels).\n"
             f"3. NO literal button sequences or macros like 'action1 -> action5' (order of actions varies).\n"
-            f"4. Use ONLY applicable categories from:\n"
+            f"4. Use applicable categories from:\n"
             f"   - [PHYSICS]: How objects move, collide, and interact with boundaries\n"
             f"   - [STRUCTURE]: Persistent spatial relationships (symmetry, containment, alignment)\n"
             f"   - [GOAL]: What constitutes success (abstractly, not as coordinates)\n"
             f"   - [CONTROL]: How entity selection/switching operates\n"
             f"   - [PALETTE]: Color-to-role mapping IF clearly observed\n"
             f"   - [CONSTRAINTS]: What is forbidden or impossible\n\n"
-            f"Skip any category that doesn't apply to this game.\n"
-            f"Format your response strictly inside <distilled_invariants>...</distilled_invariants> with bullet points:\n"
-            f"<distilled_invariants>\n"
+            f"Format your revised invariant list strictly inside <revised_invariants>...</revised_invariants> with bullet points:\n"
+            f"<revised_invariants>\n"
             f"- [PHYSICS]: ...\n"
             f"- [STRUCTURE]: ...\n"
             f"- [GOAL]: ...\n"
-            f"</distilled_invariants>"
+            f"</revised_invariants>"
         )
 
         messages_to_send: list[dict[str, Any]]
@@ -564,11 +635,13 @@ class SolverAgent:
             )
             response = sanitize_model_response(raw_response)
         except Exception as exc:
-            logger.warning(f"Solver win reflection invocation failed: {exc}")
+            logger.warning(f"Solver invariant revision invocation failed: {exc}")
             response = ""
 
         invariants: list[str] = []
-        xml_m = re.search(r"<distilled_invariants>(.*?)(?:</distilled_invariants>|\Z)", response, re.DOTALL | re.IGNORECASE)
+        xml_m = re.search(r"<revised_invariants>(.*?)(?:</revised_invariants>|\Z)", response, re.DOTALL | re.IGNORECASE)
+        if not xml_m:
+            xml_m = re.search(r"<distilled_invariants>(.*?)(?:</distilled_invariants>|\Z)", response, re.DOTALL | re.IGNORECASE)
         inv_text = xml_m.group(1).strip() if xml_m else response.strip()
 
         for line in inv_text.splitlines():
@@ -593,12 +666,48 @@ class SolverAgent:
                 continue
             invariants.append(line_s)
 
-        if not invariants:
+        if not invariants and outcome.upper() == "WIN":
             if hyp:
                 invariants.append(f"Confirmed goal principle: {hyp}")
             else:
                 invariants.append("Level victory achieved via coordinated multi-entity alignment")
 
-        logger.info(f"Solver distilled {len(invariants)} cross-level invariants:\n" + "\n".join(f"  * {inv}" for inv in invariants))
+        logger.info(
+            f"Solver revised {len(invariants)} cross-level invariants ({outcome.upper()}):\n"
+            + "\n".join(f"  * {inv}" for inv in invariants)
+        )
         return invariants
+
+    def distill_level_win_invariants(
+        self,
+        winning_candidate: dict[str, Any] | None = None,
+        execution_summary: str = "",
+        active_invariants: list[dict[str, Any]] | list[str] | None = None,
+        invalidated_invariants: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
+        """Turn 2: Follow-up reflection asking the Solver to revise/distill invariants after a win."""
+        return self.revise_invariants(
+            outcome="WIN",
+            execution_summary=execution_summary,
+            failure_reason="",
+            active_invariants=active_invariants,
+            invalidated_invariants=invalidated_invariants,
+            winning_candidate=winning_candidate,
+        )
+
+    def reflect_and_revise_on_failure(
+        self,
+        execution_summary: str = "",
+        failure_reason: str = "",
+        active_invariants: list[dict[str, Any]] | list[str] | None = None,
+        invalidated_invariants: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
+        """Turn 2: Follow-up reflection asking the Solver to revise invariants after an attempt failure / contradiction."""
+        return self.revise_invariants(
+            outcome="FAILURE",
+            execution_summary=execution_summary,
+            failure_reason=failure_reason,
+            active_invariants=active_invariants,
+            invalidated_invariants=invalidated_invariants,
+        )
 

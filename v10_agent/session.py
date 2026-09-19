@@ -49,10 +49,10 @@ class PhaseTransition:
     """Определяет допустимые переходы и условия."""
     TRANSITIONS = {
         SessionPhase.PROBING: [SessionPhase.CODING, SessionPhase.FALLBACK, SessionPhase.PROBING, SessionPhase.REFLECTING],
-        SessionPhase.CODING: [SessionPhase.SOLVING, SessionPhase.PROBING, SessionPhase.FALLBACK],
-        SessionPhase.SOLVING: [SessionPhase.EXECUTING, SessionPhase.PROBING, SessionPhase.FALLBACK],
+        SessionPhase.CODING: [SessionPhase.SOLVING, SessionPhase.PROBING, SessionPhase.FALLBACK, SessionPhase.REFLECTING],
+        SessionPhase.SOLVING: [SessionPhase.EXECUTING, SessionPhase.PROBING, SessionPhase.FALLBACK, SessionPhase.REFLECTING],
         SessionPhase.EXECUTING: [SessionPhase.REFLECTING, SessionPhase.SOLVING, SessionPhase.PROBING, SessionPhase.FALLBACK],
-        SessionPhase.REFLECTING: [SessionPhase.PROBING, SessionPhase.SOLVING, SessionPhase.EXECUTING],
+        SessionPhase.REFLECTING: [SessionPhase.PROBING, SessionPhase.SOLVING, SessionPhase.EXECUTING, SessionPhase.FALLBACK],
         SessionPhase.FALLBACK: [SessionPhase.EXECUTING, SessionPhase.PROBING, SessionPhase.SOLVING, SessionPhase.REFLECTING, SessionPhase.FALLBACK],
     }
 
@@ -140,6 +140,9 @@ class GameSession:
         self.level_initial_grid_hash: str | None = None
         self.level_executed_actions: list[str] = []
         self.in_persistent_fallback: bool = False
+        self._last_attempt_failed: bool = False
+        self._last_failure_reason: str = ""
+        self._last_failure_summary: str = ""
 
     def transition_to(self, new_phase: SessionPhase, reason: str = "") -> None:
         """Explicit state machine transition enforcing allowed lifecycle progression."""
@@ -193,15 +196,21 @@ class GameSession:
                 else "Direct candidate completion"
             )
 
-            # Turn 2: Ask Solver to reflect on the win and distill domain-general invariants
-            self.transition_to(SessionPhase.REFLECTING, "distilling level win invariants")
+            # Turn 2: Ask Solver to reflect on the win and revise/distill domain-general invariants
+            self.transition_to(SessionPhase.REFLECTING, "revising invariants after level win")
+            inv_data = game_mem.get_invariants_for_revision()
             distilled_invariants = self.solver.distill_level_win_invariants(
                 winning_candidate=winning_cand,
                 execution_summary=exec_summary,
+                active_invariants=inv_data.get("active"),
+                invalidated_invariants=inv_data.get("invalidated"),
             )
 
-            for inv in distilled_invariants:
-                game_mem.record_stratified_invariant(inv, tier=3)
+            game_mem.apply_invariant_revision(
+                revised_invariants=distilled_invariants,
+                outcome="WIN",
+                level_id=self.current_level_id,
+            )
 
             primary_inv = " | ".join(distilled_invariants) if distilled_invariants else "Satisfied level goal via coordinated alignment"
             game_mem.record_level_solution(
@@ -253,6 +262,9 @@ class GameSession:
         self.solver_reset_reason = None
         self._level_win_handled = False
         self._last_trajectory_id = None
+        self._last_attempt_failed = False
+        self._last_failure_reason = ""
+        self._last_failure_summary = ""
         self.level_initial_grid = None
         self.level_initial_grid_hash = None
         self.memory_manager.handle_level_transition(new_level_id)
@@ -292,6 +304,9 @@ class GameSession:
         self.in_persistent_fallback = False
         self._level_win_handled = False
         self._last_trajectory_id = None
+        self._last_attempt_failed = False
+        self._last_failure_reason = ""
+        self._last_failure_summary = ""
         self.memory_manager.handle_game_transition(new_game_id, self.current_level_id)
         logger.info(f"Reset session for new game {new_game_id}.")
 
@@ -331,6 +346,14 @@ class GameSession:
             self.game_over_reset_count += 1
             self.replan_requested = True
             self.active_pool = None
+            self._last_attempt_failed = True
+            self._last_failure_reason = "GAME_OVER encountered during candidate execution."
+            executed_steps = [a for a in self.level_executed_actions if a and a.upper() not in ("RESET", "ACTION7")]
+            self._last_failure_summary = (
+                f"{len(executed_steps)} actions executed before GAME_OVER: {', '.join(executed_steps[:12])}"
+                if executed_steps
+                else "Immediate GAME_OVER on action"
+            )
             self.level_executed_actions.clear()
             reset_action = {
                 "id": "RESET",
@@ -827,6 +850,21 @@ class GameSession:
 
             max_attempts = getattr(self.config, "max_chain_attempts_per_level", 5)
             if self.level_chain_attempts >= max_attempts:
+                if self._last_attempt_failed:
+                    try:
+                        self.transition_to(SessionPhase.REFLECTING, "revising invariants after attempt failure")
+                        inv_data = game_mem.get_invariants_for_revision()
+                        revised_invs = self.solver.reflect_and_revise_on_failure(
+                            execution_summary=self._last_failure_summary,
+                            failure_reason=self._last_failure_reason,
+                            active_invariants=inv_data.get("active"),
+                            invalidated_invariants=inv_data.get("invalidated"),
+                        )
+                        game_mem.apply_invariant_revision(revised_invs, outcome="FAILURE", level_id=self.current_level_id)
+                    except Exception as exc:
+                        logger.warning(f"Solver failure invariant revision failed: {exc}")
+                    finally:
+                        self._last_attempt_failed = False
                 logger.warning(f"Level chain attempt budget exhausted ({max_attempts}) for {self.current_level_id}.")
                 if self.config.enable_symbolic_fallback and getattr(self.config, "solver_exhaustion_forces_fallback", True):
                     self.in_persistent_fallback = True
@@ -836,6 +874,22 @@ class GameSession:
                     logger.warning(f"Level chain attempt budget exhausted ({max_attempts}) for {self.current_level_id}. Transitioning to next game without reset.")
                     raise LevelAttemptsExhaustedError(f"Level chain attempt budget exhausted ({max_attempts} attempts). Transitioning to next game without reset.")
             else:
+                if self._last_attempt_failed and self.level_chain_attempts > 0:
+                    try:
+                        self.transition_to(SessionPhase.REFLECTING, "revising invariants after attempt failure")
+                        inv_data = game_mem.get_invariants_for_revision()
+                        revised_invs = self.solver.reflect_and_revise_on_failure(
+                            execution_summary=self._last_failure_summary,
+                            failure_reason=self._last_failure_reason,
+                            active_invariants=inv_data.get("active"),
+                            invalidated_invariants=inv_data.get("invalidated"),
+                        )
+                        game_mem.apply_invariant_revision(revised_invs, outcome="FAILURE", level_id=self.current_level_id)
+                    except Exception as exc:
+                        logger.warning(f"Solver failure invariant revision failed: {exc}")
+                    finally:
+                        self._last_attempt_failed = False
+
                 self.level_chain_attempts += 1
                 logger.info(f"Initiating Solver planning attempt {self.level_chain_attempts}/{max_attempts} for {self.current_level_id}...")
                 solver_mm = getattr(
@@ -884,6 +938,9 @@ class GameSession:
                     logger.info(f"Solver generated {len(self.active_pool.candidates)} candidates: {'; '.join(c_summaries)}")
                 else:
                     logger.warning(f"Solver trajectory proposal failed on attempt {self.level_chain_attempts}/{max_attempts}.")
+                    self._last_attempt_failed = True
+                    self._last_failure_reason = f"Solver trajectory proposal failed on attempt {self.level_chain_attempts}/{max_attempts}."
+                    self._last_failure_summary = "No valid candidates generated."
                     if self.level_chain_attempts >= max_attempts:
                         if self.config.enable_symbolic_fallback and getattr(self.config, "solver_exhaustion_forces_fallback", True):
                             self.in_persistent_fallback = True
@@ -915,6 +972,14 @@ class GameSession:
             if exec_res.circuit_broken:
                 next_cand = self.active_pool.active_candidate() if self.active_pool else None
                 if next_cand is None:
+                    self._last_attempt_failed = True
+                    self._last_failure_reason = f"Candidate pool exhausted; circuit breaker triggered: {exec_res.error_message}"
+                    executed_steps = [a for a in self.level_executed_actions if a and a.upper() not in ("RESET", "ACTION7")]
+                    self._last_failure_summary = (
+                        f"{len(executed_steps)} actions executed before circuit break: {', '.join(executed_steps[:12])}"
+                        if executed_steps
+                        else "Candidate failed on initial step"
+                    )
                     max_attempts = getattr(self.config, "max_chain_attempts_per_level", 5)
                     if self.level_chain_attempts >= max_attempts:
                         logger.warning(f"All candidates failed and attempt budget ({max_attempts}) reached. Switching to persistent fallback.")
@@ -1128,6 +1193,14 @@ class GameSession:
                 self.active_manifest = None
                 self.active_pool = None
                 self.replan_requested = True
+                self._last_attempt_failed = True
+                self._last_failure_reason = f"Transition falsification detected: action {falsified} invalid or produced unexpected transition."
+                executed_steps = [a for a in self.level_executed_actions if a and a.upper() not in ("RESET", "ACTION7")]
+                self._last_failure_summary = (
+                    f"{len(executed_steps)} actions executed before falsification: {', '.join(executed_steps[:12])}"
+                    if executed_steps
+                    else "Falsification detected on initial step"
+                )
 
                 # Invalidate stale kinematics in GameMemory and known_actions
                 if eval_res.falsified_action:
@@ -1152,6 +1225,14 @@ class GameSession:
             elif eval_res.replan_needed or (self.active_pool is not None and self.active_pool.active_candidate() is None):
                 self.replan_requested = True
                 self.active_pool = None
+                self._last_attempt_failed = True
+                self._last_failure_reason = "Candidate trajectory exhausted or diverged from expected intermediate states."
+                executed_steps = [a for a in self.level_executed_actions if a and a.upper() not in ("RESET", "ACTION7")]
+                self._last_failure_summary = (
+                    f"{len(executed_steps)} actions executed before divergence: {', '.join(executed_steps[:12])}"
+                    if executed_steps
+                    else "Trajectory completed without reaching goal"
+                )
 
             if eval_res.reset_needed:
                 self.solver_reset_pending = True

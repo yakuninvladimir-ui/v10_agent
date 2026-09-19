@@ -391,6 +391,7 @@ class GameMemory:
     completed_levels: int = 0
     structured_invariants: list[StructuredInvariant] = field(default_factory=list)
     last_discovered_invariants: list[Any] = field(default_factory=list)
+    invalidated_invariants: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def confirmed_actors(self) -> set[str]:
@@ -469,11 +470,33 @@ class GameMemory:
         if action_id not in self.confirmed_action_effects:
             self.unconfirmed_actions[action_id] = reason
 
-    def invalidate_action_effect(self, action_id: str, level_id: str = "") -> None:
+    def invalidate_action_effect(self, action_id: str, level_id: str = "", reason: str = "") -> None:
         """Remove invalidated action effect from confirmed kinematics upon empirical falsification."""
         self.confirmed_action_effects.pop(action_id, None)
-        self.unconfirmed_actions[action_id] = "falsified_by_empirical_verifier"
+        reason_str = reason or "falsified_by_empirical_verifier"
+        self.unconfirmed_actions[action_id] = reason_str
+        inv_reason_str = reason or "falsified_by_empirical_verifier (action produced zero delta or collided with obstacle)"
         prefix = f"Action {action_id} kinematic effect:"
+        found_rule = False
+        for r in list(self.invariant_rules):
+            if r.startswith(prefix) or f"action {action_id.lower()}" in r.lower():
+                found_rule = True
+                if not any(entry.get("description") == r for entry in self.invalidated_invariants):
+                    self.invalidated_invariants.append({
+                        "description": r,
+                        "invariant_type": "kinematics",
+                        "reason": inv_reason_str,
+                        "level_id": level_id,
+                        "action_id": action_id,
+                    })
+        if not found_rule and not any(entry.get("action_id") == action_id for entry in self.invalidated_invariants):
+            self.invalidated_invariants.append({
+                "description": f"Kinematic effect of {action_id}",
+                "invariant_type": "kinematics",
+                "reason": inv_reason_str,
+                "level_id": level_id,
+                "action_id": action_id,
+            })
         self.tier1_kinematics_and_topology = [
             r for r in self.tier1_kinematics_and_topology if not r.startswith(prefix)
         ]
@@ -482,7 +505,7 @@ class GameMemory:
         ]
         for inv in self.structured_invariants:
             if action_id.lower() in inv.description.lower() and inv.invariant_type == "kinematics":
-                self.falsify_invariant(inv.invariant_id, level_id)
+                self.falsify_invariant(inv.invariant_id, level_id, reason=reason_str)
 
     def record_selection_mechanic(self, note: str) -> None:
         if note not in self.selection_mechanics:
@@ -623,7 +646,7 @@ class GameMemory:
             if len(inv.confirmed_on_levels) >= 2 or inv.confidence >= 0.7:
                 inv.ternary_status = Ternary.TRUE
 
-    def falsify_invariant(self, inv_id: str, level_id: str = "") -> None:
+    def falsify_invariant(self, inv_id: str, level_id: str = "", reason: str = "") -> None:
         """Decrease confidence and set status to Ternary.FALSE upon empirical contradiction."""
         inv = self._get_invariant(inv_id)
         if inv:
@@ -631,6 +654,89 @@ class GameMemory:
                 inv.falsified_on_levels.append(level_id)
             inv.confidence = max(0.0, inv.confidence - 0.3)
             inv.ternary_status = Ternary.FALSE
+            fail_reason = reason or "Contradicted by empirical transition / zero grid delta / boundary collision"
+            inv.metadata["falsification_reason"] = fail_reason
+            if not any(entry.get("description") == inv.description for entry in self.invalidated_invariants):
+                self.invalidated_invariants.append({
+                    "description": inv.description,
+                    "invariant_id": inv.invariant_id,
+                    "invariant_type": inv.invariant_type,
+                    "reason": fail_reason,
+                    "level_id": level_id,
+                })
+
+    def get_invariants_for_revision(self) -> dict[str, list[dict[str, Any]]]:
+        """Return active and invalidated invariants with full explanations and evidence for Solver revision."""
+        active_list = []
+        for inv in self.structured_invariants:
+            if inv.ternary_status != Ternary.FALSE:
+                evidence = []
+                if inv.confirmed_on_levels:
+                    evidence.append(f"Confirmed on {', '.join(inv.confirmed_on_levels)}")
+                if inv.source:
+                    evidence.append(f"Source: {inv.source}")
+                if inv.confidence:
+                    evidence.append(f"Confidence: {inv.confidence:.2f}")
+                if inv.metadata and "init_actor" in inv.metadata:
+                    evidence.append(f"Initial actor: {inv.metadata['init_actor']}")
+                evidence_str = "; ".join(evidence) if evidence else "Observed structural property"
+
+                active_list.append({
+                    "id": inv.invariant_id,
+                    "type": inv.invariant_type.upper(),
+                    "description": inv.description,
+                    "rule": inv.description,
+                    "evidence": evidence_str,
+                    "inclusion_reason": evidence_str,
+                    "confidence": inv.confidence,
+                })
+
+        invalidated_list = []
+        for item in self.invalidated_invariants:
+            desc = item.get("description", "")
+            r_str = item.get("reason", "Contradicted by empirical observation")
+            invalidated_list.append({
+                "description": desc,
+                "rule": desc,
+                "type": item.get("invariant_type", "GENERAL").upper(),
+                "reason": r_str,
+                "invalidation_reason": r_str,
+                "level_id": item.get("level_id", ""),
+                "action_id": item.get("action_id", ""),
+            })
+
+        return {"active": active_list, "invalidated": invalidated_list}
+
+    def apply_invariant_revision(
+        self,
+        revised_invariants: list[str],
+        outcome: str = "WIN",
+        level_id: str = "",
+    ) -> None:
+        """Apply revised invariants from Solver, updating active pool and resolving invalidated ones."""
+        if not revised_invariants:
+            return
+
+        for line in revised_invariants:
+            rule_clean = line.strip().lstrip("-*•0123456789. ")
+            if not rule_clean:
+                continue
+
+            # Check if this rule resolves or reformulates any previously invalidated invariant
+            for inv_rec in list(self.invalidated_invariants):
+                inv_desc = inv_rec.get("description", "")
+                action_match = re.search(r"ACTION\d+", inv_desc, re.IGNORECASE)
+                if action_match and action_match.group(0).lower() in rule_clean.lower():
+                    self.invalidated_invariants.remove(inv_rec)
+
+            # Record revised invariant into structured tiers
+            tier = 3 if outcome == "WIN" else 2
+            self.record_stratified_invariant(
+                rule=rule_clean,
+                tier=tier,
+                confidence=0.85 if outcome == "WIN" else 0.75,
+                source=f"solver_revision_{outcome.lower()}",
+            )
 
     def get_invariants_by_type(self, inv_type: str) -> list[StructuredInvariant]:
         return [inv for inv in self.structured_invariants if inv.invariant_type == inv_type]
