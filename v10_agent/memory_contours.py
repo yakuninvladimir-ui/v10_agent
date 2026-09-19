@@ -199,6 +199,7 @@ class EpistemicMemory:
     judgments: list[BrusentsovJudgment] = field(default_factory=list)
     live_omit_branches: list[BranchSignature] = field(default_factory=list)
     severed_null_signatures: set[str] = field(default_factory=set)
+    failed_completed_trajectories: list[tuple[str, ...]] = field(default_factory=list)
     current_level_attempts: list[dict[str, Any]] = field(default_factory=list)
     max_entries: int = 50
 
@@ -253,9 +254,40 @@ class EpistemicMemory:
             self.live_omit_branches.append(branch)
 
     def sever_branch(self, signature_id: str) -> None:
-        """Permanently sever a contradicted branch (NULL verdict)."""
+        """Permanently sever a contradicted branch (NULL verdict) or failed trajectory."""
         self.severed_null_signatures.add(signature_id)
         self.live_omit_branches = [b for b in self.live_omit_branches if b.signature_id != signature_id]
+        if " -> " in signature_id:
+            parts = tuple(s.strip() for s in signature_id.split(" -> ") if s.strip())
+            if parts and parts not in self.failed_completed_trajectories:
+                self.failed_completed_trajectories.append(parts)
+        elif signature_id.strip() and not signature_id.startswith("sig_") and not signature_id.startswith("s"):
+            parts = (signature_id.strip(),)
+            if parts not in self.failed_completed_trajectories:
+                self.failed_completed_trajectories.append(parts)
+
+    def record_failed_completed_trajectory(self, trajectory_tuple: tuple[str, ...]) -> None:
+        """Record a completed trajectory that failed to win the level."""
+        sig_tuple = tuple(trajectory_tuple)
+        if sig_tuple and sig_tuple not in self.failed_completed_trajectories:
+            self.failed_completed_trajectories.append(sig_tuple)
+
+    def is_trajectory_subsumed(self, candidate_tuple: tuple[str, ...]) -> tuple[bool, str | None]:
+        """Check if candidate trajectory is completely contained in a failed trajectory from index 0 in order.
+
+        Rule:
+        - If failed is 1-2-3-4-5-4-3-2-1:
+          * 1-2-3-4-5 is subsumed (True, prefix of length 5 matching from the start).
+          * 5-4-3-2-1 is NOT subsumed (False, does not start with action 1 from the start).
+          * 1-2-3-4-5-4-3-2-1 is subsumed (True, exact full match).
+          * 1-2-3-4-5-4-3-2-1-6 is NOT subsumed (False, extends beyond failed trajectory).
+        """
+        if not candidate_tuple:
+            return False, None
+        for failed in self.failed_completed_trajectories:
+            if len(candidate_tuple) <= len(failed) and failed[:len(candidate_tuple)] == candidate_tuple:
+                return True, " -> ".join(failed)
+        return False, None
 
     def is_severed(self, signature_id: str) -> bool:
         return signature_id in self.severed_null_signatures
@@ -286,6 +318,7 @@ class EpistemicMemory:
         self.live_omit_branches.clear()
         self.severed_null_signatures.clear()
         self.current_level_attempts.clear()
+        self.failed_completed_trajectories.clear()
 
 
 TIER_RULES = [

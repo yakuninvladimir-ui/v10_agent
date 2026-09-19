@@ -522,3 +522,113 @@ def action2(api):
     assert cand_long.active
 
 
+def test_trajectory_subsumption_matching_order_from_start():
+    """User specification test:
+
+    'если новая траектория целиком содержится в старой - отсекаем.
+     Но важно при этом отсечь именно совпадающие по порядку действия.
+     То есть если есть неудачная 1-2-3-4-5-4-3-2-1, то 1-2-3-4-5 отсекается, а 5-4-3-2-1 - нет.'
+
+    Cases:
+    1. Failed: 1-2-3-4-5-4-3-2-1
+    2. New candidate: 1-2-3-4-5 -> Subsumed prefix from start -> BLOCKED (отсекается).
+    3. New candidate: 5-4-3-2-1 -> Does not start from 0 -> NOT BLOCKED (не отсекается).
+    4. New candidate: 1-2-3-4-5-4-3-2-1 -> Exact match -> BLOCKED (отсекается).
+    5. New candidate: 1-2-3-4-5-4-3-2-1-6 -> Extends past failed trajectory -> NOT BLOCKED (не отсекается).
+    6. New candidate: 2-3-4-5 -> Sub-slice not starting from 0 -> NOT BLOCKED (не отсекается).
+    """
+    config = V10Config()
+    executor = SandboxExecutor()
+    binder = VerificationBinder()
+    verifier = LayeredVerifier(config)
+    sym_exec = SymbolicTrajectoryExecutor(config, executor, binder, verifier)
+
+    # 30x30 grid with plenty of space
+    grid = [[0] * 30 for _ in range(30)]
+    grid[15][15] = 1
+    snapshot = extract_arga_snapshot(grid)
+    pset = build_planning_set(
+        snapshot,
+        ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "RESET"],
+    )
+
+    ep_mem = EpistemicMemory(level_id="l0")
+    syntax_mem = SyntaxErrorMemory(level_id="l0")
+
+    # Record the failed 9-step trajectory: 1-2-3-4-5-4-3-2-1
+    ep_mem.sever_branch("action1 -> action2 -> action3 -> action4 -> action5 -> action4 -> action3 -> action2 -> action1")
+
+    code = """
+def action1(api):
+    return api.declare_environment_action("ACTION1")
+def action2(api):
+    return api.declare_environment_action("ACTION2")
+def action3(api):
+    return api.declare_environment_action("ACTION3")
+def action4(api):
+    return api.declare_environment_action("ACTION4")
+def action5(api):
+    return api.declare_environment_action("ACTION5")
+def action6(api):
+    return api.declare_environment_action("ACTION6")
+"""
+    manifest = {
+        "functions": [
+            {"name": f"action{i}", "parameters": []} for i in range(1, 7)
+        ]
+    }
+    module = executor.load_module(code, manifest)
+
+    # Case A: 1-2-3-4-5 is a prefix of 1-2-3-4-5-4-3-2-1 from start -> MUST BE BLOCKED
+    cand_prefix = CandidateTrajectory(
+        trajectory_id="c_prefix",
+        steps=[{"step_id": f"s{i}", "dsl_function": f"action{i}", "arguments": {}} for i in (1, 2, 3, 4, 5)],
+    )
+    pool_a = TrajectoryPool(proposal_id="p_a", candidates=[cand_prefix])
+    res_a = sym_exec.prepare_and_execute_step(pool_a, pset, module, ep_mem, syntax_mem)
+    assert res_a.verdict == StepExecutionVerdict.PRE_VERIFICATION_FAILED
+    assert res_a.circuit_broken is True
+    assert not cand_prefix.active
+
+    # Case B: 5-4-3-2-1 does NOT match from index 0 -> MUST NOT BE BLOCKED
+    cand_non_prefix = CandidateTrajectory(
+        trajectory_id="c_non_prefix",
+        steps=[{"step_id": f"s{i}", "dsl_function": f"action{i}", "arguments": {}} for i in (5, 4, 3, 2, 1)],
+    )
+    pool_b = TrajectoryPool(proposal_id="p_b", candidates=[cand_non_prefix])
+    res_b = sym_exec.prepare_and_execute_step(pool_b, pset, module, ep_mem, syntax_mem)
+    assert res_b.verdict == StepExecutionVerdict.SUCCESS
+    assert cand_non_prefix.active
+
+    # Case C: 1-2-3-4-5-4-3-2-1 exact full match -> MUST BE BLOCKED
+    cand_exact = CandidateTrajectory(
+        trajectory_id="c_exact",
+        steps=[{"step_id": f"s{idx}", "dsl_function": f"action{act}", "arguments": {}} for idx, act in enumerate((1, 2, 3, 4, 5, 4, 3, 2, 1))],
+    )
+    pool_c = TrajectoryPool(proposal_id="p_c", candidates=[cand_exact])
+    res_c = sym_exec.prepare_and_execute_step(pool_c, pset, module, ep_mem, syntax_mem)
+    assert res_c.verdict == StepExecutionVerdict.PRE_VERIFICATION_FAILED
+    assert res_c.circuit_broken is True
+    assert not cand_exact.active
+
+    # Case D: 1-2-3-4-5-4-3-2-1-6 extends beyond failed trajectory -> MUST NOT BE BLOCKED
+    cand_longer = CandidateTrajectory(
+        trajectory_id="c_longer",
+        steps=[{"step_id": f"s{idx}", "dsl_function": f"action{act}", "arguments": {}} for idx, act in enumerate((1, 2, 3, 4, 5, 4, 3, 2, 1, 6))],
+    )
+    pool_d = TrajectoryPool(proposal_id="p_d", candidates=[cand_longer])
+    res_d = sym_exec.prepare_and_execute_step(pool_d, pset, module, ep_mem, syntax_mem)
+    assert res_d.verdict == StepExecutionVerdict.SUCCESS
+    assert cand_longer.active
+
+    # Case E: 2-3-4-5 internal subslice not starting from 0 -> MUST NOT BE BLOCKED
+    cand_interior = CandidateTrajectory(
+        trajectory_id="c_interior",
+        steps=[{"step_id": f"s{i}", "dsl_function": f"action{i}", "arguments": {}} for i in (2, 3, 4, 5)],
+    )
+    pool_e = TrajectoryPool(proposal_id="p_e", candidates=[cand_interior])
+    res_e = sym_exec.prepare_and_execute_step(pool_e, pset, module, ep_mem, syntax_mem)
+    assert res_e.verdict == StepExecutionVerdict.SUCCESS
+    assert cand_interior.active
+
+

@@ -39,6 +39,11 @@ def format_sequence_signature(steps: list[dict[str, Any]]) -> str:
     return " -> ".join(format_step_signature(s) for s in steps)
 
 
+def get_trajectory_signature_tuple(steps: list[dict[str, Any]]) -> tuple[str, ...]:
+    """Format sequence of steps into a tuple of canonical step signatures."""
+    return tuple(format_step_signature(s) for s in steps)
+
+
 class StepExecutionVerdict(Enum):
     SUCCESS = "success"
     PRE_VERIFICATION_FAILED = "pre_verification_failed"
@@ -190,21 +195,38 @@ class SymbolicTrajectoryExecutor:
         fn_name = str(step_dict.get("dsl_function", ""))
         step_sig = format_step_signature(step_dict)
         full_traj_sig = format_sequence_signature(candidate.steps)
+        cand_tuple = get_trajectory_signature_tuple(candidate.steps)
 
         # 1. Pre-execution Verification
-        # 1a. Check if candidate or full trajectory is already severed in EpistemicMemory.
-        # Strict invariant: ONLY exact full matches of completed trajectories are blocked.
-        # Sub-sequences / prefixes and isolated step signatures must NOT block longer candidates.
+        # 1a. Check if candidate or full trajectory is already severed in EpistemicMemory,
+        # or if candidate trajectory is completely contained in a previously failed trajectory
+        # matching in order from the start (index 0).
+        # Rule: If failed is 1-2-3-4-5-4-3-2-1, then 1-2-3-4-5 is subsumed & severed,
+        # but 5-4-3-2-1 is NOT severed because it does not match from index 0.
+        is_subsumed = False
+        subsuming_traj = None
+        if hasattr(epistemic_memory, "is_trajectory_subsumed"):
+            is_subsumed, subsuming_traj = epistemic_memory.is_trajectory_subsumed(cand_tuple)
+
         if (
             not candidate.active
             or epistemic_memory.is_severed(candidate.trajectory_id)
             or epistemic_memory.is_severed(full_traj_sig)
+            or is_subsumed
         ):
-            logger.info(f"SymbolicExecutor: Candidate {candidate.trajectory_id} (full trajectory {full_traj_sig!r}) is severed; severing candidate.")
+            reason_detail = (
+                f"completely contained in previously failed trajectory {subsuming_traj!r}"
+                if is_subsumed
+                else f"previously severed: {full_traj_sig}"
+            )
+            logger.info(
+                f"SymbolicExecutor: Candidate {candidate.trajectory_id} ({full_traj_sig!r}) "
+                f"is rejected ({reason_detail}); severing candidate."
+            )
             candidate.sever()
             return StepExecutionResult(
                 verdict=StepExecutionVerdict.PRE_VERIFICATION_FAILED,
-                error_message=f"Candidate or full trajectory previously severed: {full_traj_sig}",
+                error_message=f"Candidate trajectory {reason_detail}",
                 circuit_broken=True,
             )
 
@@ -401,9 +423,14 @@ class SymbolicTrajectoryExecutor:
                 active_cand.sever()
                 full_sig = format_sequence_signature(active_cand.steps)
                 seq_sig = format_sequence_signature(active_cand.steps[:active_cand.cursor + 1])
+                full_tuple = get_trajectory_signature_tuple(active_cand.steps)
+                seq_tuple = get_trajectory_signature_tuple(active_cand.steps[:active_cand.cursor + 1])
                 epistemic_memory.sever_branch(full_sig)
                 epistemic_memory.sever_branch(seq_sig)
                 epistemic_memory.sever_branch(active_cand.trajectory_id)
+                if hasattr(epistemic_memory, "record_failed_completed_trajectory"):
+                    epistemic_memory.record_failed_completed_trajectory(full_tuple)
+                    epistemic_memory.record_failed_completed_trajectory(seq_tuple)
             else:
                 epistemic_memory.sever_branch(pending_step.step_id)
             cand_advanced = False
@@ -460,8 +487,11 @@ class SymbolicTrajectoryExecutor:
                     )
                 else:
                     traj_sig = format_sequence_signature(active_cand.steps)
+                    traj_tuple = get_trajectory_signature_tuple(active_cand.steps)
                     epistemic_memory.sever_branch(traj_sig)
                     epistemic_memory.sever_branch(active_cand.trajectory_id)
+                    if hasattr(epistemic_memory, "record_failed_completed_trajectory"):
+                        epistemic_memory.record_failed_completed_trajectory(traj_tuple)
                     epistemic_memory.record_attempt_feedback(
                         hypothesis=f"Candidate {active_cand.trajectory_id}",
                         trajectory_summary=traj_sig,
