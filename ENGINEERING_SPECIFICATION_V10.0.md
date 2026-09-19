@@ -1,56 +1,60 @@
 # ARC-AGI-3 LCLD Agent
-# Engineering Specification — Version 10.0
-# (Tri-Agent Implementation Contracts, Independent Symbolic Execution, Multi-Candidate Reset Traversal & Brusentsov Verification)
+# Engineering Specification — Version 10.1-r1
+# (Tri-Agent Implementation Contracts, Independent Symbolic Execution, Multi-Candidate Reset Traversal, 4-Valued Brusentsov Logic, Persistent Object Grounding & Safe Evidence Probing)
 
 ---
 
 ## 0. Engineering Objective
 
-This document provides the complete, authoritative implementation specification for the **ARC-AGI-3 LCLD Agent (Version 10.0)**. An engineer reading this document should be able to implement or maintain the complete codebase from scratch without ambiguity, external documentation, or prior version references.
+This document provides the complete, authoritative implementation specification for the **ARC-AGI-3 LCLD Agent (Version 10.1-r1)**. An engineer reading this document should be able to implement or maintain the complete codebase from scratch without ambiguity, external documentation, or prior version references.
 
 The system implements:
 1. **Deterministic Perception**: ARGA-Lite object extraction, topological cavity detection, substantive spatial relation filtering, and freedom of motion bounds.
-2. **Tri-Agent Role Hierarchy**: Independent LLM call families for Explorer, Coder, and Solver with complete, non-overlapping authority, enforced by strict ISO-1 through ISO-8 isolation invariants (including ISO-2 curriculum quarantine shielding Coder from puzzle goals).
+2. **Tri-Agent Role Hierarchy**: Independent LLM call families for Explorer, Coder, and Solver with complete, non-overlapping authority, enforced by strict ISO-1 through ISO-10 isolation invariants (including ISO-2 curriculum quarantine shielding Coder from puzzle goals).
 3. **Strict Stratified Memory Contours**: `EnvironmentSpecMemory`, `SyntaxErrorMemory`, `EpistemicMemory`, and cross-level `GameMemory` with Tier 1 kinematics protection and Brusentsov cross-level invariant re-evaluation.
 4. **Independent Symbolic Trajectory Executor**: Pre-execution signature verification, sandbox isolation, dynamic argument filtering, and circuit-breaking.
 5. **Multi-Trajectory Candidate Pool Traversal & 5-Attempt Ceiling**: The Solver is invoked for full multi-step trajectory packages (up to 4 candidates per package) with a hard limit of 5 planning attempts per level (`max_chain_attempts_per_level = 5`, ~10–20 candidate trajectories total). Under **no circumstances** is the Solver called per step; execution is handled deterministically step-by-step by the `SymbolicTrajectoryExecutor` from clean initial states ($S_0$) via environmental `RESET`.
 6. **Unified Hybrid Environment Support**: Seamless classification and execution of hybrid environments (`active_pipeline = "hybrid"`) where discrete buttons (`ACTION1..5`) and coordinate clicks (`ACTION6`) coexist, scheduling probing without mutual lockout.
 7. **Domain-General Memory-Based Invariant Deduction**: Zero game-specific prompt bindings; invariants are deduced by the LLM from empirical memory, object affordances, and the short-term trial scratchpad.
-8. **Brusentsov 3-Valued Logic ($xy \lor xy'_0 \lor x'y'$)**: Mathematical realization in `brusentsov_logic.py` and active step consequence checking via `implies_brusentsov(expected_propositions, observed_propositions)` in `LayeredVerifier`.
+8. **Brusentsov 4-Valued Logic & Strict 8-Tier Verification**: Mathematical realization of 4-valued judgments (`FOLLOW`, `OMIT`, `NULL`, `UNDECIDED`) in `brusentsov_logic.py`, `EpistemicSignal` segregation (ISO-9), and strict 8-tier cascade in `LayeredVerifier` with ISO-10 expectation non-severance.
 9. **Robust State Orchestration & Safe Fallback**: No dirty-board cascading, clean-state resets on contradiction, single-reset `GAME_OVER` invariant, and Virtual Sandbox candidate repair without index 0 hijacking.
 10. **Offline Packaging**: Self-extracting LZMA base64 packaging complying with Kaggle limits (< 985 KB).
+11. **Persistent Object Tracking & Identity Grounding**: Multi-frame object permanence in `tracker.py` using centroid distance, IoU matching, track confidence decay, and ambiguity scoring wired into `PlanningSet` and `LayeredVerifier`.
+12. **Safe Evidence-Seeking Loop & Strict NOOP Elimination**: Epistemic probe queue in `session.py` (Section 3.8 of `act()`) emitting real actions (`ACTION1..7`), bounded by `max_evidence_probes_per_level = 2` and streak limit fallback to `NULL`. Strictly zero `NOOP` emission.
+13. **MTP=3 Speculative Decoding & Safe Boot Fallback**: Speculative execution ($k=3$) for Qwen 3.8 27B via vLLM with automated non-speculative restart on server boot crashes.
 
 ---
 
 ## 1. Module Architecture & File Layout
 
-Active package root: `v10_agent/` (27 core source files + 4 prompt builder files)
+Active package root: `v10_agent/` (28 core source files + 4 prompt builder files)
 
 ```
 v10_agent/
 ├── __init__.py                                 # Package exports and version metadata
 ├── action_adapter.py                           # Action adapter and normalization
 ├── arga_lite.py                                # Deterministic ARGA-Lite perception & relation extraction
-├── brusentsov_logic.py                         # Ternary Enum and implies_brusentsov operator
-├── config.py                                   # V10Config dataclass with environment overrides
+├── brusentsov_logic.py                         # 4-valued Verdict, EpistemicSignal, and implies_brusentsov operator
+├── config.py                                   # V10Config dataclass with environment overrides & MTP CLI builder
 ├── dsl_coder.py                                # Coder Agent (Call 2) & SandboxedModule compiler
 ├── explorer_agent.py                           # Explorer Agent (Call 1) & PrimitiveProbeManager
 ├── fallback_symbolic.py                        # Deterministic symbolic fallback engine
 ├── frame_media.py                              # Visual rendering: dual-frame raw and annotated PNG
 ├── game_adapter.py                             # Competition environment and game interface adapter
-├── judge.py                                    # LayeredVerifier with multi-signal ground-truth verification
+├── judge.py                                    # LayeredVerifier with strict 8-tier decision cascade & ISO-10
 ├── llm_advisor.py                              # LLM client supporting vLLM, OpenAI, DashScope, and Ollama
 ├── logging.py                                  # Structured JSON audit and session logger
-├── memory_contours.py                          # Stratified 3-tier memory stores & MemoryContourManager
+├── memory_contours.py                          # Stratified 3-tier memory stores, EpistemicMemory & MemoryContourManager
 ├── observe.py                                  # Observation normalization and border cropping
 ├── planning_set.py                             # PlanningSet, PlanningObject, SpatialRelation, CoordinateCandidate
 ├── policy.py                                   # Action selection policy and fallback arbitration
 ├── sandbox.py                                  # Restricted AST checker and SandboxExecutor
-├── session.py                                  # GameSession top-level state machine orchestrator
+├── session.py                                  # GameSession top-level orchestrator & safe evidence-seeking loop
 ├── solver_agent.py                             # Solver Agent (Call 3), XML parser & reflection engine
-├── symbolic_executor.py                        # Independent SymbolicTrajectoryExecutor controller
-├── trajectory.py                               # CandidateTrajectory and TrajectoryPool
-├── types.py                                    # Core types: Grid2D, ActionId, BoundingBox, Centroid
+├── symbolic_executor.py                        # Independent SymbolicTrajectoryExecutor controller & UNDECIDED handling
+├── tracker.py                                  # PersistentObjectTracker & TrackedObject multi-frame identity
+├── trajectory.py                               # CandidateTrajectory (with is_severed) and TrajectoryPool
+├── types.py                                    # Core types: Grid2D, ActionId, BoundingBox, Centroid, Propositions
 ├── universal_invariants.py                     # Universal algebraic & collinear axial invariant discovery
 ├── verification.py                             # VerificationBinder and PropositionSet grounding
 ├── verifier_packet.py                          # Structured symbolic verifier packet
@@ -112,6 +116,27 @@ class V10Config:
     reasoning_budget_tokens: int = 32000
     qwen_reasoning_budget_tokens: int = 32000
 
+    # Speculative Decoding & Multi-Token Prediction (MTP=3 for Qwen 3.8 27B)
+    vllm_mtp_enabled: bool = True                          # Enable MTP speculative decoding
+    vllm_mtp_tokens: int = 3                               # k=3 prediction depth
+    vllm_speculative_method: str = "mtp"                   # Speculative method
+    vllm_speculative_model: str | None = None              # Optional draft model path
+    vllm_speculative_config: str | None = None             # Optional raw JSON override
+    vllm_speculative_cli_format: str = "auto"              # "auto" | "config_json" | "spec_tokens" | "speculative_model"
+
+    # V10.1-r1 4-Valued Logic & Persistent Tracking Parameters
+    enable_undecided_verdict: bool = True                  # Enable Verdict.UNDECIDED
+    enable_persistent_tracker: bool = True                 # Multi-frame object identity tracking
+    max_evidence_probes_per_level: int = 2                 # Strict ceiling on evidence-seeking probes per level
+    max_undecided_streak: int = 2                          # Maximum consecutive UNDECIDED verdicts before NULL fallback
+    tracker_iou_threshold: float = 0.3                     # Minimum bounding-box IoU for track match
+    tracker_max_distance: float = 5.0                      # Maximum centroid pixel distance for track match
+    tracker_max_missed_frames: int = 2                     # Frame threshold before retiring lost tracks
+    tracker_confidence_decay: float = 0.85                 # Multiplicative decay per missed frame
+    tracker_ambiguity_threshold: float = 0.5               # Ambiguity score threshold triggering UNDECIDED
+    undecided_min_remaining_actions: int = 25              # Threshold below which evidence seeking is auto-disabled
+    strict_8tier_order: bool = True                        # Enforce strict 8-tier verification cascade
+
     # Perception
     crop_border_pixels: int = 1                            # 1 px crop to eliminate frame borders
 
@@ -143,16 +168,49 @@ class V10Config:
 
 ## 3. Core Data Structures & Models
 
-### 3.1 Brusentsov Ternary Logic (`v10_agent/brusentsov_logic.py`)
+### 3.1 Brusentsov 4-Valued Logic & Epistemic Signals (`v10_agent/brusentsov_logic.py`)
 
 ```python
 class Ternary(Enum):
     TRUE = 1          # FOLLOW: Necessary implication held; physical progress made
     FALSE = -1        # NULL: Contradiction; wall collision; branch severed
     IRRELEVANT = 0    # OMIT: Non-contradicting step; entity toggle; branch kept live
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Verdict):
+            return other == self
+        return super().__eq__(other)
+
+
+class EpistemicSignal(Enum):
+    """Controller signals. Not truth values (ISO-9)."""
+    SEEK_EVIDENCE = 1
+
+
+class Verdict(Enum):
+    """Full judge verdict = logical value or epistemic signal."""
+    FOLLOW = "FOLLOW"        # maps to Ternary.TRUE
+    NULL = "NULL"            # maps to Ternary.FALSE
+    OMIT = "OMIT"            # maps to Ternary.IRRELEVANT
+    UNDECIDED = "UNDECIDED"  # maps to EpistemicSignal.SEEK_EVIDENCE
+
+    @property
+    def ternary(self) -> Ternary | None:
+        if self is Verdict.FOLLOW:
+            return Ternary.TRUE
+        if self is Verdict.NULL:
+            return Ternary.FALSE
+        if self is Verdict.OMIT:
+            return Ternary.IRRELEVANT
+        return None
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Ternary):
+            return self.ternary == other
+        return super().__eq__(other)
 ```
 
-#### The `implies_brusentsov` Operator:
+#### The `implies_brusentsov` Operator & ISO-10:
 $$x \Rightarrow y \equiv xy \lor xy'_0 \lor x'y'$$
 
 ```python
@@ -190,6 +248,7 @@ def implies_brusentsov(expected: PropositionSet, observed: PropositionSet) -> Te
 
     # 3. Inessential missing effect without physical contradiction (OMIT check: x'y' -> IRRELEVANT)
     return Ternary.IRRELEVANT
+```
 
 def evaluate_invariant_across_levels(
     invariant: StructuredInvariant,
@@ -258,6 +317,26 @@ class PlanningObject:
     compact_ascii: list[str] = field(default_factory=list)
     mask: tuple[tuple[int, ...], ...] = field(default_factory=tuple)
     filled_mask: tuple[tuple[int, ...], ...] = field(default_factory=tuple)
+    persistent_id: str | None = None # Temporal identity assigned by PersistentObjectTracker
+    track_confidence: float = 1.0    # Confidence score from multi-frame tracker
+
+
+@dataclass
+class TrackedObject:
+    """Persistent object identity tracked across successive frames."""
+    track_id: str                    # Stable identity (e.g. "track_0")
+    color: int
+    area: int
+    bbox: BoundingBox
+    centroid: Centroid
+    shape_signature: str
+    filled_shape_signature: str
+    age: int = 1                     # Total frames this track has existed
+    hit_streak: int = 1              # Consecutive frames matched
+    missed_frames: int = 0           # Consecutive frames unobserved
+    confidence: float = 1.0          # Decays exponentially on missed frames
+    history: list[Centroid] = field(default_factory=list)
+
 
 @dataclass(frozen=True)
 class SpatialRelation:
@@ -271,7 +350,13 @@ class SpatialRelation:
     metric_value: float | None = None
 ```
 
-#### 3.2.1 Action Space Invariant & Exclusion of ACTION7 (Undo)
+#### 3.2.1 Registered Change-Centric Proposition Families
+`REGISTERED_PROPOSITION_FAMILIES` registers propositions evaluating state changes over time:
+- `"cumulative_motion"`: Delta accumulation over multiple steps ($\Delta r, \Delta c$).
+- `"shape_stability"`: Shape invariance check across transitions ($1 = \text{preserved}, 0 = \text{deformed}$).
+- `"occlusion"`: Visual layering / occlusion detection.
+
+#### 3.2.2 Action Space Invariant & Exclusion of ACTION7 (Undo)
 Under competition conditions, `ACTION7` is fixed as an `Undo` operation in the ARC-AGI-3 environment. The V10 architecture fundamentally does not use `ACTION7`:
 1. **Epistemic State Consistency**: Rather than attempting reverse-step backtracking via `Undo` (which creates ambiguous intermediate states, complicates invariant tracking, and risks infinite oscillatory loops), the agent relies on clean-slate restarts ($S_0$) via environment `RESET`.
 2. **Deterministic Forward Traversal**: All candidate execution is strictly forward-directed. `ACTION7` is deliberately excluded from `PlanningSet.allowed_action_ids`, primitive probing, and code generation prompts to enforce unambiguous trajectory evaluation.
@@ -287,6 +372,8 @@ class GroundedStep:
     dsl_function: str                # "action1", "action6", ...
     arguments: dict[str, Any]        # Grounded planning IDs or coordinates
     expected_propositions: PropositionSet
+    confidence: str = "confirmed"    # "confirmed" | "low" | "unconfirmed" (ISO-10)
+    matching_status: str = "exact"   # "exact" | "ambiguous" | "none"
 
 @dataclass
 class CandidateTrajectory:
@@ -307,6 +394,10 @@ class CandidateTrajectory:
 
     def sever(self) -> None:
         self.active = False
+
+    @property
+    def is_severed(self) -> bool:
+        return not self.active
 
     def is_finished(self) -> bool:
         return self.cursor >= len(self.steps) or not self.active
@@ -445,6 +536,25 @@ class GameMemory:
         and winning macros are strictly excluded, shielding DSL synthesis from goal leakage.
         """
         ...
+
+
+@dataclass
+class EpistemicMemory:
+    """Stores declarative judgments and epistemic signals for the active level."""
+    level_id: str
+    judgments: list[BrusentsovJudgment] = field(default_factory=list)
+    epistemic_signals: list[EpistemicSignal] = field(default_factory=list) # ISO-9 segregated controller signals
+    severed_null_signatures: set[str] = field(default_factory=set)
+    live_omit_branches: list[dict[str, Any]] = field(default_factory=list)
+    current_level_scratchpad: list[dict[str, Any]] = field(default_factory=list)
+
+    def record_judgment(self, judgment: BrusentsovJudgment) -> None:
+        """Record truth-valued judgment (FOLLOW, NULL, OMIT)."""
+        self.judgments.append(judgment)
+
+    def record_signal(self, signal: EpistemicSignal) -> None:
+        """Record controller signal (ISO-9). Segregated from truth-value judgments."""
+        self.epistemic_signals.append(signal)
 
 @dataclass
 class UniversalInvariant:
@@ -737,6 +847,53 @@ Implemented in `v10_agent/frame_media.py` and `v10_agent/prompt_builders/solver_
 - Aggregates small dots ($area \le 2$) of identical color into composite marker groups (`marker_group_color_{c}` / `marker_dots_c{c}`).
 - Quadrant-balanced salience sorting (TL, TR, BL, BR + confirmed actors) preventing visual/spatial bias.
 
+### 5.4 Persistent Object Tracking & Strict 8-Tier Cascade Implementation
+
+#### 5.4.1 Tracker Matching Algorithm (`v10_agent/tracker.py`)
+`PersistentObjectTracker.update(snapshot_or_objects)` executes a greedy bipartite match between existing `TrackedObject` tracks and detected `PlanningObject` instances:
+1. Matches candidates using bounding-box IoU ($\ge 0.3$) and centroid Euclidean distance ($\le 5.0$ px).
+2. Computes ambiguity margin between top-1 and top-2 match scores; if margin $< 0.1$, flags `last_ambiguity_score > 0.5`.
+3. Updates matched tracks: `confidence = 1.0`, `hit_streak += 1`, `missed_frames = 0`, appends centroid to `history`.
+4. Updates unmatched tracks: `missed_frames += 1`, `confidence *= 0.85`. Tracks with `missed_frames > 2` are retired.
+
+#### 5.4.2 Strict 8-Tier Decision Cascade (`v10_agent/judge.py`)
+`LayeredVerifier.evaluate_transition` executes the immutable 8-tier decision cascade enforcing ISO-10:
+
+```python
+# Tier 1: Syntactic & Invariant Malformation
+if malformed_arguments or invariant_malformation:
+    return BrusentsovJudgment(verdict=Verdict.NULL, explanation="Tier 1: Malformed step syntax or invariant")
+
+# Tier 2: Fatal Domain Violations (Zero displacement on confirmed directional motion)
+if is_confirmed_motion and zero_grid_delta:
+    return BrusentsovJudgment(verdict=Verdict.NULL, explanation="Tier 2: Confirmed motion yielded zero delta (collision)")
+
+# Epistemic Uncertainty Short-Circuit (ISO-10)
+if (getattr(step, "confidence", "confirmed") in ("low", "unconfirmed")
+    or getattr(step, "matching_status", "exact") == "ambiguous"
+    or (tracker and tracker.last_ambiguity_score > tracker.ambiguity_threshold)):
+    return BrusentsovJudgment(verdict=Verdict.UNDECIDED, explanation="Epistemic uncertainty short-circuit")
+
+# Tier 3: Physical Contradiction (Direct contradiction between expected and observed)
+if any(contradicts(e, o) for e in expected for o in observed):
+    return BrusentsovJudgment(verdict=Verdict.NULL, explanation="Tier 3: Physical contradiction in propositions")
+
+# Tier 4: Necessary Containment (Affirmation / FOLLOW)
+if all(is_necessarily_contained(e, observed) for e in expected):
+    return BrusentsovJudgment(verdict=Verdict.FOLLOW, explanation="Tier 4: Necessary containment satisfied")
+
+# Tier 5: Downstream Disconfirmation (High confidence step violated confirmed physics)
+if confirmed_physics_violated:
+    return BrusentsovJudgment(verdict=Verdict.NULL, explanation="Tier 5: Downstream disconfirmation")
+
+# Tier 6: Downstream Ambiguity / Unconfirmed Delta
+if zero_grid_delta and not is_confirmed_motion:
+    return BrusentsovJudgment(verdict=Verdict.UNDECIDED, explanation="Tier 6: Zero delta on unconfirmed action")
+
+# Tier 7 & 8: Irrelevant Frame Noise & Default Fallback
+return BrusentsovJudgment(verdict=Verdict.OMIT, explanation="Tier 7/8: Benign passive transition")
+```
+
 ---
 
 ## 6. Independent Symbolic Trajectory Executor (`v10_agent/symbolic_executor.py`)
@@ -862,7 +1019,7 @@ def evaluate_transition(
         cand_severed = False
         cand_finished = (active_cand is None or active_cand.is_finished()) if active_pool else True
 
-    elif judgment.verdict == Ternary.FALSE:
+    elif judgment.verdict == Verdict.NULL:
         if active_cand is not None:
             active_cand.sever()
             seq_sig = " -> ".join(str(s.get("dsl_function", "")) for s in active_cand.steps[:active_cand.cursor + 1])
@@ -871,7 +1028,17 @@ def evaluate_transition(
         cand_severed = True
         cand_finished = True
 
-    else:  # Ternary.IRRELEVANT
+    elif judgment.verdict == Verdict.UNDECIDED:
+        # Candidate not severed, cursor held, evidence probe needed (ISO-9 / ISO-10)
+        cand_advanced = False
+        cand_severed = False
+        cand_finished = False
+        evidence_needed = True
+        evidence_hint = getattr(judgment, "explanation", "Epistemic uncertainty requires evidence probe")
+        replan_needed = False
+        reset_needed = False
+
+    else:  # Verdict.OMIT
         if active_cand is not None:
             active_cand.advance()
         cand_advanced = True
@@ -890,6 +1057,9 @@ def evaluate_transition(
 
     # Multi-Candidate Pool Traversal via RESET
     if is_won:
+        replan_needed = False
+        reset_needed = False
+    elif judgment.verdict == Verdict.UNDECIDED:
         replan_needed = False
         reset_needed = False
     elif cand_finished:
@@ -911,6 +1081,7 @@ def evaluate_transition(
         candidate_advanced=cand_advanced, candidate_severed=cand_severed,
         replan_needed=replan_needed, reset_needed=reset_needed,
         falsification_detected=falsification_detected, falsified_action=falsified_action,
+        evidence_needed=evidence_needed, evidence_hint=evidence_hint,
     )
 ```
 
@@ -1050,30 +1221,65 @@ else:
 
 In `hybrid` environments, spatial coordinate clicks and discrete button presses coexist. The agent avoids artificial mode separation: both discrete sweep probes and coordinate hypothesis probes are enqueued directly into `self.probe_queue`. After probing completes, a clean `RESET` is executed before any Solver candidate trajectory executes from pristine state $S_0$.
 
+### 7.5 Safe Evidence-Seeking Loop & Strict NOOP Elimination (`v10_agent/session.py`)
+When `SymbolicTrajectoryExecutor` issues a `Verdict.UNDECIDED`:
+
+```python
+# 3.8. V10.1 Evidence-Seeking Blocking Dispatch (Strict NOOP Prohibition)
+if self.evidence_seeking_active:
+    if self.probe_queue:
+        probe_action_item = self.probe_queue.pop(0)
+        probe_action = probe_action_item.to_dict() if hasattr(probe_action_item, "to_dict") else dict(probe_action_item)
+        self.last_probe_action = probe_action
+        self.last_snapshot = snapshot
+        self.last_planning_set = planning_set
+        self.pending_action = probe_action
+        self.pending_step = None
+        self.last_engine_action = str(probe_action.get("action_id") or probe_action.get("id") or "ACTION1").upper()
+        self.evidence_probes_executed += 1
+        return probe_action
+    else:
+        # Probe queue exhausted: fall through cleanly to NULL (sever candidate + clean reset)
+        self.undecided_fallback_to_null += 1
+        self.evidence_seeking_active = False
+        self.undecided_streak = 0
+        self.pending_step_snapshot = None
+        if self.active_pool and self.active_pool.active_candidate():
+            self.active_pool.active_candidate().sever()
+        self.solver_reset_pending = True
+        self.solver_reset_reason = "evidence_probe_exhausted_null"
+```
+
 ---
 
 ## 8. Verification & Validation Commands
 
-All **191 unit tests** across 38 test files validate every module, invariant, and mathematical formulation:
+All **235 unit tests** across 45 test files validate every module, invariant, and mathematical formulation:
 
 ```powershell
-# Run complete test suite (191 tests across 38 test files)
+# Run complete test suite (235 tests across 45 test files)
 py -3.12 -m pytest v10_agent/tests
 
 # Compile and build self-extracting Kaggle notebook
 py -3.12 build_notebook_v10.py
 
-# Verify dynamic kinematics and falsification reprobe
-py -3.12 -m pytest v10_agent/tests/test_dynamic_falsification_and_reprobe.py
+# Run standalone Phase-A structural preflight check
+py -3.12 lcld_preflight.py
 
-# Verify stratified memory and topological judge
-py -3.12 -m pytest v10_agent/tests/test_stratified_memory_and_topological_judge.py
+# Verify Phase 1 (4-valued logic, Verdict, Tracker dataclasses)
+py -3.12 -m pytest v10_agent/tests/test_v10_1_phase1.py
 
-# Verify collinear axis detection and universal clean reset
-py -3.12 -m pytest v10_agent/tests/test_collinear_axis_and_clean_reset.py
+# Verify Phase 2 (Strict 8-tier cascade & ISO-10 compliance)
+py -3.12 -m pytest v10_agent/tests/test_v10_1_phase2.py
 
-# Verify dual multimodal frame rendering
-py -3.12 -m pytest v10_agent/tests/test_universal_multimodal_dual_view.py
+# Verify Phase 3 (Change-centric propositions & persistent grounding)
+py -3.12 -m pytest v10_agent/tests/test_v10_1_phase3.py
+
+# Verify Phase 4 (Safe evidence-seeking loop & NOOP elimination)
+py -3.12 -m pytest v10_agent/tests/test_v10_1_phase4.py
+
+# Verify vLLM MTP=3 speculative decoding and graceful fallback
+py -3.12 -m pytest v10_agent/tests/test_vllm_mtp_config.py
 ```
 
 ---
@@ -1086,7 +1292,7 @@ py -3.12 -m pytest v10_agent/tests/test_universal_multimodal_dual_view.py
 3. Declarative planning is separated from execution: Solver proposes XML trajectories; Symbolic Executor runs step-by-step.
 4. Trajectory budget ceiling: Solver plans full multi-step trajectory packages within a hard limit of 5 attempts per level (max_chain_attempts_per_level = 5, ~10-20 candidates total). The Solver is NEVER called per step.
 5. Unified hybrid pipeline: Seamless execution of hybrid environments (active_pipeline = "hybrid") combining discrete actions and coordinate clicks without artificial mode lockout.
-6. Transitions are judged by Brusentsov necessary implication: xy (FOLLOW), xy'_0 (OMIT), x'y' (NULL). Active consequence checking via implies_brusentsov verifies asserted EXPECT: propositions.
+6. Transitions are judged by Brusentsov necessary implication: xy (FOLLOW), xy'_0 (OMIT), x'y' (NULL), and epistemic uncertainty (UNDECIDED). Active consequence checking via implies_brusentsov verifies asserted EXPECT: propositions.
 7. Perception is filtered: Directional navigation relations strictly exclude 1-pixel cavities and noise dots.
 8. The board is protected: Multi-candidate pools execute sequentially via RESET without premature replanning; contradictions trigger clean resets.
 9. Zero game-specific bias: No hardcoded game keywords, quadrant templates, or movement assumptions.
@@ -1094,4 +1300,8 @@ py -3.12 -m pytest v10_agent/tests/test_universal_multimodal_dual_view.py
 11. Stratified 3-tier memory with cross-level sanitization: Knowledge is partitioned into Physics (Tier 1), Interaction Dynamics (Tier 2), and Deduced Rules (Tier 3), preserving kinematics world laws while sanitizing transient local colors and coordinates.
 12. Strict ISO-2 curriculum quarantine: Coder empirical context strictly excludes Tier 3 rules, goal invariants, and winning macros, preventing goal leakage into DSL synthesis.
 13. Virtual Sandbox non-override: Forward simulation repairs candidates by truncating collisions, but never hijacks position 0 ahead of LLM candidates.
+14. 4-Valued Brusentsov Logic (ISO-9): Logical truth values (FOLLOW, OMIT, NULL) are strictly segregated from controller signals (UNDECIDED). Epistemic signals must never be treated as truth values.
+15. Strict Containment (ISO-10): Raw LLM expectation mismatches without physical invariant breaches never emit NULL, preventing catastrophic trajectory severance.
+16. Strict NOOP Elimination: The agent strictly never emits NOOP to the Arcade runtime under any condition. Probes strictly use real available actions (ACTION1..7), falling through to NULL if probe queue is exhausted.
+17. Speculative MTP=3 with Graceful Boot Fallback: Speculative model execution failure automatically re-launches standard non-speculative serving without crashing the competition run.
 ```

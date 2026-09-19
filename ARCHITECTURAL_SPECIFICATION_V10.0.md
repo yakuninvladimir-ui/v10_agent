@@ -1,12 +1,12 @@
 # ARC-AGI-3 LCLD Agent
-# Architectural Specification — Version 10.0
-# (Tri-Agent Hierarchy, Independent Symbolic Execution, Multi-Trajectory Reset Traversal, Hybrid Environment Support & Brusentsov Ternary Logic)
+# Architectural Specification — Version 10.1-r1
+# (Tri-Agent Hierarchy, Independent Symbolic Execution, Multi-Trajectory Reset Traversal, Hybrid Environment Support, 4-Valued Brusentsov Logic, Persistent Object Grounding, Safe Evidence-Seeking Loop & MTP=3 Acceleration)
 
 ---
 
 ## 0. Purpose and Architectural Vision
 
-This document defines the Version 10.0 architecture of the **ARC-AGI-3 LCLD (Locally Constrained Learning and Discovery) Agent**. The agent is engineered to operate autonomously under:
+This document defines the Version 10.1-r1 architecture of the **ARC-AGI-3 LCLD (Locally Constrained Learning and Discovery) Agent**. The agent is engineered to operate autonomously under:
 
 1. **Hidden environment mechanics, hybrid action spaces (A+B), and dynamic action surfaces** across diverse, unseen ARC-AGI-3 grid environments;
 2. **Deterministic, object-centric perception** grounded by ARGA-Lite and an immutable `PlanningSet`;
@@ -17,7 +17,7 @@ This document defines the Version 10.0 architecture of the **ARC-AGI-3 LCLD (Loc
 7. **An Independent Symbolic Trajectory Executor** that physically decouples declarative trajectory generation (Qwen Solver) from verification (Judge) and environment interaction;
 8. **Multi-Trajectory Candidate Pool Traversal via Clean RESET**: Sequential execution of multiple proposed candidate trajectories through environmental `RESET` without premature Solver replanning;
 9. **Full Multi-Step Trajectory Packages with Strict Budget Ceilings**: Solver plans complete multi-step trajectory packages (2–4 candidates of 10–30 steps) under a strict ceiling of 5 attempts per level (~10–20 trajectories total per level), completely eliminating per-step LLM invocations;
-10. **Brusentsov 3-Valued Logic ($xy \lor xy'_0 \lor x'y'$) & Active Consequence Verification**: Mathematical and operational evaluation of physical progress (FOLLOW: $+1$), benign non-contradictory neutrality (OMIT: $0$), and physical contradictions (NULL: $-1$) powered by explicit `EXPECT:` proposition checking;
+10. **Brusentsov 4-Valued Logic ($xy \lor xy'_0 \lor x'y'$) & Active Consequence Verification**: Mathematical and operational evaluation of physical progress (FOLLOW: $+1$), benign non-contradictory neutrality (OMIT: $0$), physical contradictions (NULL: $-1$), and epistemic uncertainty (UNDECIDED: SEEK_EVIDENCE) powered by explicit `EXPECT:` proposition checking;
 11. **Hybrid Environment Support (A+B)**: Seamless unified handling of discrete actions (`ACTION1..5`), spatial coordinate clicks (`ACTION6`), and hybrid mixtures without mutual exclusion or artificial mode barriers;
 12. **Double-Loop Learning** with domain-specific error routing (syntax/execution faults to Coder; physical/logical outcomes to Solver);
 13. **Substantive Perception Filtering & Motion Freedom Grounding** preventing distractors, background cavities, and wall collisions from derailing the planning loop;
@@ -25,8 +25,12 @@ This document defines the Version 10.0 architecture of the **ARC-AGI-3 LCLD (Loc
 15. **Dual-Signal Dynamic Kinematics & Empirical Falsification**: Detection of action nullity on pristine board ($S_0$) triggering immediate invalidation of falsified kinematics in `GameMemory`, pruning of known actions, clean board reset, and focused micro-reprobing;
 16. **Stratified 3-Tier Episodic and Cross-Level Memory Hierarchy**: Disjoint stratification of Foundational Physics & Kinematics (Tier 1), Interaction Dynamics & Selection (Tier 2), and High-Level Invariant Rules & Curriculum (Tier 3), featuring confirmed actor tracking, Tier 1 displacement preservation, and ISO-2 curriculum quarantine;
 17. **Dynamic Cross-Level Invariant Discovery & Re-evaluation**: Progressive accumulation, cross-level diffing, and active ternary re-evaluation of structural invariants as level complexity increases;
-18. **Solver Two-Turn Reflection & Win Invariant Distillation**: Epistemic reflection upon level win where Solver distills domain-general invariants and strategies into curriculum memory without button-sequence pollution;
-19. **Universal Multimodal Dual-View Perception**: Dual-frame visual projection (unannotated raw frame + bounding-box labeled annotated frame with indicator marker grouping and quadrant-balanced salience).
+18. **Solver Two-Turn Reflection & Win/Loss Invariant Revision**: Epistemic reflection upon level win and failure where Solver distills and revises domain-general invariants and strategies into curriculum memory without button-sequence pollution;
+19. **Universal Multimodal Dual-View Perception**: Dual-frame visual projection (unannotated raw frame + bounding-box labeled annotated frame with indicator marker grouping and quadrant-balanced salience);
+20. **Persistent Object Grounding & Multi-Frame Identity Tracking**: Object permanence via `PersistentObjectTracker` and `TrackedObject` (centroid displacement, IoU overlap, confidence decay, track history) preventing distractor hopping and object ID flicker across planning sets;
+21. **Safe Evidence-Seeking Loop with Strict NOOP Elimination**: Targeted probe actions (`ACTION1..7`, strictly never `NOOP`) executed on epistemic uncertainty (`UNDECIDED`) within strict probe budgets (`max_evidence_probes_per_level = 2`, action threshold $\ge 25$, streak limits) without premature candidate severing or resetting;
+22. **Speculative Model Acceleration with MTP=3 for Qwen 3.8 27B**: Native $k=3$ prediction depth for Qwen 3.8 27B via vLLM (`--speculative-config` / `--speculative-tokens 3`), environment variable propagation, and automatic non-speculative fallback on boot failure;
+23. **Strict 8-Tier Decision Cascade & ISO-10 Compliance**: Rigorous decision order in `LayeredVerifier` guaranteeing that simple expectation mismatches do not yield false `NULL` verdicts when physical invariants remain intact.
 
 ### 0.1 What the Architecture Is NOT
 - It is **not** a monolithic prompt-loop that asks a language model to "play the game" by generating raw action keys.
@@ -50,9 +54,9 @@ Authority is strictly ordered from highest to lowest:
 ```
 1. Gateway & Environment Contracts (Arcade/env.step, official RESET, GAME_OVER semantics)
                                  │
-2. Brusentsov LayeredVerifier (Absolute authority on transition validity: FOLLOW / NULL / OMIT)
+2. Brusentsov LayeredVerifier (Strict 8-Tier Decision Cascade: FOLLOW / NULL / OMIT / UNDECIDED)
                                  │
-3. GameSession Orchestrator (State machine owner, budget manager, lifecycle coordinator)
+3. GameSession Orchestrator (State machine owner, budget manager, evidence probe coordinator)
                                  │
 4. SymbolicTrajectoryExecutor (Independent execution controller, sandbox caller, circuit-breaker)
                                  │
@@ -64,7 +68,7 @@ Authority is strictly ordered from highest to lowest:
                                  │
 8. Explorer Agent (Probes primitive actions and coordinate affordances; extracts factual rules)
                                  │
-9. ARGA-Lite & PlanningSet (Deterministic perceptual vocabulary for the active cycle)
+9. ARGA-Lite, PersistentObjectTracker & PlanningSet (Perceptual vocabulary & multi-frame identity tracking)
                                  │
 10. Isolated Memory Stores (EnvironmentSpecMemory, SyntaxErrorMemory, EpistemicMemory, GameMemory)
 ```
@@ -264,8 +268,13 @@ Optional `EXPECT: prop=val` clauses allow the Brusentsov judge to verify step co
 </trajectory_3>
 ```
 
-#### 1.3.1 Turn 2: Epistemic Win Reflection (`distill_level_win_invariants`)
-Upon solving a level, Solver is invoked in a dedicated reflection turn to distill domain-general invariants and color palette semantics:
+#### 1.3.1 Turn 2: Mandatory Win/Loss Invariant Revision (`distill_level_win_invariants` & `distill_level_failure_invariants`)
+The Solver is invoked in a mandatory reflection turn upon both level completion and level failure/falsification. This ensures continuous epistemic revision:
+1. **Upon Victory (`[EXECUTION OUTCOME: LEVEL WON]`)**:
+   Solver reflects on the verified winning trajectory, extracting high-level physical, palette, and goal invariants into Tier 3 curriculum memory without button-sequence pollution.
+2. **Upon Defeat / Falsification (`[EXECUTION OUTCOME: LEVEL FAILED / INVARIANT FALSIFIED]`)**:
+   When symbolic verification severs an invariant or candidate pool exhaustively without victory, Solver receives the falsification records and actively revises the invariant list, formulating updated, non-contradictory hypotheses.
+
 ```text
 [EXECUTION OUTCOME: LEVEL WON]
 Your proposed trajectory (winning_candidate) successfully solved this level and achieved victory!
@@ -280,9 +289,9 @@ CRITICAL RULES FOR INVARIANTS:
 2. NO step counts or action repetition numbers (distances vary across levels).
 3. NO literal button sequences or macros like 'action1 -> action5' (order of actions varies).
 4. Focus on describing:
-   - [PALETTE & ROLES]: Explicitly map observed object colors to their functional roles across levels (which color is the static target/socket, which color is the movable actor piece, which color is the symmetry axis/tool, and what color represents active selection indicators or background holes).
-   - [GOAL]: How the win condition is satisfied (e.g. covering targets of target color with primary pieces and their reflections).
-   - [ENTITIES & MECHANICS]: The distinct roles and physical mechanics of entities (e.g. mirror axis reflecting pieces across itself).
+   - [PALETTE & ROLES]: Explicitly map observed object colors to their functional roles across levels.
+   - [GOAL]: How the win condition is satisfied.
+   - [ENTITIES & MECHANICS]: The distinct roles and physical mechanics of entities.
    - [CONTROL]: How entity cycling or toggling operates across active elements.
 
 Format your response strictly inside <distilled_invariants>...</distilled_invariants> with bullet points:
@@ -341,6 +350,8 @@ Format your response strictly inside <distilled_invariants>...</distilled_invari
 | **ISO-6** | The Solver Agent proposes trajectories declaratively; it never executes them. All execution is handled by the independent `SymbolicTrajectoryExecutor`. |
 | **ISO-7** | Zero game-specific bias: Prompts must not contain hardcoded references to specific game mechanics (e.g. quadrant cloning, avatar names, key/door assumptions). All invariants must be inferred dynamically from the empirical memory block. |
 | **ISO-8** | Zero color-binding leakage across levels: Selection mechanics must not bind actor-toggle operations to local color artifacts from prior levels. |
+| **ISO-9** | Controller signals (`EpistemicSignal.SEEK_EVIDENCE` from `Verdict.UNDECIDED`) are strictly separated from truth values. They must be recorded in `epistemic_signals` and never pollute logical truth judgment sets. |
+| **ISO-10** | Strict Containment: Mere mismatch against an ungrounded LLM expectation (`EXPECT:`) without violation of physical invariants or domain laws must **never** emit a `NULL` verdict. It resolves conservatively to `UNDECIDED` or `OMIT`. |
 
 ---
 
@@ -432,12 +443,17 @@ The `VirtualSandbox` in `v10_agent/virtual_sandbox.py` operates strictly as an o
 3. **Planning Attempt Ceiling and No Per-Step Invocations**:
    - Trajectory planning is batched into full multi-step trajectory packages (up to 4 candidates per package, 10–30 steps each) within a hard ceiling of 5 planning attempts per level (`max_chain_attempts_per_level = 5`), yielding ~10–20 total candidate trajectories per level.
    - The Solver is **never invoked per step**. Per-step execution is handled deterministically by the `SymbolicTrajectoryExecutor` and validated step-by-step by the `LayeredVerifier`.
+### 2.5 Epistemic Uncertainty Handling in SymbolicTrajectoryExecutor
+When `LayeredVerifier` returns `Verdict.UNDECIDED` (e.g. low tracking confidence, ambiguous spatial matching, or unconfirmed action delta without physical contradiction):
+1. **Candidate Trajectory Preservation**: The active candidate trajectory cursor is **not** advanced, and the candidate is **not** severed (`candidate_advanced = False`, `candidate_severed = False`).
+2. **Evidence Flagging**: `TransitionEvaluationResult.evidence_needed` is set to `True` with a diagnostic hint (`evidence_hint`).
+3. **Reset Suppression**: `reset_needed` and `replan_needed` remain `False`, allowing `GameSession` to dispatch targeted evidence probes without prematurely aborting the candidate or wiping board progress.
 
 ---
 
-## 3. Brusentsov 3-Valued Logic in Transition Verification
+## 3. Brusentsov 4-Valued Logic in Transition Verification
 
-The core evaluation engine of the agent is the `LayeredVerifier`, governed by **Brusentsov's 3-valued logic**.
+The core evaluation engine of the agent is the `LayeredVerifier`, governed by **Brusentsov's 4-valued logic and epistemic control framework**.
 
 ### 3.1 Foundations: Why Classical Boolean Logic Fails
 Classical Boolean logic operates with two truth values: $\{0, 1\}$ (or $\{F, T\}$). Its standard conditional is **material implication**:
@@ -447,9 +463,9 @@ In verification of autonomous agent trajectories, material implication suffers f
 
 ### 3.2 Nikolai P. Brusentsov and Necessary Implication
 In the development of the ternary computer *Setun* (Moscow State University, 1958) and his formalization of Aristotelian syllogistics, Nikolai Petrovich Brusentsov established that genuine empirical reasoning requires **three truth values**:
-- $+1$ (True / Affirmation)
-- $0$ (Neutral / Omission / Irrelevance)
-- $-1$ (False / Incompatibility / Contradiction)
+- $+1$ (True / Affirmation / FOLLOW)
+- $0$ (Neutral / Omission / Irrelevance / OMIT)
+- $-1$ (False / Incompatibility / Contradiction / NULL)
 
 Brusentsov defined **necessary implication** ($x \Rightarrow y$), which asserts that the consequence $y$ is *necessarily contained* in the condition $x$:
 $$x \Rightarrow y \equiv xy \lor xy'_0 \lor x'y'$$
@@ -460,47 +476,63 @@ In this ternary disjunctive normal form:
 3. **$x'y'$ (Contraposition / NULL, $-1$)**: A strict contradiction. The expected progress was violated by an impossible state ($x'$) and a contradicting outcome ($y'$), such as a wall collision, 0 displacement on a movement command, an increase in distance to the target socket, or an illegal shape deformation.
 4. **$x'y$ (Excluded Term)**: Classical material implication includes the term $x'y$ (the condition did not occur, yet the consequence did). Brusentsov's logic **strictly omits** this term as inessential and invalid for empirical causality.
 
-### 3.3 The Three Truth Values in Agent Operation
+### 3.3 The Four Verdict Values & Epistemic Controller Signals
+
+Version 10.1-r1 extends the operational decision layer into 4-valued Brusentsov logic, distinguishing between **logical truth values** and **epistemic controller signals** (ISO-9):
 
 ```
-                             Transition Evaluation
-                                       │
-            ┌──────────────────────────┼──────────────────────────┐
-            ▼                          ▼                          ▼
-     Brusentsov TRUE           Brusentsov IRRELEVANT       Brusentsov FALSE
-       (Value: +1)                  (Value: 0)               (Value: -1)
-      Verdict: FOLLOW              Verdict: OMIT            Verdict: NULL
-            │                          │                          │
-   ┌────────┴────────┐        ┌────────┴────────┐        ┌────────┴────────┐
-   │ Physical        │        │ Non-contradict- │        │ Collision,      │
-   │ progress toward │        │ ing transition  │        │ zero delta,     │
-   │ target achieved.│        │ (e.g. toggle    │        │ divergence from │
-   │ Advance cursor. │        │ entity control).│        │ target socket.  │
-   │ Extend branch.  │        │ Advance cursor. │        │ Sever branch.   │
-   └─────────────────┘        │ Keep branch live│        │ Queue RESET.    │
-                              │ in memory.      │        │ Next candidate. │
-                              └─────────────────┘        └─────────────────┘
+                                    Transition Evaluation
+                                              │
+                   ┌──────────────────────────┼──────────────────────────┬──────────────────────────┐
+                   ▼                          ▼                          ▼                          ▼
+            Brusentsov TRUE           Brusentsov IRRELEVANT       Brusentsov FALSE          Epistemic Signal
+              (Value: +1)                  (Value: 0)               (Value: -1)             (SEEK_EVIDENCE)
+             Verdict: FOLLOW              Verdict: OMIT            Verdict: NULL           Verdict: UNDECIDED
+                   │                          │                          │                          │
+          ┌────────┴────────┐        ┌────────┴────────┐        ┌────────┴────────┐        ┌────────┴────────┐
+          │ Physical        │        │ Non-contradict- │        │ Collision,      │        │ Ambiguous track,│
+          │ progress toward │        │ ing transition  │        │ zero delta on   │        │ unconfirmed     │
+          │ target achieved.│        │ (e.g. toggle    │        │ motion, fatal   │        │ delta. Hold     │
+          │ Advance cursor. │        │ entity control).│        │ physical breach.│        │ candidate cursor│
+          │ Extend branch.  │        │ Advance cursor. │        │ Sever branch.   │        │ and dispatch    │
+          └─────────────────┘        │ Keep branch live│        │ Queue RESET.    │        │ evidence probe. │
+                                     │ in memory.      │        │ Next candidate. │        └─────────────────┘
+                                     └─────────────────┘        └─────────────────┘
 ```
 
-| Brusentsov State | Truth Value | Operational Verdict | Ground-Truth Verification Criteria | Action / Memory Effect |
-| :--- | :---: | :---: | :--- | :--- |
-| **TRUE** | $+1$ | **FOLLOW** | - The expected entity was displaced in the specified direction.<br>- State changed in-place (color, toggle, orientation).<br>- Distance to target decreased or invariant maintained. | Candidate cursor advances ($c \leftarrow c + 1$). If candidate finishes without win, queues clean `RESET` and advances to next candidate. |
-| **IRRELEVANT** | $0$ | **OMIT** | - Action did not displace primary target, but produced a legitimate state change (e.g. toggling active entity control).<br>- No boundary collision, no goal divergence, no invariant violation. | Candidate cursor advances ($c \leftarrow c + 1$). Signature recorded as live omit branch in `EpistemicMemory`. |
-| **FALSE** | $-1$ | **NULL** | - Movement action produced 0 displacement (boundary collision / wall hit).<br>- Contradiction with confirmed physics.<br>- Target entity was destroyed or mutated into an invalid shape. | **Branch is severed immediately**. Sequence recorded in `severed_null_signatures`. Queues clean `RESET` to $S_0$. Advances to next pool candidate. |
+| Operational Verdict | Brusentsov State / Signal | Truth Value | Decision Criteria | Action / Memory Effect |
+| :--- | :--- | :---: | :--- | :--- |
+| **FOLLOW** | `Ternary.TRUE` | $+1$ | Necessary containment satisfied: expected displacement observed, state changed in-place, distance to target reduced. | Candidate cursor advances ($c \leftarrow c + 1$). Extends branch in `EpistemicMemory`. |
+| **OMIT** | `Ternary.IRRELEVANT` | $0$ | Non-contradicting passive transition (e.g. entity cycling, innocuous visual noise). | Candidate cursor advances ($c \leftarrow c + 1$). Signature recorded as live omit branch in `EpistemicMemory`. |
+| **NULL** | `Ternary.FALSE` | $-1$ | Physical contradiction, wall collision, zero displacement on confirmed motion, shape destruction. | **Branch severed immediately**. Signature recorded in `severed_null_signatures`. Queues `RESET` to $S_0$. |
+| **UNDECIDED** | `EpistemicSignal.SEEK_EVIDENCE` | N/A | Epistemic uncertainty: unconfirmed delta, ambiguous object identity match, low tracking confidence. | **Candidate cursor holds ($c \leftarrow c$)**. Candidate not severed. Triggers safe evidence probe queue. |
 
-### 3.4 Active Consequence Checking via `implies_brusentsov`
+### 3.4 Strict 8-Tier Decision Cascade in `LayeredVerifier`
+To eliminate judgment race conditions and enforce ISO-10, `LayeredVerifier.evaluate_transition` evaluates transition propositions in an immutable 8-tier hierarchy:
+
+1. **Tier 1: Syntactic & Invariant Malformation ($\to \text{NULL}$)**:
+   - Malformed step arguments, invalid planning IDs, or direct violations of active universal invariants.
+2. **Tier 2: Fatal Domain Violations ($\to \text{NULL}$)**:
+   - Zero grid displacement on a confirmed directional motion action (wall collision / boundary breach).
+   - Illegal destruction or vanishing of protected invariant entities.
+3. **Epistemic Uncertainty Short-Circuit ($\to \text{UNDECIDED}$)**:
+   - If tracker confidence is low ($< 0.6$), spatial matching is ambiguous, or upstream step confidence is `"low"`/`"unconfirmed"`, evaluation short-circuits to `Verdict.UNDECIDED` before physical containment checks, preventing false contradictions.
+4. **Tier 3: Physical Contradiction ($\to \text{NULL}$)**:
+   - Proposition incompatibility: observed propositions directly contradict expected propositions (`contradicts(e, o)`).
+5. **Tier 4: Necessary Containment ($\to \text{FOLLOW}$)**:
+   - Every expected atomic proposition is necessarily contained in the observed transition set (`is_necessarily_contained(e, observed)`).
+6. **Tier 5: Downstream Disconfirmation ($\to \text{NULL}$)**:
+   - High-confidence step expectation where confirmed physics were violated downstream.
+7. **Tier 6: Downstream Ambiguity / Unconfirmed Delta ($\to \text{UNDECIDED}$)**:
+   - Action was emitted but produced zero delta on an unconfirmed action, or tracker reports ambiguous spatial association (`last_ambiguity_score > threshold`). Triggers targeted evidence probing.
+8. **Tier 7: Irrelevant Frame Noise ($\to \text{OMIT}$)**:
+   - Background changes, innocuous cosmetic delta, or selection toggle without primary motion.
+9. **Tier 8: Default Fallback ($\to \text{OMIT}$)**:
+   - Safe conservative default ensuring non-fatal transitions are not prematurely aborted.
+
+### 3.5 Active Consequence Checking via `implies_brusentsov` & ISO-10 Compliance
 When Solver candidate steps declare explicit expectations (e.g. `action1() EXPECT: dy=-1, dx=0`), `LayeredVerifier` in `v10_agent/judge.py` evaluates the step transition using `implies_brusentsov(step.expected_propositions, observed_propositions)` from `v10_agent/brusentsov_logic.py`:
-
-1. **Incompatibility / Nullity Check ($\to \text{FALSE}$)**:
-   - For every expected atomic proposition $e \in \text{expected}$, the verifier checks if any observed proposition $o \in \text{observed}$ contradicts $e$ (`contradicts(e, o)`).
-   - If an object identity was expected to be preserved (`family="object_identity"`, `predicate="preserved"`) but is observed as `destroyed`, `missing`, or `vanished`, a contradiction occurs.
-   - Upon contradiction, `implies_brusentsov` returns `Ternary.FALSE` (Brusentsov nullity $xy'_0$). The candidate trajectory is severed immediately and a clean `RESET` is queued.
-2. **Necessary Containment Check ($\to \text{TRUE}$)**:
-   - If every expected atomic proposition is necessarily contained in the observed transition set (`is_necessarily_contained(e, observed)`), `implies_brusentsov` returns `Ternary.TRUE` (Brusentsov affirmation $xy$).
-   - The candidate step is verified as successful; the candidate cursor advances to the next step.
-3. **Inessential Missing Consequence Check ($\to \text{IRRELEVANT}$)**:
-   - If the expected consequence is not observed, but no physical laws or boundary constraints were violated, `implies_brusentsov` returns `Ternary.IRRELEVANT` (Brusentsov neutrality $xy'_0$ / omit branch).
-   - The step is treated as non-fatal: the cursor advances, and the state transition signature is preserved in `EpistemicMemory.live_omit_branches` for potential structural adaptation.
+- **ISO-10 Compliance**: A simple discrepancy between an observed state and an LLM's raw expectation does **not** yield `NULL` if physical invariants and domain laws are intact. The verifier classifies the step as `UNDECIDED` (if evidence is needed) or `OMIT` (if benign), preventing catastrophic trajectory abandonment caused by LLM expectation phrasing.
 
 ---
 
@@ -548,6 +580,26 @@ To discover higher-order mathematical structures without game-specific heuristic
 To prevent perceptual context fragmentation from large clusters of indicator dots:
 1. **Marker Aggregation**: Small dots ($area \le 2$) sharing the same color are aggregated into composite marker groups (`marker_group_color_{c}` / `marker_dots_c{c}`).
 2. **Quadrant-Balanced Salience**: Objects are partitioned across the 4 grid quadrants (TL, TR, BL, BR). Up to 10 substantive objects per quadrant and all confirmed actors are prioritized, guaranteeing spatial diversity and preventing attention collapse on local clusters.
+
+### 4.6 Persistent Object Tracking & Multi-Frame Identity (`v10_agent/tracker.py`)
+To prevent identity flicker, entity ID swapping (`obj_0` switching identities mid-level), and distractor hopping across planning cycles:
+1. **`TrackedObject` Representation**:
+   Maintains `track_id` (e.g. `track_0`), persistent bounding box, centroid, color, area, shape signatures, history of centroids, `age`, `missed_frames`, and a decaying `confidence` metric.
+2. **Greedy Centroid & IoU Association**:
+   At each perception cycle, `PersistentObjectTracker.update()` matches newly segmented ARGA-Lite `PlanningObject` instances to existing tracks:
+   - Evaluates bounding-box IoU (threshold $\ge 0.3$) and Euclidean centroid distance (distance $\le 5.0$ pixels).
+   - If an object matches an existing track, the track's position is updated, `confidence` is refreshed to 1.0, and `missed_frames` is reset to 0.
+   - If an existing track has no match, its `missed_frames` counter increments, and its `confidence` decays by `tracker_confidence_decay` (default 0.85). If missed frames exceed `max_missed_frames` (default 2), the track is retired.
+3. **Ambiguity Scoring**:
+   If multiple candidate objects lie equidistant from an existing track within `tracker_ambiguity_threshold`, `last_ambiguity_score` records the ambiguity. High ambiguity ($> 0.5$) routes into Tier 6 of the `LayeredVerifier`, emitting `Verdict.UNDECIDED` rather than risking a false `NULL` on an ambiguous object.
+4. **PlanningSet Integration**:
+   Every `PlanningObject` in `PlanningSet` is enriched with `persistent_id: str | None` and `track_confidence: float`, allowing the symbolic executor, verifier, and solver to reference stable temporal entities.
+
+### 4.7 Change-Centric Propositions
+The proposition vocabulary in `v10_agent/types.py` registers three fundamental change-centric proposition families:
+- **`cumulative_motion`**: Quantifies cumulative coordinate displacement of a persistent track across multiple successive steps ($\Delta r_{\text{total}}, \Delta c_{\text{total}}$).
+- **`shape_stability`**: Verifies that an entity's internal shape signature and area remain preserved ($1$) or deformed ($0$) across transitions.
+- **`occlusion`**: Detects when an entity is temporarily occluded or layered beneath another object or indicator dot.
 
 ---
 
@@ -636,11 +688,19 @@ When a level is successfully completed:
 2. It triggers Turn 2 reflection via `solver.distill_level_win_invariants()`, prompting the Solver to extract high-level domain invariants, geometric symmetries, and abstract strategies.
 3. These distilled insights are recorded into `GameMemory.record_level_solution()` and rendered into `curriculum_progression_from_won_levels` across subsequent levels.
 
-### 6.7 Dynamic Action Surface & Clean State Invariant
-When actions appear dynamically (e.g. conditional affordances or modal triggers):
-1. Newly surfaced actions are identified and probed immediately.
-2. If an action toggles active control (e.g. `ACTION5`), dynamic reprobing tests directional movement for the newly selected entity.
-3. Universal post-probe clean `RESET` ensures that all Solver candidate executions begin from a clean, pristine board state ($S_0$).
+### 6.8 Safe Evidence-Seeking Loop & Strict NOOP Elimination Invariant
+When the verifier returns `Verdict.UNDECIDED` during trajectory execution:
+1. **Probe Queue Interception**: `GameSession.act()` intercepts execution at Section 3.8 and dispatches a targeted evidence probe from `self.probe_queue`.
+2. **Strict NOOP Elimination**: The Arcade/ARC-AGI-3 runtime strictly rejects `NOOP` with an `InvalidActionError`. Evidence seeking must strictly emit real available actions (`ACTION1`..`ACTION7`). If the probe queue is empty or exhausted, the session falls through cleanly to `NULL` (severing the active candidate and triggering a clean reset). **Under no circumstances is `NOOP` emitted**.
+3. **Action Budget Protection**: Evidence probing is capped at `max_evidence_probes_per_level` (default 2), automatically disables if remaining level actions fall below `undecided_min_remaining_actions` (default 25), and is bounded by `max_undecided_streak` (default 2) to prevent infinite loops.
+
+### 6.9 Telemetry Counters Invariant
+Harness telemetry (`harness_telemetry()`) records comprehensive metrics for V10.1 epistemic tracking:
+- `undecided_count`: Total number of `UNDECIDED` verdicts issued.
+- `undecided_resolved_by_probe`: Number of `UNDECIDED` states successfully resolved to `FOLLOW` or `OMIT` via targeted probing.
+- `undecided_fallback_to_null`: Number of `UNDECIDED` states fallen back to `NULL` due to streak limits or probe exhaustion.
+- `evidence_probes_executed`: Total number of evidence-seeking probe actions dispatched.
+- `epistemic_signals_count`: Count of epistemic signals routed to `EpistemicMemory`.
 
 ---
 
@@ -649,25 +709,27 @@ When actions appear dynamically (e.g. conditional affordances or modal triggers)
 Error handling is partitioned strictly by domain:
 
 ```
-                           Error Detected
-                                 │
-            ┌────────────────────┴────────────────────┐
-            ▼                                         ▼
-   Sandbox Execution Error                  Physical / Logical Outcome
- (Syntax, TypeError, AST, Limits)               (NULL or OMIT Verdict)
-            │                                         │
-            ▼                                         ▼
-      EXTERNAL LOOP                             INTERNAL LOOP
-            │                                         │
-  Writes to SyntaxErrorMemory               Writes to EpistemicMemory
-  Invokes Coder for DSL repair              Pivots Solver trajectory
-  Solver context untouched                  Coder context untouched
+                                  Outcome Detected
+                                         │
+        ┌────────────────────────────────┼────────────────────────────────┐
+        ▼                                ▼                                ▼
+Sandbox Execution Error        Physical Contradiction            Epistemic Uncertainty
+(Syntax, TypeError, Limits)     (NULL or OMIT Verdict)            (UNDECIDED Verdict)
+        │                                │                                │
+        ▼                                ▼                                ▼
+  EXTERNAL LOOP                    INTERNAL LOOP                   EVIDENCE LOOP
+        │                                │                                │
+Writes to SyntaxErrorMemory     Writes to EpistemicMemory         Intercepts in act() (Sec 3.8)
+Invokes Coder for DSL repair    Pivots Solver trajectory          Dispatches targeted probe
+Solver context untouched        Coder context untouched           Holds candidate cursor
 ```
 
 - **External Loop (Syntax & Sandbox Routing)**:
   When generated DSL code fails static checks, raises a `TypeError`, or exceeds sandbox limits, diagnostics are routed **exclusively** to `SyntaxErrorMemory`. The Coder is re-invoked (up to `max_coder_retries`). The Solver is completely shielded from syntax tracebacks.
 - **Internal Loop (Logical & Empirical Routing)**:
   When DSL code executes cleanly but the step fails to advance the puzzle (NULL or OMIT), the judgment is routed **exclusively** to `EpistemicMemory`. The Coder is not penalized or re-invoked. The Solver receives the judgment in its prompt and adapts its next trajectory package.
+- **Evidence Loop (Safe Epistemic Probing)**:
+  When an observation cannot be resolved due to unconfirmed deltas or ambiguous spatial tracking (UNDECIDED), the step is not severed. An epistemic probe is dispatched from available environment actions, returning empirical clarity without resetting the board.
 
 ---
 
@@ -679,6 +741,8 @@ Error handling is partitioned strictly by domain:
 - `max_solver_retries_per_level`: 5 attempts.
 - `max_explorer_attempts_per_level`: 5 attempts.
 - `max_explorer_probe_actions_per_level`: 30 actions.
+- `max_evidence_probes_per_level`: 2 actions (strict epistemic probe cap).
+- `max_undecided_streak`: 2 consecutive undecided steps before NULL fallback.
 - `max_candidates_per_solver_package`: 4 candidates.
 - `max_steps_per_candidate`: 20 steps.
 - `max_actions_per_level`: 500 actions.
@@ -701,16 +765,27 @@ Under ARC-AGI-3 competition environment conditions, `ACTION7` is fixed as an `Un
 1. **Epistemic State Consistency**: Rather than attempting reverse-step backtracking via `Undo` (which creates ambiguous intermediate states, complicates invariant tracking, and risks infinite oscillatory loops), the agent relies on clean-slate restarts ($S_0$) via environment `RESET`.
 2. **Deterministic Forward Traversal**: All candidate trajectory execution is strictly forward-directed. `ACTION7` is deliberately filtered out from `PlanningSet.allowed_action_ids`, primitive probing, and code generation prompts to enforce unambiguous trajectory evaluation.
 
+### 8.4 Multi-Token Prediction (MTP=3) Speculative Decoding Architecture
+To maximize inference throughput and reasoning depth within strict competition time limits, the local LLM server incorporates Multi-Token Prediction ($k=3$, `MTP=3`) for Qwen 3.8 27B:
+1. **Configuration Parameters**:
+   - `vllm_mtp_enabled: bool = True` (default enabled for competition).
+   - `vllm_mtp_tokens: int = 3` (normative $k=3$ prediction depth).
+   - `vllm_speculative_method: str = "mtp"`.
+2. **CLI Argument Synthesis (`build_vllm_speculative_args`)**:
+   Generates exact flags compatible across vLLM CLI dialects (`--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` or `--speculative-tokens 3 --speculative-method mtp`).
+3. **Automated Crash-Safe Fallback**:
+   If the vLLM server fails to boot (e.g. model weights lack MTP heads or architectural mismatch), `phase_a_heavy_smoke.py` captures the error log, cleanly terminates the dead process, and re-launches vLLM in standard non-speculative mode, providing a 100% guarantee against crashed runs.
+
 ---
 
 ## 9. Packaging, Kaggle Deployment & Auditability
 
 ### 9.1 Self-Extracting LZMA Packaging (`build_notebook_v10.py`)
 To comply with the Kaggle submission limit (< 985 KB):
-- The entire `v10_agent` package (27 core modules + 4 prompt builder modules) is compressed into an in-memory LZMA archive.
+- The entire `v10_agent` package (28 core modules + 4 prompt builder modules) is compressed into an in-memory LZMA archive.
 - The compressed payload is encoded as base64 text and embedded in a single competition notebook cell.
 - A lightweight bootstrap unpacks the code into the Kaggle runtime environment upon notebook execution.
-- **Current Total Size**: ~142 KB (uses only **14.4%** of the 985 KB ceiling).
+- **Current Total Size**: ~215 KB (uses only **21.8%** of the 985 KB ceiling).
 
 ### 9.2 Audit Log Contract
 Every action emitted to the competition gateway is auditable through a complete structured trace:
@@ -718,10 +793,14 @@ $$\text{Grid Hash} \longrightarrow \text{PlanningSet} \longrightarrow \text{Solv
 All traces are written to `local_harness_run.json` during evaluation runs.
 
 ### 9.3 Test Suite & Quality Assurance
-The V10 codebase is verified by a suite of **191 unit tests** across 38 test modules, covering:
+The V10.1 codebase is verified by a comprehensive suite of **235 unit tests** across 45 test modules, covering:
+- 4-valued Brusentsov logic (`Verdict`: `FOLLOW`, `NULL`, `OMIT`, `UNDECIDED`) and `EpistemicSignal`.
+- Strict 8-tier decision cascade in `LayeredVerifier` and ISO-10 expectation non-severance.
+- Persistent object tracking (`PersistentObjectTracker`, `TrackedObject`), IoU matching, centroid distance, and ambiguity scoring.
+- Change-centric proposition evaluation (`cumulative_motion`, `shape_stability`, `occlusion`).
+- Safe evidence-seeking loop with strict NOOP elimination and probe budget ceilings.
+- Multi-Token Prediction (MTP=3) configuration and graceful vLLM boot fallback.
 - ARGA-Lite perception, 2D descriptors, cavity detection, and dual-view image generation.
-- Tri-agent separation of powers, prompt isolation, and syntax routing.
-- Brusentsov ternary truth evaluation and active consequence checking via `implies_brusentsov`.
 - Dynamic kinematics, falsification detection, micro-reprobing, and universal clean reset.
 - Stratified 3-tier memory contours, Tier 1 kinematics protection, confirmed actor tracking, and cross-level invariant re-evaluation.
 - Virtual sandbox polymorphic simulation, step repair without index 0 hijacking, and A* fallback planning.
