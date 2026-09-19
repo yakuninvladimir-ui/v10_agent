@@ -247,11 +247,38 @@ def get_vllm_env(site_packages: pathlib.Path) -> dict[str, str]:
         # Critical Blackwell / RTX 6000 Ada workaround (from v9):
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
     })
+
+    # MTP & Speculative decoding environment variables
+    vllm_mtp_enabled = os.getenv("ARC_VLLM_MTP_ENABLED", os.getenv("VLLM_MTP_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+    if vllm_mtp_enabled:
+        mtp_tokens = os.getenv("ARC_VLLM_MTP_TOKENS") or os.getenv("VLLM_MTP_TOKENS") or os.getenv("VLLM_SPECULATIVE_TOKENS") or "3"
+        spec_method = os.getenv("ARC_VLLM_SPECULATIVE_METHOD") or os.getenv("VLLM_SPEC_METHOD") or os.getenv("VLLM_SPECULATIVE_METHOD") or "mtp"
+        env.update({
+            "VLLM_MTP_TOKENS": str(mtp_tokens),
+            "VLLM_SPECULATIVE_TOKENS": str(mtp_tokens),
+            "VLLM_SPEC_METHOD": str(spec_method),
+            "VLLM_SPECULATIVE_METHOD": str(spec_method),
+        })
+        spec_model = os.getenv("ARC_VLLM_SPECULATIVE_MODEL") or os.getenv("VLLM_SPEC_MODEL") or os.getenv("VLLM_SPECULATIVE_MODEL")
+        if spec_model:
+            env["VLLM_SPECULATIVE_MODEL"] = str(spec_model)
+            env["VLLM_SPEC_MODEL"] = str(spec_model)
+        spec_cfg = os.getenv("ARC_VLLM_SPECULATIVE_CONFIG") or os.getenv("VLLM_SPECULATIVE_CONFIG")
+        if spec_cfg:
+            env["VLLM_SPECULATIVE_CONFIG"] = str(spec_cfg)
+
     return env
 
 
-def start_vllm_server(model_path: pathlib.Path, site_packages: pathlib.Path) -> bool:
+def start_vllm_server(
+    model_path: pathlib.Path,
+    site_packages: pathlib.Path,
+    enable_mtp: bool | None = None,
+) -> bool:
     global _vllm_proc, _vllm_log_file
+    if enable_mtp is None:
+        enable_mtp = os.getenv("ARC_VLLM_MTP_ENABLED", os.getenv("VLLM_MTP_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+
     log_path = get_vllm_log_path()
     _vllm_log_file = log_path.open("w", encoding="utf-8")
 
@@ -278,6 +305,17 @@ def start_vllm_server(model_path: pathlib.Path, site_packages: pathlib.Path) -> 
         "--trust-remote-code",
     ]
 
+    if enable_mtp:
+        try:
+            from v10_agent.config import build_vllm_speculative_args, config_from_env
+            cfg = config_from_env()
+            cfg.vllm_mtp_enabled = True
+            spec_args = build_vllm_speculative_args(cfg, model_path=model_path)
+            cmd.extend(spec_args)
+            print(f"[HEAVY-SMOKE] MTP=3 speculative decoding requested: {' '.join(spec_args)}", flush=True)
+        except Exception as spec_exc:
+            print(f"[HEAVY-SMOKE] Notice: could not load speculative args from config: {spec_exc}", flush=True)
+
     print(f"[HEAVY-SMOKE] Starting vLLM server: {' '.join(cmd)}", flush=True)
     _vllm_proc = subprocess.Popen(
         cmd,
@@ -294,7 +332,19 @@ def start_vllm_server(model_path: pathlib.Path, site_packages: pathlib.Path) -> 
 
     while time.monotonic() < deadline:
         if _vllm_proc.poll() is not None:
-            print(f"[HEAVY-SMOKE] vLLM process exited prematurely with code {_vllm_proc.returncode}!", flush=True)
+            retcode = _vllm_proc.returncode
+            print(f"[HEAVY-SMOKE] vLLM process exited prematurely with code {retcode}!", flush=True)
+            tail = _vllm_log_tail(10000)
+            print(f"[HEAVY-SMOKE] vLLM startup failure log tail:\n{tail}", flush=True)
+            stop_vllm_server()
+
+            if enable_mtp:
+                print(
+                    "[HEAVY-SMOKE] NOTICE: vLLM startup failed with MTP speculative decoding enabled. "
+                    "Initiating graceful fallback: RESTARTING vLLM WITHOUT MTP speculative decoding...",
+                    flush=True,
+                )
+                return start_vllm_server(model_path, site_packages, enable_mtp=False)
             return False
         try:
             with urlopen(f"{VLLM_BASE_URL}/models", timeout=3) as resp:
@@ -306,6 +356,14 @@ def start_vllm_server(model_path: pathlib.Path, site_packages: pathlib.Path) -> 
             time.sleep(4.0)
 
     print("[HEAVY-SMOKE] vLLM server startup timed out!", flush=True)
+    stop_vllm_server()
+    if enable_mtp:
+        print(
+            "[HEAVY-SMOKE] NOTICE: vLLM startup timed out with MTP enabled. "
+            "Initiating graceful fallback: RESTARTING vLLM WITHOUT MTP speculative decoding...",
+            flush=True,
+        )
+        return start_vllm_server(model_path, site_packages, enable_mtp=False)
     return False
 
 

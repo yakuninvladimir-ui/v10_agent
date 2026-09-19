@@ -41,6 +41,11 @@ def default_config() -> dict[str, Any]:
         "coder_exhaustion_forces_fallback": cfg.coder_exhaustion_forces_fallback,
         "solver_exhaustion_forces_fallback": cfg.solver_exhaustion_forces_fallback,
         "abort_on_dsl_exhaustion": cfg.abort_on_dsl_exhaustion,
+        "vllm_mtp_enabled": cfg.vllm_mtp_enabled,
+        "vllm_mtp_tokens": cfg.vllm_mtp_tokens,
+        "vllm_speculative_method": cfg.vllm_speculative_method,
+        "vllm_speculative_model": cfg.vllm_speculative_model,
+        "vllm_speculative_config": cfg.vllm_speculative_config,
     })
     return cfg_dict
 

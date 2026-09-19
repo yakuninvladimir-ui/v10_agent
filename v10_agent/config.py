@@ -117,6 +117,14 @@ class V10Config:
     vllm_max_num_seqs: int = 4
     vllm_startup_timeout_seconds: int = 900
 
+    # vLLM Speculative Decoding & Multi-Token Prediction (MTP=3 normative settings)
+    vllm_mtp_enabled: bool = True
+    vllm_mtp_tokens: int = 3
+    vllm_speculative_method: str = "mtp"
+    vllm_speculative_model: str | None = None
+    vllm_speculative_config: str | None = None
+    vllm_speculative_cli_format: str = "auto"  # "auto" | "config_json" | "spec_tokens" | "speculative_model"
+
     @property
     def model_name(self) -> str:
         return self.model_path
@@ -124,6 +132,9 @@ class V10Config:
     @property
     def qwen_model_name(self) -> str:
         return self.qwen_model_path
+
+    def build_speculative_args(self, model_path: str | None = None) -> list[str]:
+        return build_vllm_speculative_args(self, model_path=model_path)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert configuration to dictionary."""
@@ -211,6 +222,32 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
     resolved_input = _int_from_env("ARC_MAX_INPUT_TOKENS", _int_from_env("ARC_QWEN_MAX_INPUT_TOKENS", 65536))
     resolved_output = _int_from_env("ARC_MAX_OUTPUT_TOKENS", _int_from_env("ARC_QWEN_MAX_OUTPUT_TOKENS", 32000))
 
+    # vLLM Speculative Decoding / MTP=3 resolution
+    resolved_mtp_enabled = _bool_from_env(
+        "ARC_VLLM_MTP_ENABLED",
+        _bool_from_env("VLLM_MTP_ENABLED", True),
+    )
+    resolved_mtp_tokens = _int_from_env(
+        "ARC_VLLM_MTP_TOKENS",
+        _int_from_env("VLLM_MTP_TOKENS", _int_from_env("VLLM_SPECULATIVE_TOKENS", 3)),
+    )
+    resolved_spec_method = (
+        os.environ.get("ARC_VLLM_SPECULATIVE_METHOD")
+        or os.environ.get("VLLM_SPEC_METHOD")
+        or os.environ.get("VLLM_SPECULATIVE_METHOD")
+        or "mtp"
+    )
+    resolved_spec_model = (
+        os.environ.get("ARC_VLLM_SPECULATIVE_MODEL")
+        or os.environ.get("VLLM_SPEC_MODEL")
+        or os.environ.get("VLLM_SPECULATIVE_MODEL")
+    )
+    resolved_spec_config = (
+        os.environ.get("ARC_VLLM_SPECULATIVE_CONFIG")
+        or os.environ.get("VLLM_SPECULATIVE_CONFIG")
+    )
+    resolved_spec_format = os.environ.get("ARC_VLLM_SPECULATIVE_CLI_FORMAT", "auto")
+
     cfg = V10Config(
         llm_advisor_backend=os.environ.get("ARC_LLM_ADVISOR_BACKEND", os.environ.get("ARC_V8_QWEN_BACKEND", "vllm")),
         model_path=resolved_model,
@@ -283,10 +320,63 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         concurrency=_int_from_env("LCLD_GAME_CONCURRENCY", 4),
         vllm_max_num_seqs=_int_from_env("LCLD_VLLM_MAX_NUM_SEQS", 4),
         vllm_startup_timeout_seconds=_int_from_env("VLLM_STARTUP_TIMEOUT_SECONDS", 900),
+        vllm_mtp_enabled=resolved_mtp_enabled,
+        vllm_mtp_tokens=resolved_mtp_tokens,
+        vllm_speculative_method=resolved_spec_method,
+        vllm_speculative_model=resolved_spec_model,
+        vllm_speculative_config=resolved_spec_config,
+        vllm_speculative_cli_format=resolved_spec_format,
     )
     if overrides:
         cfg.update_runtime(overrides)
     return cfg
+
+
+def build_vllm_speculative_args(
+    cfg: V10Config | None = None,
+    model_path: str | Any | None = None,
+) -> list[str]:
+    """Build CLI arguments for vLLM speculative decoding / MTP.
+
+    Supports:
+    - "auto" / "config_json": --speculative-config '{"method": "...", "num_speculative_tokens": N}'
+    - "spec_tokens": --spec-method <method> --spec-tokens <N> [--spec-model <model>]
+    - "speculative_model": --speculative-model <model> --num-speculative-tokens <N>
+    """
+    import json
+
+    if cfg is None:
+        cfg = config_from_env()
+
+    if not cfg.vllm_mtp_enabled or cfg.vllm_mtp_tokens <= 0:
+        return []
+
+    # 1. Explicit raw JSON override if provided
+    if cfg.vllm_speculative_config:
+        return ["--speculative-config", str(cfg.vllm_speculative_config)]
+
+    cli_format = (cfg.vllm_speculative_cli_format or "auto").strip().lower()
+    spec_model = cfg.vllm_speculative_model or (str(model_path) if model_path else None)
+
+    if cli_format == "spec_tokens":
+        args = ["--spec-method", str(cfg.vllm_speculative_method), "--spec-tokens", str(cfg.vllm_mtp_tokens)]
+        if spec_model:
+            args.extend(["--spec-model", str(spec_model)])
+        return args
+
+    if cli_format == "speculative_model":
+        target_model = spec_model or (str(model_path) if model_path else str(cfg.model_path))
+        return ["--speculative-model", target_model, "--num-speculative-tokens", str(cfg.vllm_mtp_tokens)]
+
+    # "auto" or "config_json" (universal modern vLLM format)
+    spec_dict: dict[str, Any] = {
+        "method": str(cfg.vllm_speculative_method),
+        "num_speculative_tokens": int(cfg.vllm_mtp_tokens),
+    }
+    if cfg.vllm_speculative_model:
+        spec_dict["model"] = str(cfg.vllm_speculative_model)
+
+    return ["--speculative-config", json.dumps(spec_dict)]
 
 
 def config_from_mapping(mapping: Mapping[str, Any]) -> V10Config:
