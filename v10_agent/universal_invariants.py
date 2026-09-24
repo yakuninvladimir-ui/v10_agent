@@ -45,6 +45,76 @@ class DiscoveredInvariant:
         return d
 
 
+@dataclass(frozen=True)
+class ConnectedComponentConservation:
+    """Topology invariant: object retains 4/8 connectivity under translations."""
+    subject_id: str
+    component_count: int = 1
+    area: int = 1
+    confidence: float = 0.95
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "connected_component_conservation",
+            "subject": self.subject_id,
+            "component_count": self.component_count,
+            "area": self.area,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass(frozen=True)
+class GravitySettling:
+    """Physics invariant: dynamic entity settles in a fixed directional gradient (dy, dx)."""
+    subject_id: str
+    direction: tuple[int, int]  # (dy, dx), e.g. (1, 0) for down
+    support_id: str | None = None
+    confidence: float = 0.85
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "gravity_settling",
+            "subject": self.subject_id,
+            "direction": self.direction,
+            "support": self.support_id,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass(frozen=True)
+class ContactTrigger:
+    """Interaction invariant: spatial adjacency between subject and trigger produces state transition."""
+    subject_id: str
+    trigger_id: str
+    consequence: str  # e.g., 'barrier_toggle', 'portal_teleport', 'color_change'
+    confidence: float = 0.85
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "contact_trigger",
+            "subject": self.subject_id,
+            "trigger": self.trigger_id,
+            "consequence": self.consequence,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass(frozen=True)
+class AreaConservation:
+    """Geometric invariant: object pixel area is conserved across state transformations."""
+    subject_id: str
+    area: int
+    confidence: float = 0.95
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "area_conservation",
+            "subject": self.subject_id,
+            "area": self.area,
+            "confidence": self.confidence,
+        }
+
+
 def discover_invariants(
     planning_set: PlanningSet,
     confirmed_actors: set[str] | None = None,
@@ -253,6 +323,34 @@ def discover_invariants(
                 invariant_type="container_hierarchy",
                 subject_id=rel.subject_id, target_id=rel.target_id,
                 confidence=0.9, description=f"Object {rel.subject_id} is inside {rel.target_id}"
+            ))
+
+    # 6. Topological Invariants (Component & Area Conservation, Gravity, Contact Triggers)
+    for obj in objects:
+        if obj.area > 0 and obj.color != 0:
+            # Area conservation
+            invariants.append(DiscoveredInvariant(
+                invariant_type="area_conservation",
+                subject_id=obj.id, target_id=obj.id,
+                confidence=0.95,
+                description=f"Area conservation: {obj.id} maintains area {obj.area}",
+            ))
+            # Connected component conservation
+            invariants.append(DiscoveredInvariant(
+                invariant_type="connected_component_conservation",
+                subject_id=obj.id, target_id=obj.id,
+                confidence=0.95,
+                description=f"Connected component conservation: {obj.id} maintains topological unity",
+            ))
+
+    # Contact triggers (spatial contact between dynamic actors and potential targets/hazards)
+    for rel in relations:
+        if rel.relation_type in ("adjacent_to", "touches", "aligned_with"):
+            invariants.append(DiscoveredInvariant(
+                invariant_type="contact_trigger",
+                subject_id=rel.subject_id, target_id=rel.target_id,
+                confidence=0.85,
+                description=f"Contact trigger: {rel.subject_id} interacting with {rel.target_id}",
             ))
 
     # Deduplicate invariants

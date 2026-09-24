@@ -124,8 +124,8 @@ def test_solver_revise_invariants_failure_flow():
     assert len(gm.tier1_kinematics_and_topology) >= 1
 
 
-def test_session_triggers_revision_on_win_and_failure():
-    """Verify GameSession triggers Solver revision on both level win and attempt failure."""
+def test_session_triggers_revision_on_win_and_not_on_failure():
+    """Verify GameSession triggers Solver invariant revision ONLY on level win, not on intra-level attempt failure."""
     config = V10Config(llm_advisor_backend="fake")
     advisor = MockLLMAdvisor()
     session = GameSession(config=config, advisor=advisor)
@@ -138,15 +138,7 @@ def test_session_triggers_revision_on_win_and_failure():
 
     gm = session.memory_manager.get_game_memory("session")
     gm.record_stratified_invariant("[GOAL]: Fill sockets", tier=3)
-    gm.falsify_invariant("inv_0", level_id="level_0", reason="Socket count mismatch")
 
-    advisor.set_response(
-        "solver_reflection",
-        "<revised_invariants>\n"
-        "- [GOAL]: Sockets accept pieces of matching color only\n"
-        "- [PHYSICS]: Rigid translation along unobstructed grid lanes\n"
-        "</revised_invariants>",
-    )
     advisor.set_response(
         "solver",
         "<trajectory_1>\n1. action1()\n</trajectory_1>",
@@ -167,8 +159,10 @@ def test_session_triggers_revision_on_win_and_failure():
     obs = {"state": "NOT_FINISHED", "grid": grid, "available_actions": [1]}
     session.act(obs)
 
+    # Attempt failure is cleared cleanly, but NO invariant revision was triggered intra-level
     assert session._last_attempt_failed is False
-    assert any("matching color only" in r for r in gm.tier3_level_rules)
+    assert len(gm.tier3_level_rules) == 1
+    assert "Fill sockets" in gm.tier3_level_rules[0]
 
     # 2. Simulate level win
     advisor.set_response(

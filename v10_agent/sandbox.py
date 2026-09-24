@@ -224,6 +224,12 @@ class SandboxedModule:
     compiled_code: CodeType
     namespace: dict[str, Any]
 
+    def __getattr__(self, name: str) -> Any:
+        ns = self.__dict__.get("namespace", {})
+        if name in ns:
+            return ns[name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
 
 class SandboxExecutor:
     """Restricted executor for dynamic Coder-generated Python modules."""

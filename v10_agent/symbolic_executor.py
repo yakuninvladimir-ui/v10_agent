@@ -14,7 +14,13 @@ from typing import Any
 from v10_agent.brusentsov_logic import BrusentsovJudgment, Ternary, Verdict
 from v10_agent.config import V10Config
 from v10_agent.judge import LayeredVerifier
-from v10_agent.memory_contours import BranchSignature, EpistemicMemory, SyntaxErrorRecord, SyntaxErrorMemory
+from v10_agent.memory_contours import (
+    BranchSignature,
+    EpistemicMemory,
+    SyntaxErrorRecord,
+    SyntaxErrorMemory,
+    summarize_grid_diff,
+)
 from v10_agent.planning_set import PlanningSet
 from v10_agent.sandbox import SandboxExecutor, SandboxedModule
 from v10_agent.trajectory import CandidateTrajectory, TrajectoryPool
@@ -141,7 +147,7 @@ class SymbolicTrajectoryExecutor:
                 manifest_map,
                 hypothesis=getattr(candidate, "hypothesis", None),
             )
-            if res.has_boundary_violation or res.has_collision:
+            if res.verdict == "REJECTED":
                 return False, res.reason, []
 
             repaired = res.repaired_steps if res.repaired_steps else candidate.steps
@@ -188,6 +194,11 @@ class SymbolicTrajectoryExecutor:
                 candidate.steps = repaired
             candidate._full_trajectory_verified = True
             logger.info(f"SymbolicExecutor: Full trajectory for candidate {candidate.trajectory_id} APPROVED ({len(candidate.steps)} steps). Executing...")
+
+        if candidate.initial_grid is None and planning_set is not None:
+            grid_src = getattr(planning_set, "grid", None)
+            if grid_src:
+                candidate.initial_grid = [list(r) for r in grid_src]
 
         step_dict = candidate.current_step()
         if step_dict is None:
@@ -360,6 +371,9 @@ class SymbolicTrajectoryExecutor:
             before_grid = planning_set.grid
         after_grid = after_obs.get("grid")
 
+        if active_cand is not None and active_cand.initial_grid is None and before_grid is not None:
+            active_cand.initial_grid = [list(r) for r in before_grid]
+
         zero_grid_delta = False
         if before_grid is not None and after_grid is not None:
             if before_grid == after_grid:
@@ -369,28 +383,126 @@ class SymbolicTrajectoryExecutor:
         confirmed_eff = ""
         if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
             confirmed_eff = game_memory.confirmed_action_effects.get(act_id, "")
+        is_modal_selection = (
+            act_id in ("ACTION5", "ACTION6")
+            or (game_memory and any(kw in getattr(game_memory, "confirmed_action_effects", {}).get(act_id, "").lower() for kw in ("selection", "toggle", "indicator", "active entity", "modal")))
+            or (game_memory and any(isinstance(aff, dict) and str(aff.get("action_id", "")).upper() == act_id and aff.get("effect_class") == "MODAL_SELECTION" for aff in getattr(game_memory, "action_affordances", [])))
+        )
         is_confirmed_motion = (
-            "moved" in confirmed_eff
-            and any(d in confirmed_eff for d in ("UP", "DOWN", "LEFT", "RIGHT"))
+            not is_modal_selection
+            and any(k in confirmed_eff.lower() for k in ("moved", "moves", "dy=", "dx=", "displace"))
+            and any(d in confirmed_eff.upper() for d in ("UP", "DOWN", "LEFT", "RIGHT"))
         )
 
         falsification_detected = False
         falsified_action = None
 
         if is_initial_step and zero_grid_delta and is_confirmed_motion:
-            falsification_detected = True
-            falsified_action = act_id or pending_step.dsl_function
-            judgment = BrusentsovJudgment(
-                trajectory_id=pending_step.step_id,
-                step_id=pending_step.step_id,
-                verdict=Ternary.FALSE,
-                expected_propositions=pending_step.expected_propositions,
-                observed_propositions=judgment.observed_propositions,
-                explanation=(
-                    f"Step {pending_step.step_id} ({pending_step.dsl_function} / {act_id}): "
-                    f"Action produced zero grid delta (данное действие не валидно при текущих координатах объекта / local obstacle)."
-                ),
-            )
+            # Check if this zero delta is due to boundary collision or multi-entity modal selection
+            is_blocked_by_boundary = False
+            if planning_set and hasattr(planning_set, "objects"):
+                h = len(before_grid) if before_grid else 64
+                w = len(before_grid[0]) if before_grid and len(before_grid) > 0 else 64
+                for o in planning_set.objects:
+                    if getattr(o, "role", None) in ("ACTOR", "PRIMARY", "DYNAMIC"):
+                        bbox = getattr(o, "bbox", None)
+                        if bbox:
+                            min_r = getattr(bbox, "min_row", 0)
+                            max_r = getattr(bbox, "max_row", h - 1)
+                            min_c = getattr(bbox, "min_col", 0)
+                            max_c = getattr(bbox, "max_col", w - 1)
+                            if "UP" in confirmed_eff and min_r <= 0:
+                                is_blocked_by_boundary = True
+                            if "DOWN" in confirmed_eff and max_r >= h - 1:
+                                is_blocked_by_boundary = True
+                            if "LEFT" in confirmed_eff and min_c <= 0:
+                                is_blocked_by_boundary = True
+                            if "RIGHT" in confirmed_eff and max_c >= w - 1:
+                                is_blocked_by_boundary = True
+
+            # Extract available action surface
+            allowed_acts: list[str] = []
+            if planning_set and hasattr(planning_set, "allowed_action_ids"):
+                raw_acts = planning_set.allowed_action_ids
+                if isinstance(raw_acts, (list, tuple, set)):
+                    allowed_acts = [str(a).upper() for a in raw_acts]
+
+            has_selection_mechanics = bool(game_memory and getattr(game_memory, "selection_mechanics", None))
+
+            # Potential modal switch actions: ACTION5, ACTION6 or confirmed selection/toggle actions
+            modal_switch_actions = [
+                act for act in allowed_acts
+                if act in ("ACTION5", "ACTION6")
+                or (game_memory and any(kw in getattr(game_memory, "confirmed_action_effects", {}).get(act, "").lower() for kw in ("selection", "toggle", "indicator", "active entity", "modal")))
+                or (game_memory and any(isinstance(aff, dict) and str(aff.get("action_id", "")).upper() == act and aff.get("effect_class") == "MODAL_SELECTION" for aff in getattr(game_memory, "action_affordances", [])))
+            ]
+            has_modal_switch = bool(modal_switch_actions or has_selection_mechanics)
+
+            # Unconfirmed / unexplored discrete actions that could be modal switches
+            unconfirmed_actions = [
+                act for act in allowed_acts
+                if act not in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "RESET", "ACTION7")
+                and (not game_memory or act not in getattr(game_memory, "confirmed_action_effects", {}))
+            ]
+            has_unexplored = bool(unconfirmed_actions)
+
+            if has_modal_switch or has_unexplored:
+                # Orthogonal Modality Invariant: Zero response along one axis with selector/unexplored
+                # indicates degree of freedom is blocked in current mode, NOT invalidity of action.
+                modal_probe_target = modal_switch_actions[0] if modal_switch_actions else (unconfirmed_actions[0] if unconfirmed_actions else "ACTION5")
+                falsification_detected = False
+                falsified_action = None
+                judgment = BrusentsovJudgment(
+                    trajectory_id=pending_step.step_id,
+                    step_id=pending_step.step_id,
+                    verdict=Verdict.UNDECIDED,
+                    expected_propositions=pending_step.expected_propositions,
+                    observed_propositions=judgment.observed_propositions,
+                    explanation=(
+                        f"Step {pending_step.step_id} ({pending_step.dsl_function} / {act_id}): "
+                        f"Action produced zero grid delta along kinematic axis, but modal selector / switch is available "
+                        f"({modal_probe_target}). Degree of freedom is blocked in current discrete mode. "
+                        f"Requesting modal probe {modal_probe_target}."
+                    ),
+                    evidence_hint=f"probe_{modal_probe_target}",
+                    action_dict=action_dict or {},
+                    is_effective=False,
+                )
+            elif is_blocked_by_boundary:
+                # Boundary collision: action hit boundary for this candidate (sever candidate, but do NOT falsify action)
+                falsification_detected = False
+                falsified_action = None
+                judgment = BrusentsovJudgment(
+                    trajectory_id=pending_step.step_id,
+                    step_id=pending_step.step_id,
+                    verdict=Ternary.FALSE,
+                    expected_propositions=pending_step.expected_propositions,
+                    observed_propositions=judgment.observed_propositions,
+                    explanation=(
+                        f"Step {pending_step.step_id} ({pending_step.dsl_function} / {act_id}): "
+                        f"Action produced zero grid delta due to boundary collision (soft stop/wall collision). "
+                        f"Candidate branch severed, but action is not globally falsified."
+                    ),
+                    action_dict=action_dict or {},
+                    is_effective=False,
+                )
+            else:
+                # Truly falsified: no modal switches, no boundary collision, initial step failed
+                falsification_detected = True
+                falsified_action = act_id or pending_step.dsl_function
+                judgment = BrusentsovJudgment(
+                    trajectory_id=pending_step.step_id,
+                    step_id=pending_step.step_id,
+                    verdict=Ternary.FALSE,
+                    expected_propositions=pending_step.expected_propositions,
+                    observed_propositions=judgment.observed_propositions,
+                    explanation=(
+                        f"Step {pending_step.step_id} ({pending_step.dsl_function} / {act_id}): "
+                        f"Action produced zero grid delta (данное действие не валидно при текущих координатах объекта / boundary / obstacle)."
+                    ),
+                    action_dict=action_dict or {},
+                    is_effective=False,
+                )
 
         epistemic_memory.record_judgment(judgment)
 
@@ -425,6 +537,15 @@ class SymbolicTrajectoryExecutor:
                 evidence_hint=judgment.evidence_hint,
             )
 
+        if active_cand is not None and before_grid is not None and after_grid is not None:
+            step_fn = pending_step.dsl_function or act_id or "step"
+            curr_cursor = active_cand.cursor
+            if before_grid != after_grid:
+                step_diff = summarize_grid_diff(before_grid, after_grid)
+                active_cand.step_effects.append(f"Step {curr_cursor + 1} ({step_fn}): {step_diff}")
+            else:
+                active_cand.step_effects.append(f"Step {curr_cursor + 1} ({step_fn}): no grid change")
+
         if judgment.verdict == Ternary.TRUE:
             # FOLLOW: Advance cursor
             if active_cand is not None:
@@ -435,7 +556,7 @@ class SymbolicTrajectoryExecutor:
             logger.info(f"SymbolicExecutor: Step {pending_step.step_id} verified TRUE (FOLLOW).")
 
         elif judgment.verdict == Ternary.FALSE:
-            # NULL: Sever branch & trigger candidate reset
+            # Standard NULL: Sever branch & trigger candidate reset immediately
             if active_cand is not None:
                 active_cand.sever()
                 full_sig = format_sequence_signature(active_cand.steps)
@@ -485,12 +606,22 @@ class SymbolicTrajectoryExecutor:
                         steps_repr.append(f"{fn}({args_str})")
                     else:
                         steps_repr.append(f"{fn}()")
+                diff_summary = None
+                if active_cand.initial_grid is not None and after_grid is not None:
+                    diff_summary = summarize_grid_diff(active_cand.initial_grid, after_grid)
+
                 if cand_severed:
                     failed_idx = active_cand.cursor
                     failed_fn = (
                         active_cand.steps[failed_idx].get("dsl_function", "")
                         if failed_idx < len(active_cand.steps)
-                        else "step"
+                        else (pending_step.dsl_function or "step")
+                    )
+                    diag_text = self._build_step_contradiction_diagnostic(
+                        step=pending_step,
+                        judgment=judgment,
+                        planning_set=planning_set,
+                        attempt_idx=len(getattr(epistemic_memory, "current_level_attempts", [])) + 1,
                     )
                     epistemic_memory.record_attempt_feedback(
                         hypothesis=f"Candidate {active_cand.trajectory_id}",
@@ -500,6 +631,9 @@ class SymbolicTrajectoryExecutor:
                             f"Step {failed_idx + 1} ({failed_fn}) failed: {judgment.explanation}. "
                             f"The object hit an obstacle/boundary or had no effect. DO NOT execute {failed_fn} again from this position!"
                         ),
+                        diff_summary=diff_summary,
+                        effective_steps=list(active_cand.step_effects),
+                        diagnostic=diag_text,
                     )
                 else:
                     traj_sig = format_sequence_signature(active_cand.steps)
@@ -512,6 +646,8 @@ class SymbolicTrajectoryExecutor:
                         trajectory_summary=traj_sig,
                         status="executed_but_level_not_won",
                         reason="Trajectory executed completely but game did not advance to next level. Invariant or target pattern was incorrect. DO NOT REPEAT THIS SEQUENCE!",
+                        diff_summary=diff_summary,
+                        effective_steps=list(active_cand.step_effects),
                     )
         elif (is_won or level_completed) and active_cand is not None:
             logger.info(f"SymbolicExecutor: Candidate {active_cand.trajectory_id} achieved goal/level completion.")
@@ -553,5 +689,119 @@ class SymbolicTrajectoryExecutor:
             reset_needed=reset_needed,
             falsification_detected=falsification_detected,
             falsified_action=falsified_action,
+        )
+
+    def _build_step_contradiction_diagnostic(
+        self,
+        step: GroundedStep,
+        judgment: BrusentsovJudgment,
+        planning_set: PlanningSet | None,
+        attempt_idx: int,
+    ) -> str:
+        """Format strict differential diagnostic for a physically contradicted step."""
+        fn = step.dsl_function or "action"
+        step_id = step.step_id or "s1"
+        alias_map = planning_set.object_real_to_alias if planning_set and hasattr(planning_set, "object_real_to_alias") else {}
+
+        def _alias(s_id: str) -> str:
+            return alias_map.get(s_id, s_id)
+
+        expected_parts: list[str] = []
+        observed_parts: list[str] = []
+
+        expected_motion_aliases: list[str] = []
+        expected_unchanged_aliases: list[str] = []
+        stagnant_aliases: list[str] = []
+        mutated_aliases: list[str] = []
+
+        # Analyze expectations
+        for p in step.expected_propositions:
+            alias = _alias(p.subject_id)
+            pred = p.predicate.lower()
+            if pred in ("moved", "step_moved") or (pred in ("dy", "dx", "row_delta", "col_delta") and p.value != 0):
+                if alias not in expected_motion_aliases:
+                    expected_motion_aliases.append(alias)
+                    expected_parts.append(f"moved({alias})")
+            elif pred in ("unchanged", "preserved") or (pred in ("dy", "dx", "row_delta", "col_delta") and p.value == 0):
+                if alias not in expected_unchanged_aliases:
+                    expected_unchanged_aliases.append(alias)
+                    expected_parts.append(f"unchanged({alias})")
+
+        # Analyze observations for expected actors and other participating objects
+        obs_motion: dict[str, bool] = {}
+        for o in judgment.observed_propositions:
+            alias = _alias(o.subject_id)
+            pred = o.predicate.lower()
+            if pred in ("step_moved", "moved"):
+                v = o.value
+                is_mov = False
+                if isinstance(v, (tuple, list)) and len(v) >= 2:
+                    is_mov = (v[0] != 0 or v[1] != 0)
+                elif isinstance(v, str):
+                    clean_v = v.strip("()[]")
+                    parts = [p.strip() for p in clean_v.split(",") if p.strip()]
+                    if len(parts) >= 2:
+                        is_mov = any(int(x) != 0 for x in parts if x.lstrip("-").isdigit())
+                if is_mov:
+                    obs_motion[alias] = True
+                elif alias not in obs_motion:
+                    obs_motion[alias] = False
+            elif pred in ("dy", "dx", "row_delta", "col_delta"):
+                try:
+                    if int(o.value) != 0:
+                        obs_motion[alias] = True
+                    elif alias not in obs_motion:
+                        obs_motion[alias] = False
+                except (ValueError, TypeError):
+                    pass
+
+        for alias in expected_motion_aliases:
+            if obs_motion.get(alias, False):
+                observed_parts.append(f"moved({alias})")
+            else:
+                observed_parts.append(f"stationary({alias})")
+                stagnant_aliases.append(alias)
+
+        for alias in expected_unchanged_aliases:
+            if obs_motion.get(alias, False):
+                observed_parts.append(f"moved({alias})")
+                mutated_aliases.append(alias)
+            else:
+                observed_parts.append(f"stationary({alias})")
+
+        # Also check if any other alias moved that wasn't expected to move
+        for alias, moved in obs_motion.items():
+            if moved and alias not in expected_motion_aliases and alias not in mutated_aliases:
+                mutated_aliases.append(alias)
+                if f"moved({alias})" not in observed_parts:
+                    observed_parts.append(f"moved({alias})")
+
+        exp_str = " & ".join(expected_parts) if expected_parts else "unspecified"
+        obs_str = " & ".join(observed_parts) if observed_parts else "unspecified"
+
+        if mutated_aliases and stagnant_aliases:
+            diagnosis = (
+                f"{fn} mutates alias {', '.join(mutated_aliases)}, not alias {', '.join(stagnant_aliases)}. "
+                f"Do NOT repeat {fn} for moving {', '.join(stagnant_aliases)}."
+            )
+        elif stagnant_aliases:
+            diagnosis = (
+                f"{fn} had no effect on alias {', '.join(stagnant_aliases)} (stationary/blocked). "
+                f"Do NOT repeat {fn} for moving {', '.join(stagnant_aliases)}."
+            )
+        elif mutated_aliases:
+            diagnosis = (
+                f"{fn} unexpectedly mutated alias {', '.join(mutated_aliases)} violating invariance. "
+                f"Do NOT repeat {fn}."
+            )
+        else:
+            diagnosis = f"{fn} produced contradiction: {judgment.explanation}. Do NOT repeat."
+
+        return (
+            f"[FAILED ATTEMPT {attempt_idx} DIAGNOSTIC]\n"
+            f"  Failed at step {step_id} ({fn}): Mismatch detected.\n"
+            f"  EXPECTED: {exp_str}\n"
+            f"  OBSERVED: {obs_str}\n"
+            f"  DIAGNOSIS: {diagnosis}"
         )
 

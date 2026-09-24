@@ -219,3 +219,179 @@ def test_clean_tracker_reset_on_environmental_reset():
     assert len(verifier.tracker.tracks) == 0
     assert verifier.tracker.next_track_num == 1
     assert verifier.tracker.frame_index == 0
+
+
+def test_tracker_ambiguity_restricted_to_main_actors():
+    """Verify ambiguous matching on background dots does NOT trigger UNDECIDED when main actor is clear."""
+    cfg = V10Config(
+        enable_persistent_tracker=True,
+        enable_undecided_verdict=True,
+        matching_ambiguity_threshold=0.20,
+    )
+    verifier = LayeredVerifier(cfg)
+
+    # Frame 1:
+    # Main actor: 2x2 blue square (color 1, area 4) at rows 0-1, cols 0-1
+    # Noise dots: two color 3 dots at col 10 and 12 (area 1 each)
+    grid1 = [[0] * 20 for _ in range(5)]
+    grid1[0][0] = 1
+    grid1[0][1] = 1
+    grid1[1][0] = 1
+    grid1[1][1] = 1
+    grid1[0][10] = 3
+    grid1[0][12] = 3
+
+    snap1 = extract_arga_snapshot(grid1)
+    pset = build_planning_set(snap1, ["ACTION1"], tracker=verifier.tracker)
+
+    # Frame 2:
+    # Main actor moves right by 1 (clear, unambiguous)
+    # The two dots are placed equidistant from previous positions creating ambiguity between them
+    grid2 = [[0] * 20 for _ in range(5)]
+    grid2[0][1] = 1
+    grid2[0][2] = 1
+    grid2[1][1] = 1
+    grid2[1][2] = 1
+    grid2[0][9] = 3
+    grid2[0][11] = 3
+
+    # Main actor is identified in expected_propositions
+    main_obj = [o for o in snap1.objects if o.area >= 4][0]
+    step = GroundedStep(
+        step_id="s1",
+        dsl_function="action1",
+        arguments={},
+        expected_propositions=PropositionSet.from_iterable([
+            AtomicProposition(family="metric_sign", subject_id=main_obj.id, predicate="col_delta", value=1)
+        ]),
+    )
+
+    judgment = verifier.evaluate_transition(
+        step=step,
+        before_snapshot=snap1,
+        after_obs={"grid": grid2, "state": "IN_PROGRESS"},
+        planning_set=pset,
+    )
+
+    # Main actor is clear; background dots ambiguity does NOT block execution
+    assert judgment.verdict == Verdict.FOLLOW
+
+
+def test_compound_object_internal_dots_ambiguity_ignored():
+    """Verify that when a compound object and its internal dots move without explicit EXPECT,
+    internal dot ambiguity is ignored and does NOT trigger UNDECIDED."""
+    cfg = V10Config(
+        enable_persistent_tracker=True,
+        enable_undecided_verdict=True,
+        matching_ambiguity_threshold=0.20,
+    )
+    verifier = LayeredVerifier(cfg)
+
+    # Frame 1: Container object (color 1, rows 0-4, cols 0-4, with a hole inside)
+    # containing two internal dots (color 2) at (1, 1) and (1, 3)
+    grid1 = [[0] * 15 for _ in range(10)]
+    for r in range(5):
+        for c in range(5):
+            grid1[r][c] = 1
+    # internal dots
+    grid1[1][1] = 2
+    grid1[1][3] = 2
+
+    snap1 = extract_arga_snapshot(grid1)
+    pset = build_planning_set(snap1, ["ACTION1"], tracker=verifier.tracker)
+
+    # Frame 2: Entire container + dots moved right by 1
+    grid2 = [[0] * 15 for _ in range(10)]
+    for r in range(5):
+        for c in range(5):
+            grid2[r][c + 1] = 1
+    grid2[1][2] = 2
+    grid2[1][4] = 2
+
+    # Step has empty expected_propositions (e.g. repeat step s1 of a trajectory)
+    step = GroundedStep(
+        step_id="s1",
+        dsl_function="action1",
+        arguments={},
+        expected_propositions=PropositionSet.empty(),
+    )
+
+    judgment = verifier.evaluate_transition(
+        step=step,
+        before_snapshot=snap1,
+        after_obs={"grid": grid2, "state": "IN_PROGRESS"},
+        planning_set=pset,
+    )
+
+    # Internal sibling dots ambiguity must NOT trigger UNDECIDED
+    assert judgment.verdict != Verdict.UNDECIDED
+    assert judgment.verdict in (Verdict.FOLLOW, Verdict.OMIT)
+
+
+def test_tier4b_empty_expect_ignores_passive_occluded_socket_ambiguity():
+    """Verify that when EXPECT is empty, a passive static socket whose visible area changes
+    due to partial overlap is excluded from participating actors and does not trigger UNDECIDED."""
+    cfg = V10Config(
+        enable_persistent_tracker=True,
+        enable_undecided_verdict=True,
+        matching_ambiguity_threshold=0.20,
+    )
+    verifier = LayeredVerifier(cfg)
+
+    # Frame 1:
+    # Moving piece: blue (1), 2x2 at cols 0-1
+    # Static target socket: green (3), 2x2 at cols 3-4
+    grid1 = [[0] * 10 for _ in range(5)]
+    grid1[0][0] = 1
+    grid1[0][1] = 1
+    grid1[1][0] = 1
+    grid1[1][1] = 1
+
+    grid1[0][3] = 3
+    grid1[0][4] = 3
+    grid1[1][3] = 3
+    grid1[1][4] = 3
+
+    snap1 = extract_arga_snapshot(grid1)
+    pset = build_planning_set(snap1, ["ACTION1"], tracker=verifier.tracker)
+
+    # Frame 2:
+    # Moving piece moves right to cols 2-3 (overlaps col 3 of the socket)
+    # The socket is static at col 4 (area reduced from 4 to 2)
+    grid2 = [[0] * 10 for _ in range(5)]
+    grid2[0][2] = 1
+    grid2[0][3] = 1
+    grid2[1][2] = 1
+    grid2[1][3] = 1
+
+    grid2[0][4] = 3
+    grid2[1][4] = 3
+
+    # Manually inject low ambiguity margin on the passive socket's track to simulate fragmentation ambiguity
+    if verifier.tracker:
+        verifier.tracker.update(snap1, frame_index=0)
+        for trk_id, trk in verifier.tracker.tracks.items():
+            if trk.color == 3:
+                verifier.tracker.ambiguity_by_track[trk_id] = {"diff": 0.02, "is_internal_sibling": False}
+
+    # Step with empty expected_propositions
+    step = GroundedStep(
+        step_id="s13",
+        dsl_function="action1",
+        arguments={},
+        expected_propositions=PropositionSet.empty(),
+    )
+
+    judgment = verifier.evaluate_transition(
+        step=step,
+        before_snapshot=snap1,
+        after_obs={"grid": grid2, "state": "IN_PROGRESS"},
+        planning_set=pset,
+    )
+
+    # The passive socket must NOT trigger UNDECIDED
+    assert judgment.verdict != Verdict.UNDECIDED
+    assert judgment.verdict in (Verdict.FOLLOW, Verdict.OMIT)
+
+
+

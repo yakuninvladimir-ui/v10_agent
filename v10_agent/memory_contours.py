@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from v10_agent.brusentsov_logic import BrusentsovJudgment, Ternary
 
@@ -20,6 +20,107 @@ import re
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+from enum import Enum
+
+
+class EntityRole(str, Enum):
+    """Semantic functional role of a color in the game grid (palette 0..15)."""
+    BACKGROUND = "background"
+    ACTOR = "actor"
+    OBSTACLE = "obstacle"
+    HAZARD = "hazard"
+    TARGET = "target"
+    COLLECTIBLE = "collectible"
+    PORTAL = "portal"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ColorAffordance:
+    """Affordance record for a single color index (0..15) in the ARC-AGI-3 palette."""
+    color_id: int
+    role: EntityRole = EntityRole.UNKNOWN
+    is_dynamic: bool = False
+    pixel_count: int = 0
+    interaction_count: int = 0
+    confidence: float = 0.0
+    evidence: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "color_id": self.color_id,
+            "role": self.role.value,
+            "is_dynamic": self.is_dynamic,
+            "pixel_count": self.pixel_count,
+            "interaction_count": self.interaction_count,
+            "confidence": round(self.confidence, 2),
+            "evidence": list(self.evidence),
+        }
+
+
+@dataclass
+class PaletteRoleMap:
+    """Semantic mapping of all 16 ARC-AGI-3 colors (0..15) to functional roles.
+
+    Replaces destructive color erasure ([COLOR]) with role-aware generalization.
+    """
+    colors: list[ColorAffordance] = field(default_factory=lambda: [
+        ColorAffordance(color_id=i) for i in range(16)
+    ])
+
+    def get(self, color_id: int) -> ColorAffordance:
+        if 0 <= color_id < len(self.colors):
+            return self.colors[color_id]
+        return ColorAffordance(color_id=color_id)
+
+    def assign_role(self, color_id: int, role: EntityRole, confidence: float = 0.5, evidence: str = "") -> None:
+        if 0 <= color_id < len(self.colors):
+            aff = self.colors[color_id]
+            if confidence >= aff.confidence or aff.role == EntityRole.UNKNOWN:
+                aff.role = role
+                aff.confidence = max(aff.confidence, confidence)
+                if evidence:
+                    aff.evidence.append(evidence)
+
+    def get_colors_by_role(self, role: EntityRole) -> list[ColorAffordance]:
+        return [c for c in self.colors if c.role == role]
+
+    def get_role_label(self, color_id: int) -> str:
+        if 0 <= color_id < len(self.colors):
+            aff = self.colors[color_id]
+            return f"Color {color_id} ({aff.role.value.upper()})"
+        return f"Color {color_id} (UNKNOWN)"
+
+    def generalize_color_reference(self, text: str) -> str:
+        """Replace color IDs with role-aware labels instead of destructive [COLOR] erasure."""
+        def _replace_color(m: re.Match) -> str:
+            try:
+                cid = int(m.group(1))
+                return self.get_role_label(cid)
+            except (ValueError, IndexError):
+                return m.group(0)
+
+        text = re.sub(r"\bcolor\s+(\d+)\b", _replace_color, text, flags=re.IGNORECASE)
+        text = re.sub(r"\bcolor_(\d+)\b", _replace_color, text, flags=re.IGNORECASE)
+        text = re.sub(r"\(color\s+(\d+)\)", lambda m: f"({_replace_color(m)})", text, flags=re.IGNORECASE)
+        return text
+
+    def format_for_prompt(self) -> str:
+        lines = ["PALETTE MAPPING (16 Colors, 0..15):"]
+        for aff in self.colors:
+            if aff.role != EntityRole.UNKNOWN or aff.pixel_count > 0:
+                status = "dynamic" if aff.is_dynamic else "static"
+                lines.append(
+                    f"  Color {aff.color_id}: {aff.role.value.upper()} ({status}, "
+                    f"pixels={aff.pixel_count}, confidence={aff.confidence:.1f})"
+                )
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"colors": [c.to_dict() for c in self.colors if c.role != EntityRole.UNKNOWN or c.pixel_count > 0]}
+
 
 class IsolationViolationError(RuntimeError):
     """Raised when an architectural memory contour invariant (ISO-1..ISO-5) is violated."""
@@ -70,6 +171,67 @@ FORBIDDEN_GOAL_PATTERNS_IN_CODER = [
 ]
 
 
+def summarize_grid_diff(
+    before_grid: Sequence[Sequence[int]] | None,
+    after_grid: Sequence[Sequence[int]] | None,
+) -> str:
+    """Summarize the physical cell-by-cell differential between two grids.
+
+    Follows Cartesian coordinate system: x=col, y=row.
+    Reports:
+    - If 0 cells changed: '0 cells changed (no visible change on grid)'
+    - If <= 12 cells changed: explicit listing '(x=col, y=row): c_before -> c_after'
+    - Aggregate transition counts: '[c_from->c_to (cnt cells)]'
+    - Inclusive bounding box of changes: 'in bbox: cols {min_c}..{max_c} (inclusive), rows {min_r}..{max_r} (inclusive)'
+    """
+    if before_grid is None or after_grid is None:
+        return "no grid data available"
+    h = len(before_grid)
+    w = len(before_grid[0]) if h > 0 else 0
+    h_after = len(after_grid)
+    w_after = len(after_grid[0]) if h_after > 0 else 0
+    if h != h_after or w != w_after:
+        return f"grid dimensions changed: {h}x{w} -> {h_after}x{w_after}"
+    if h == 0 or w == 0:
+        return "0 cells changed (empty grid)"
+
+    changed_cells: list[tuple[int, int, int, int]] = []
+    transitions: dict[tuple[int, int], int] = {}
+    min_r, max_r = h, -1
+    min_c, max_c = w, -1
+
+    for r in range(h):
+        row_b = before_grid[r]
+        row_a = after_grid[r]
+        for c in range(min(len(row_b), len(row_a))):
+            cb = int(row_b[c])
+            ca = int(row_a[c])
+            if cb != ca:
+                changed_cells.append((c, r, cb, ca))
+                transitions[(cb, ca)] = transitions.get((cb, ca), 0) + 1
+                if r < min_r:
+                    min_r = r
+                if r > max_r:
+                    max_r = r
+                if c < min_c:
+                    min_c = c
+                if c > max_c:
+                    max_c = c
+
+    if not changed_cells:
+        return "0 cells changed (no visible change on grid)"
+
+    trans_strs = [f"{cb}->{ca} ({cnt} cells)" for (cb, ca), cnt in sorted(transitions.items())]
+    trans_part = ", ".join(trans_strs)
+    bbox_part = f"in bbox: cols {min_c}..{max_c} (inclusive), rows {min_r}..{max_r} (inclusive)"
+
+    if len(changed_cells) <= 12:
+        cells_str = ", ".join(f"(x={c}, y={r}): {cb}->{ca}" for c, r, cb, ca in changed_cells)
+        return f"{len(changed_cells)} cells changed [{trans_part}] at {cells_str}; {bbox_part}"
+    else:
+        return f"{len(changed_cells)} cells changed [{trans_part}]; {bbox_part}"
+
+
 @dataclass
 class ProbeRecord:
     """Record of an exploratory probe action executed in the environment."""
@@ -79,6 +241,7 @@ class ProbeRecord:
     observed_effect: str
     confidence: float
     timestamp: float = field(default_factory=time.time)
+    affordance: dict[str, Any] | None = None
 
 
 FORBIDDEN_SPEC_KEYS = frozenset({
@@ -233,27 +396,46 @@ class EpistemicMemory:
         trajectory_summary: str,
         status: str,
         reason: str,
+        diff_summary: str | None = None,
+        effective_steps: list[str] | None = None,
+        diagnostic: str | None = None,
     ) -> None:
-        """Record attempt failure/rejection in current level scratchpad."""
-        self.current_level_attempts.append({
+        """Record attempt failure/rejection in current level scratchpad with differential before/after tracking."""
+        entry: dict[str, Any] = {
             "attempt_index": len(self.current_level_attempts) + 1,
             "hypothesis": hypothesis,
             "trajectory": trajectory_summary,
             "status": status,
             "reason": reason,
-        })
+        }
+        if diff_summary:
+            entry["diff_summary"] = diff_summary
+        if effective_steps:
+            entry["effective_steps"] = list(effective_steps)
+        if diagnostic:
+            entry["diagnostic"] = diagnostic
+        self.current_level_attempts.append(entry)
         if len(self.current_level_attempts) > 5:
             self.current_level_attempts.pop(0)
 
     def format_scratchpad_context(self) -> str:
-        """Format current-level failed attempts so the Solver avoids repeating mistakes."""
+        """Format current-level failed attempts with differential before/after analysis."""
         if not self.current_level_attempts:
             return ""
-        lines = ["CURRENT LEVEL FAILED ATTEMPTS IN SHORT-TERM SCRATCHPAD (DO NOT REPEAT):"]
+        lines = ["CURRENT LEVEL FAILED ATTEMPTS (DIFFERENTIAL BEFORE/AFTER SCRATCHPAD):"]
         for att in self.current_level_attempts:
             lines.append(
-                f"- Attempt {att['attempt_index']}: [{att.get('status')}] Reason: {att.get('reason')}. Trajectory: {att.get('trajectory')}"
+                f"- Attempt {att['attempt_index']}: [{att.get('status')}] Trajectory: {att.get('trajectory')}"
             )
+            if att.get("diagnostic"):
+                for d_line in att["diagnostic"].splitlines():
+                    lines.append(f"  {d_line}")
+            if att.get("diff_summary"):
+                lines.append(f"  * Physical grid diff (before vs after attempt): {att['diff_summary']}")
+            if att.get("effective_steps"):
+                lines.append(f"  * Effective steps during attempt: {'; '.join(att['effective_steps'])}")
+            if att.get("reason"):
+                lines.append(f"  * Failure reason: {att['reason']}")
         return "\n".join(lines)
 
     def pause_branch_as_omit(self, branch: BranchSignature) -> None:
@@ -330,6 +512,10 @@ class EpistemicMemory:
         self.current_level_attempts.clear()
         self.failed_completed_trajectories.clear()
 
+    def clear_for_new_level(self) -> None:
+        """Clear intra-level history when transitioning to a new level."""
+        self.clear()
+
 
 TIER_RULES = [
     # (tier, pattern, description/type)
@@ -381,6 +567,146 @@ class StructuredInvariant:
 
 
 @dataclass
+class LevelVictoryExample:
+    """Neutral illustrative example of how a past level was solved (not a prescriptive template)."""
+    level_id: str
+    winning_actions: list[str] = field(default_factory=list)
+    object_diffs: list[dict[str, Any]] = field(default_factory=list)
+    static_objects: list[str] = field(default_factory=list)
+    initial_objects: list[dict[str, Any]] = field(default_factory=list)
+    goal_rule: str = ""
+    start_grid_hash: str = ""
+    end_grid_hash: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "level_id": self.level_id,
+            "winning_actions": list(self.winning_actions),
+            "object_diffs": list(self.object_diffs),
+            "static_objects": list(self.static_objects),
+            "initial_objects": list(self.initial_objects),
+            "goal_rule": self.goal_rule,
+            "start_grid_hash": self.start_grid_hash,
+            "end_grid_hash": self.end_grid_hash,
+        }
+
+
+@dataclass
+class DefeatExemplar:
+    """Concrete example of a fatal error — grounding for NEGATIVE_BARRIER invariants (xy'_0 → NULL)."""
+    level_index: int
+    fatal_step: int
+    fatal_action_id: int                         # 1..6
+    fatal_coords: tuple[int, int] | None = None  # (x, y) for ACTION6
+    actor_position_before: tuple[int, int] = (0, 0)
+    hazard_color: int = -1                       # Color 0..15
+    pre_defeat_subgrid: list[list[int]] = field(default_factory=list)
+    environment_signal: str = ""
+    explanation: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "level_index": self.level_index, "fatal_step": self.fatal_step,
+            "fatal_action_id": self.fatal_action_id, "fatal_coords": self.fatal_coords,
+            "actor_position_before": self.actor_position_before,
+            "hazard_color": self.hazard_color, "environment_signal": self.environment_signal,
+            "explanation": self.explanation,
+        }
+
+    def format_for_prompt(self) -> str:
+        coord_str = f" at coords ({self.fatal_coords[0]}, {self.fatal_coords[1]})" if self.fatal_coords else ""
+        return (
+            f"LAST DEFEAT (Level {self.level_index}, Step {self.fatal_step}):\n"
+            f"  Action: ACTION{self.fatal_action_id}{coord_str}\n"
+            f"  Actor was at: row={self.actor_position_before[0]}, col={self.actor_position_before[1]}\n"
+            f"  Hazard color: {self.hazard_color}\n"
+            f"  Signal: {self.environment_signal}\n"
+            f"  Lesson: {self.explanation}"
+        )
+
+
+@dataclass
+class VictoryExemplar:
+    """Concrete example of level completion — grounding for POSITIVE_CANON invariants (xy → FOLLOW)."""
+    level_index: int
+    total_steps: int
+    action_sequence: list[int] = field(default_factory=list)
+    key_transitions: list[dict[str, Any]] = field(default_factory=list)
+    final_action_id: int = 0
+    target_color: int = -1                      # Color 0..15
+    final_subgrid: list[list[int]] = field(default_factory=list)
+    explanation: str = ""
+    winning_invariants_used: list[str] = field(default_factory=list)
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "level_index": self.level_index, "total_steps": self.total_steps,
+            "action_sequence": list(self.action_sequence),
+            "key_transitions": list(self.key_transitions),
+            "final_action_id": self.final_action_id, "target_color": self.target_color,
+            "explanation": self.explanation,
+            "winning_invariants_used": list(self.winning_invariants_used),
+        }
+
+    def format_for_prompt(self) -> str:
+        seq_str = " → ".join(str(a) for a in self.action_sequence[:20])
+        if len(self.action_sequence) > 20:
+            seq_str += "..."
+        lines = [
+            f"LAST VICTORY (Level {self.level_index}, {self.total_steps} steps):",
+            f"  Winning sequence: [{seq_str}]",
+            f"  Final action: ACTION{self.final_action_id} → reached Color {self.target_color} (TARGET)",
+        ]
+        if self.key_transitions:
+            lines.append("  Key breakthroughs:")
+            for kt in self.key_transitions[:5]:
+                lines.append(f"    - Step {kt.get('step', '?')}: {kt.get('description', 'transition')}")
+        lines.append(f"  Explanation: {self.explanation}")
+        return "\n".join(lines)
+
+
+@dataclass
+class GroundedInvariant:
+    """Symbolic invariant grounded in concrete exemplars via Brusentsov logic of entailment."""
+    invariant_id: str
+    antecedent: str               # e.g., 'Contact(ACTOR, Color_2)'
+    consequent: str               # e.g., 'DefeatReset()'
+    brusentsov_type: str          # 'NEGATIVE_BARRIER' or 'POSITIVE_CANON'
+    scope: str                    # 'CORE_GAME_LAW' or 'LEVEL_SPECIFIC'
+    grounded_in_defeat: DefeatExemplar | None = None
+    grounded_in_victory: VictoryExemplar | None = None
+    times_confirmed: int = 0
+    times_falsified: int = 0
+    confidence: float = 0.5
+    created_on_level: int = 0
+
+    def is_active(self) -> bool:
+        return self.times_falsified == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "invariant_id": self.invariant_id, "antecedent": self.antecedent,
+            "consequent": self.consequent, "brusentsov_type": self.brusentsov_type,
+            "scope": self.scope, "times_confirmed": self.times_confirmed,
+            "times_falsified": self.times_falsified, "confidence": round(self.confidence, 2),
+        }
+        if self.grounded_in_defeat:
+            result["defeat_exemplar"] = self.grounded_in_defeat.to_dict()
+        if self.grounded_in_victory:
+            result["victory_exemplar"] = self.grounded_in_victory.to_dict()
+        return result
+
+    def format_for_prompt(self) -> str:
+        status = "ACTIVE" if self.is_active() else f"FALSIFIED ({self.times_falsified}x)"
+        return (
+            f"[{self.brusentsov_type}] {self.antecedent} => {self.consequent} "
+            f"(scope={self.scope}, confirmed={self.times_confirmed}x, status={status})"
+        )
+
+
+@dataclass
 class GameMemory:
     """Cross-level memory summary surviving level transitions within the same game.
     
@@ -403,7 +729,27 @@ class GameMemory:
     structured_invariants: list[StructuredInvariant] = field(default_factory=list)
     last_discovered_invariants: list[Any] = field(default_factory=list)
     invalidated_invariants: list[dict[str, Any]] = field(default_factory=list)
+    last_level_victory_example: LevelVictoryExample | None = None
     confirmed_actor_ids: set[str] = field(default_factory=set)
+    # --- New memory blocks ---
+    palette: PaletteRoleMap = field(default_factory=PaletteRoleMap)
+    last_defeat_exemplar: DefeatExemplar | None = None
+    last_victory_exemplar_v2: VictoryExemplar | None = None
+    grounded_invariants: list[GroundedInvariant] = field(default_factory=list)
+    curriculum_history: list[dict[str, Any]] = field(default_factory=list)
+    working_hypotheses: list[dict[str, Any]] = field(default_factory=list)
+    action_affordances: list[dict[str, Any]] = field(default_factory=list)
+
+    def update_action_affordances(self, affordances: list[dict[str, Any]]) -> None:
+        """Record or update confirmed action affordances."""
+        for aff in affordances:
+            if isinstance(aff, dict) and aff.get("action_id"):
+                act_id = str(aff["action_id"]).upper()
+                self.action_affordances = [
+                    a for a in self.action_affordances
+                    if not (isinstance(a, dict) and str(a.get("action_id", "")).upper() == act_id)
+                ]
+                self.action_affordances.append(dict(aff))
 
     @property
     def confirmed_actors(self) -> set[str]:
@@ -446,19 +792,23 @@ class GameMemory:
         return role_map
 
     def _generalize_text(self, text: str) -> str:
-        r"""Replace specific object IDs with functional role markers and strip level-local colors (ISO-8).
+        r"""Replace specific object IDs with functional role markers and generalize colors via palette roles (ISO-8).
 
         Confirmed actors → [ACTOR], destinations → [TARGET],
         collision objects → [OBSTACLE], unknown → [ENTITY].
-        Also strips specific (color N) and color_\d+ literals so palettes don't contaminate new levels.
+        Colors are generalized using PaletteRoleMap semantic roles instead of destructive [COLOR] erasure.
         """
         for obj_id, role in self._build_role_map().items():
             text = text.replace(obj_id, f"[{role}]")
         # Any remaining unknown obj_... replaced by [ENTITY]
         text = re.sub(r"obj_[a-zA-Z0-9_]+", "[ENTITY]", text)
-        # ISO-8: Strip concrete color specifications across level transitions
-        text = re.sub(r"\b(?:color\s+\d+|color_\d+)\b", "[COLOR]", text, flags=re.IGNORECASE)
-        text = re.sub(r"\(color\s+\d+\)", "[COLOR]", text, flags=re.IGNORECASE)
+        # Use PaletteRoleMap for semantic color generalization instead of [COLOR] erasure
+        if hasattr(self, 'palette') and self.palette is not None:
+            text = self.palette.generalize_color_reference(text)
+        else:
+            # Fallback: preserve color identity with uppercase marker
+            text = re.sub(r"\b(?:color\s+\d+|color_\d+)\b", lambda m: f"[{m.group(0).upper()}]", text, flags=re.IGNORECASE)
+            text = re.sub(r"\(color\s+\d+\)", lambda m: f"[{m.group(0).upper()}]", text, flags=re.IGNORECASE)
         return text
 
     def _is_level_specific(self, text: str) -> bool:
@@ -528,13 +878,8 @@ class GameMemory:
             self.selection_mechanics.append(note)
         
         metadata = {}
-        m_ax = re.search(r"axis_steps=([+-]?\d+)", note)
-        m_pc = re.search(r"piece_steps=([+-]?\d+)", note)
-        if m_ax and m_pc:
-            metadata["axis_steps"] = int(m_ax.group(1))
-            metadata["piece_steps"] = int(m_pc.group(1))
-
-        m_src = re.search(r"internal dots moved from\s+(obj_[a-zA-Z0-9_]+)", note)
+        # Extract general actor/source entity from selection mechanic note
+        m_src = re.search(r"(?:moved|controlled|active|source)\s+(?:from\s+)?(obj_[a-zA-Z0-9_]+)", note, re.IGNORECASE)
         if m_src:
             metadata["init_source_entity"] = m_src.group(1)
 
@@ -542,7 +887,14 @@ class GameMemory:
         if m_act:
             metadata["action_id"] = m_act.group(1).upper()
 
-        inv_type = "kinematics"  # We use kinematics so VirtualSandbox can read it as physics
+        # Extract displacement if present
+        m_dy = re.search(r"dy=([+-]?\d+)", note)
+        m_dx = re.search(r"dx=([+-]?\d+)", note)
+        if m_dy and m_dx:
+            metadata["dy"] = int(m_dy.group(1))
+            metadata["dx"] = int(m_dx.group(1))
+
+        inv_type = "kinematics"
         self.record_stratified_invariant(note, tier=2, invariant_type=inv_type, confidence=0.8, source="selection_probe", metadata=metadata)
 
     def record_reusable_primitive(self, fn_meta: dict[str, Any]) -> None:
@@ -645,6 +997,73 @@ class GameMemory:
                     source="level_solution",
                     metadata={"level_id": level_id},
                 )
+
+    def record_level_victory_example(
+        self,
+        level_id: str,
+        winning_actions: list[str],
+        object_diffs: list[dict[str, Any]],
+        static_objects: list[str] | None = None,
+        initial_objects: list[dict[str, Any]] | None = None,
+        goal_rule: str = "",
+        start_grid_hash: str = "",
+        end_grid_hash: str = "",
+    ) -> None:
+        """Record an illustrative factual victory example from a completed level."""
+        self.last_level_victory_example = LevelVictoryExample(
+            level_id=str(level_id),
+            winning_actions=list(winning_actions),
+            object_diffs=list(object_diffs),
+            static_objects=list(static_objects or []),
+            initial_objects=list(initial_objects or []),
+            goal_rule=str(goal_rule),
+            start_grid_hash=start_grid_hash,
+            end_grid_hash=end_grid_hash,
+        )
+
+    def format_previous_level_example(self) -> str:
+        """Format last completed level victory as an illustrative example, not a prescriptive template."""
+        if not self.last_level_victory_example:
+            return ""
+        ex = self.last_level_victory_example
+        lines = [
+            f"PREVIOUS LEVEL EXAMPLE (Level {ex.level_id} victory - illustrative only, do not blindly copy):",
+        ]
+        if ex.initial_objects:
+            lines.append("- Initial State Objects:")
+            for io in ex.initial_objects:
+                name = io.get("name", io.get("alias", io.get("id", "object")))
+                color = io.get("color", "?")
+                bbox = io.get("bbox", [])
+                role = io.get("role", "object")
+                desc = io.get("description", "")
+                extra = f": {desc}" if desc else ""
+                lines.append(f"  * {name} (color {color}, bbox {bbox}, {role}){extra}")
+
+        if ex.object_diffs:
+            lines.append("- Observed Object Changes for Win:")
+            for od in ex.object_diffs:
+                alias = od.get("alias", od.get("id", "object"))
+                dy = od.get("dy")
+                dx = od.get("dx")
+                color_change = od.get("color_change")
+                change_parts = []
+                if dy is not None and dx is not None and (dy != 0 or dx != 0):
+                    change_parts.append(f"displaced by (dy={dy:+d}, dx={dx:+d})")
+                if color_change:
+                    change_parts.append(f"color {color_change}")
+                if od.get("status"):
+                    change_parts.append(str(od["status"]))
+                details = ", ".join(change_parts) if change_parts else "transformed"
+                lines.append(f"  * {alias}: {details}")
+        if ex.static_objects:
+            lines.append(f"- Objects Remaining Completely Static: {', '.join(ex.static_objects)}")
+        if ex.winning_actions:
+            lines.append(f"- Winning action sequence ({len(ex.winning_actions)} steps): {' -> '.join(ex.winning_actions[:15])}{'...' if len(ex.winning_actions) > 15 else ''}")
+        if ex.goal_rule:
+            lines.append(f"- Goal pattern observed: {ex.goal_rule}")
+        lines.append("NOTE: This is an example of game logic from the previous level. Use it to understand how actions interact with shapes, not to assume the exact same goal on this level.")
+        return "\n".join(lines)
 
     def _get_invariant(self, inv_id: str) -> StructuredInvariant | None:
         for inv in self.structured_invariants:
@@ -874,6 +1293,84 @@ class GameMemory:
 
         return "\n".join(sections)
 
+    def update_last_defeat(self, exemplar: DefeatExemplar) -> None:
+        """Record the most recent defeat exemplar and auto-create a grounded hazard invariant."""
+        self.last_defeat_exemplar = exemplar
+        if exemplar.hazard_color >= 0:
+            self.palette.assign_role(
+                exemplar.hazard_color, EntityRole.HAZARD, confidence=0.9,
+                evidence=f"Contact caused defeat on level {exemplar.level_index} step {exemplar.fatal_step}",
+            )
+            inv_id = f"gi_hazard_color_{exemplar.hazard_color}"
+            existing = next((g for g in self.grounded_invariants if g.invariant_id == inv_id), None)
+            if existing:
+                existing.grounded_in_defeat = exemplar
+                existing.times_confirmed += 1
+                existing.confidence = min(1.0, existing.confidence + 0.2)
+            else:
+                self.grounded_invariants.append(GroundedInvariant(
+                    invariant_id=inv_id,
+                    antecedent=f"Contact(ACTOR, Color_{exemplar.hazard_color})",
+                    consequent="DefeatReset()",
+                    brusentsov_type="NEGATIVE_BARRIER",
+                    scope="CORE_GAME_LAW",
+                    grounded_in_defeat=exemplar,
+                    times_confirmed=1, confidence=0.9,
+                    created_on_level=exemplar.level_index,
+                ))
+
+    def update_last_victory(self, exemplar: VictoryExemplar) -> None:
+        """Record the most recent victory exemplar and auto-create a grounded target invariant."""
+        self.last_victory_exemplar_v2 = exemplar
+        if exemplar.target_color >= 0:
+            self.palette.assign_role(
+                exemplar.target_color, EntityRole.TARGET, confidence=0.9,
+                evidence=f"Contact triggered victory on level {exemplar.level_index}",
+            )
+            inv_id = f"gi_target_color_{exemplar.target_color}"
+            existing = next((g for g in self.grounded_invariants if g.invariant_id == inv_id), None)
+            if existing:
+                existing.grounded_in_victory = exemplar
+                existing.times_confirmed += 1
+                existing.confidence = min(1.0, existing.confidence + 0.2)
+            else:
+                self.grounded_invariants.append(GroundedInvariant(
+                    invariant_id=inv_id,
+                    antecedent=f"Contact(ACTOR, Color_{exemplar.target_color})",
+                    consequent="LevelVictory()",
+                    brusentsov_type="POSITIVE_CANON",
+                    scope="CORE_GAME_LAW",
+                    grounded_in_victory=exemplar,
+                    times_confirmed=1, confidence=0.9,
+                    created_on_level=exemplar.level_index,
+                ))
+
+    def record_curriculum_transition(self, level_from: int, level_to: int, delta_summary: str) -> None:
+        """Record what changed between levels for curriculum learning."""
+        self.curriculum_history.append({
+            "from_level": level_from, "to_level": level_to,
+            "summary": delta_summary,
+            "core_invariants_carried": len([g for g in self.grounded_invariants if g.is_active() and g.scope == "CORE_GAME_LAW"]),
+            "timestamp": time.time(),
+        })
+
+    def format_grounded_memory_for_prompt(self) -> str:
+        """Format the complete grounded memory block for Solver Turn-1 prompt."""
+        sections = []
+        palette_str = self.palette.format_for_prompt()
+        if palette_str:
+            sections.append(palette_str)
+        if self.last_defeat_exemplar:
+            sections.append(self.last_defeat_exemplar.format_for_prompt())
+        if self.last_victory_exemplar_v2:
+            sections.append(self.last_victory_exemplar_v2.format_for_prompt())
+        active_core = [g for g in self.grounded_invariants if g.is_active() and g.scope == "CORE_GAME_LAW"]
+        if active_core:
+            sections.append("CORE GAME LAWS (verified across levels):")
+            for g in active_core:
+                sections.append(f"  {g.format_for_prompt()}")
+        return "\n\n".join(sections)
+
     def clear(self) -> None:
         self.confirmed_action_effects.clear()
         self.unconfirmed_actions.clear()
@@ -892,7 +1389,8 @@ class GameMemory:
         clean_sm = []
         for s in self.selection_mechanics:
             s_clean = self._generalize_text(s)
-            s_clean = re.sub(r"\s*\(axis_steps=[^)]+\)", "", s_clean)
+            s_clean = re.sub(r"\s*\((?:axis_steps|piece_steps)=[^)]+\)", "", s_clean)
+            s_clean = re.sub(r"\s*\(axis_steps=[^,)]+,\s*piece_steps=[^)]+\)", "", s_clean)
             if s_clean not in clean_sm:
                 clean_sm.append(s_clean)
         self.selection_mechanics = clean_sm

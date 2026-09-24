@@ -24,6 +24,65 @@ logger = logging.getLogger(__name__)
 
 from v10_agent.explorer_agent import clean_and_parse_json
 
+
+def derive_manifest_from_python_source(source: str) -> dict[str, Any]:
+    """Parse Python source and derive canonical v10.dsl_manifest.1 using AST."""
+    import ast
+
+    tree = ast.parse(source)
+    functions: list[dict[str, Any]] = []
+
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            fn_name = node.name
+            doc = ast.get_docstring(node) or f"Declare environment action {fn_name.upper()}."
+
+            num_args = len(node.args.args)
+            num_defaults = len(node.args.defaults)
+            default_start = num_args - num_defaults
+
+            params: list[dict[str, Any]] = []
+            for i, arg in enumerate(node.args.args):
+                if arg.arg == "api":
+                    continue
+                p_name = arg.arg
+                p_type = "int"
+                if arg.annotation:
+                    if isinstance(arg.annotation, ast.Name):
+                        p_type = arg.annotation.id
+                    elif isinstance(arg.annotation, ast.Constant):
+                        p_type = str(arg.annotation.value)
+
+                p_dict: dict[str, Any] = {"name": p_name, "type": p_type}
+                if i >= default_start:
+                    def_node = node.args.defaults[i - default_start]
+                    if isinstance(def_node, ast.Constant):
+                        p_dict["default"] = def_node.value
+                    elif isinstance(def_node, ast.UnaryOp) and isinstance(def_node.op, ast.USub) and isinstance(def_node.operand, ast.Constant):
+                        p_dict["default"] = -def_node.operand.value
+                    else:
+                        p_dict["default"] = 0
+                else:
+                    if p_name in ("x", "y", "count"):
+                        p_dict["default"] = 0
+
+                params.append(p_dict)
+
+            functions.append({
+                "name": fn_name,
+                "parameters": params,
+                "returns": "effect_declaration",
+                "docstring": doc.strip(),
+                "purity": "pure_declaration",
+                "expected_effect_template": {},
+            })
+
+    return {
+        "schema_version": "v10.dsl_manifest.1",
+        "functions": functions,
+    }
+
+
 def extract_code_and_manifest(text: str) -> tuple[str | None, dict[str, Any] | None]:
     """Extract Python source and JSON manifest from Coder model output."""
     clean_text = sanitize_model_response(text)
@@ -54,6 +113,15 @@ def extract_code_and_manifest(text: str) -> tuple[str | None, dict[str, Any] | N
                         manifest = cand
                         break
 
+    # 3. Fallback: if manifest is missing or omitted, automatically derive from Python AST
+    if manifest is None and source:
+        try:
+            derived = derive_manifest_from_python_source(source)
+            if derived.get("functions"):
+                manifest = derived
+        except Exception as exc:
+            logger.debug(f"Could not derive manifest from Python AST: {exc}")
+
     return source, manifest
 
 
@@ -64,11 +132,11 @@ class DSLCoder:
         self,
         config: V10Config,
         advisor: BaseLLMAdvisor,
-        sandbox_executor: SandboxExecutor,
+        sandbox_executor: SandboxExecutor | None = None,
     ):
         self.config = config
         self.advisor = advisor
-        self.sandbox_executor = sandbox_executor
+        self.sandbox_executor = sandbox_executor or SandboxExecutor()
 
     def generate_dsl(
         self,
@@ -154,6 +222,76 @@ class DSLCoder:
                 diagnostics_history.append(err_msg)
                 continue
 
+            # Ensure persistent confirmed actions from game_memory and action_affordances are preserved and augmented
+            confirmed_acts = set()
+            if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
+                confirmed_acts.update(str(a).upper() for a in game_memory.confirmed_action_effects if str(a).upper() not in ("RESET", "ACTION7"))
+            if game_memory is not None and hasattr(game_memory, "action_affordances"):
+                for aff in getattr(game_memory, "action_affordances", []):
+                    if isinstance(aff, dict) and aff.get("action_id"):
+                        act_id = str(aff["action_id"]).upper()
+                        if act_id not in ("RESET", "ACTION7"):
+                            confirmed_acts.add(act_id)
+            if env_spec:
+                if "action_affordances" in env_spec and isinstance(env_spec["action_affordances"], list):
+                    for aff in env_spec["action_affordances"]:
+                        if isinstance(aff, dict) and aff.get("action_id"):
+                            act_id = str(aff["action_id"]).upper()
+                            if act_id not in ("RESET", "ACTION7"):
+                                confirmed_acts.add(act_id)
+                if "available_actions" in env_spec and isinstance(env_spec["available_actions"], list):
+                    for act in env_spec["available_actions"]:
+                        act_id = str(act).upper()
+                        if act_id not in ("RESET", "ACTION7"):
+                            confirmed_acts.add(act_id)
+
+            existing_fn_names = set()
+            for fn in manifest.get("functions", []):
+                if isinstance(fn, dict):
+                    if fn.get("name"):
+                        existing_fn_names.add(str(fn["name"]).lower())
+                    if fn.get("action_id"):
+                        existing_fn_names.add(str(fn["action_id"]).lower())
+            missing_acts = [act for act in confirmed_acts if act.lower() not in existing_fn_names]
+            if missing_acts:
+                missing_code = []
+                for act in sorted(missing_acts):
+                    fn_name = act.lower()
+                    if act == "ACTION6":
+                        missing_code.append(
+                            f"\ndef {fn_name}(api, x=0, y=0):\n"
+                            f"    \"\"\"Preserved confirmed coordinate action.\"\"\"\n"
+                            f"    return api.declare_environment_action(action_id='ACTION6', data={{'x': int(x), 'y': int(y)}})\n"
+                        )
+                        manifest.get("functions", []).append({
+                            "name": fn_name,
+                            "action_id": "ACTION6",
+                            "parameters": [
+                                {"name": "x", "type": "int", "default": 0},
+                                {"name": "y", "type": "int", "default": 0},
+                            ],
+                            "returns": "effect_declaration",
+                            "docstring": "Preserved confirmed coordinate action.",
+                            "purity": "pure_declaration",
+                            "expected_effect_template": {},
+                        })
+                    else:
+                        missing_code.append(
+                            f"\ndef {fn_name}(api):\n"
+                            f"    \"\"\"Preserved confirmed action from earlier level or verified affordance.\"\"\"\n"
+                            f"    return api.declare_environment_action(action_id='{act}')\n"
+                        )
+                        manifest.get("functions", []).append({
+                            "name": fn_name,
+                            "action_id": act,
+                            "parameters": [],
+                            "returns": "effect_declaration",
+                            "docstring": "Preserved confirmed action from earlier level or verified affordance.",
+                            "purity": "pure_declaration",
+                            "expected_effect_template": {},
+                        })
+                source = source + "\n" + "\n".join(missing_code)
+
             # 1. Static AST Sandbox Validation & Compilation
             try:
                 module = self.sandbox_executor.load_module(source, manifest)
@@ -190,6 +328,15 @@ class DSLCoder:
                 continue
 
             # Certified success!
+            allowed_acts = set(confirmed_acts)
+            if env_spec and "available_actions" in env_spec and env_spec["available_actions"]:
+                allowed_acts.update(str(a).upper() for a in env_spec["available_actions"])
+            if allowed_acts:
+                manifest["functions"] = [
+                    fn for fn in manifest.get("functions", [])
+                    if not re.match(r"^ACTION\d+$", str(fn.get("name", "")).upper())
+                    or str(fn.get("name", "")).upper() in allowed_acts
+                ]
             logger.info(f"DSLCoder generated valid DSL module on attempt {attempt}/{retries}")
             return module, manifest, []
 

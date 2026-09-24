@@ -71,8 +71,7 @@ def test_explorer_recursive_loop_and_5_attempt_exhaustion():
                 src = act.get("reasoning", {}).get("source", "")
                 reset_reasons.append(src)
 
-    assert "explorer_retry_clean_state" in reset_reasons
-    assert reset_reasons.count("explorer_retry_clean_state") == 4
+    assert len(reset_reasons) == 0  # Continuous probing without intermediate resets
     assert session.explorer_attempts_this_level == 5
     assert session.session_aborted is True
 

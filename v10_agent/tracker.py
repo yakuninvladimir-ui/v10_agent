@@ -96,6 +96,7 @@ class TrackedObject:
     occluded_by: str | None = None
     cumulative_delta: tuple[float, float] = (0.0, 0.0)
     mask: tuple[tuple[int, ...], ...] = ()
+    source_object_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -126,6 +127,7 @@ class PersistentObjectTracker:
         self.frame_index: int = 0
         self.last_ambiguity_score: float | None = None
         self.last_ambiguous_track: str | None = None
+        self.ambiguity_by_track: dict[str, float] = {}
 
     def reset(self) -> None:
         """Full reset called on every environmental RESET."""
@@ -134,6 +136,7 @@ class PersistentObjectTracker:
         self.frame_index = 0
         self.last_ambiguity_score = None
         self.last_ambiguous_track = None
+        self.ambiguity_by_track = {}
 
     def get_tracked(self) -> list[TrackedObject]:
         """Return all currently active or occluded tracked objects sorted by persistent_id."""
@@ -210,11 +213,43 @@ class PersistentObjectTracker:
 
         # Check matching ambiguity (difference between best and second-best candidate < matching_ambiguity_threshold)
         ambiguity_scores: list[tuple[float, str]] = []
+        self.ambiguity_by_track = {}
         for trk_id in active_track_ids:
-            trk_costs = sorted([cost for cost, t_id, _ in cost_entries if t_id == trk_id and cost < match_threshold])
-            if len(trk_costs) >= 2:
-                diff = trk_costs[1] - trk_costs[0]
+            cand_pairs = sorted(
+                [(cost, c_idx) for cost, t_id, c_idx in cost_entries if t_id == trk_id and cost < match_threshold],
+                key=lambda x: x[0],
+            )
+            if len(cand_pairs) >= 2:
+                cost0, c_idx0 = cand_pairs[0]
+                cost1, c_idx1 = cand_pairs[1]
+                diff = cost1 - cost0
+                comp0 = components[c_idx0]
+                comp1 = components[c_idx1]
+
+                # Point 2: Detect mutual ambiguity between sibling 1x1 micro-dots of the same parent / spatial cluster
+                p0 = getattr(comp0, "parent_id", None)
+                p1 = getattr(comp1, "parent_id", None)
+                same_parent = bool(p0 is not None and p0 == p1)
+                inside_shared_parent = False
+                if comp0.area <= 2 and comp1.area <= 2:
+                    for parent in components:
+                        if getattr(parent, "area", 0) >= 4:
+                            p_bbox = parent.bbox
+                            if (p_bbox.min_row <= comp0.centroid.row <= p_bbox.max_row
+                                and p_bbox.min_col <= comp0.centroid.col <= p_bbox.max_col
+                                and p_bbox.min_row <= comp1.centroid.row <= p_bbox.max_row
+                                and p_bbox.min_col <= comp1.centroid.col <= p_bbox.max_col):
+                                inside_shared_parent = True
+                                break
+
+                is_internal_sibling = bool(same_parent or inside_shared_parent)
+
                 ambiguity_scores.append((round(diff, 4), trk_id))
+                self.ambiguity_by_track[trk_id] = {
+                    "diff": round(diff, 4),
+                    "is_internal_sibling": is_internal_sibling,
+                    "parent_id": p0 if same_parent else None,
+                }
 
         if ambiguity_scores:
             ambiguity_scores.sort(key=lambda x: x[0])
@@ -266,6 +301,7 @@ class PersistentObjectTracker:
             track.shape_signature = comp.shape_signature
             track.filled_shape_signature = comp.filled_shape_signature
             track.mask = comp.mask
+            track.source_object_id = getattr(comp, "id", getattr(track, "source_object_id", None))
             comp.persistent_id = trk_id
             comp.track_confidence = track.confidence
 
@@ -348,6 +384,7 @@ class PersistentObjectTracker:
                     occluded_by=None,
                     cumulative_delta=(0.0, 0.0),
                     mask=comp.mask,
+                    source_object_id=getattr(comp, "id", None),
                 )
                 self.tracks[trk_id] = new_track
                 comp.persistent_id = trk_id

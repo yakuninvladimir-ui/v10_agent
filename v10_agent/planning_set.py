@@ -42,6 +42,14 @@ class PlanningSet:
     relations: tuple[SpatialRelation, ...]
     coordinate_candidates: tuple[CoordinateCandidate, ...]
     grid_dims: tuple[int, int] = (0, 0)
+    crop_offset: int = 0
+
+    @property
+    def grid(self) -> list[list[int]] | None:
+        """Reconstruct 2D grid matrix from full_grid_hex_rows if available."""
+        if not self.full_grid_hex_rows:
+            return None
+        return [[int(c, 16) for c in row] for row in self.full_grid_hex_rows]
 
     def resolve_object_id(self, key: str) -> PlanningObjectId | None:
         """Resolve a real object ID, alias label, or persistent_id to the canonical object ID."""
@@ -94,6 +102,7 @@ def build_planning_set(
     snapshot_id: str | None = None,
     grid_hex_rows: Sequence[str] | None = None,
     tracker: Any | None = None,
+    crop_offset: int = 0,
 ) -> PlanningSet:
     """Build a certified PlanningSet adhering to Invariants I1-I8."""
     if tracker is not None and hasattr(tracker, "update"):
@@ -224,4 +233,5 @@ def build_planning_set(
         relations=relations,
         coordinate_candidates=coordinate_candidates,
         grid_dims=snapshot.grid_dims,
+        crop_offset=crop_offset,
     )

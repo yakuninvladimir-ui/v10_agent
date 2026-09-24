@@ -79,9 +79,8 @@ def test_solver_prompt_suppresses_unconfirmed_coordinate_affordances():
     )
     
     assert "salient_coordinate_affordances" not in user_prompt
-    assert "STRICT PROHIBITION ON INACTIVE OR UNCONFIRMED ACTIONS" in sys_prompt
-    assert "inactive_or_unconfirmed_actions" in user_prompt
-    assert "ACTION6" in user_prompt
+    assert "FALSIFIED - do not rely on:" in user_prompt
+    assert "ACTION6: unconfirmed/inactive" in user_prompt
     
     # Case B: ACTION6 is confirmed active
     game_mem_confirmed = GameMemory(game_id="test_game")
@@ -94,8 +93,8 @@ def test_solver_prompt_suppresses_unconfirmed_coordinate_affordances():
         game_memory=game_mem_confirmed,
     )
     
-    assert "salient_coordinate_affordances" in user_prompt_b
-    assert "confirmed_active_actions" in user_prompt_b
+    assert "ACTION6: clicked entity toggled state" in user_prompt_b
+    assert "ACTION6: unconfirmed/inactive" not in user_prompt_b
 
 
 def test_game_memory_unconfirmed_action_lifecycle():

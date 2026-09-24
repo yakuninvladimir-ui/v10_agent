@@ -95,8 +95,8 @@ def test_build_multimodal_smoke_payload():
 
     user_text = next(item["text"] for item in user_content if item.get("type") == "text")
     assert "solver_raw_frame.png is the exact same frame as solver_annotated_frame.png, but without object annotations." in user_text
-    assert f'"grid_hash": "{meta["grid_hash"]}"' in user_text
-    assert '"planning_objects":' in user_text
+    assert f"hash {meta['grid_hash']}" in user_text
+    assert "OBJECT INDEX" in user_text
 
     # Verify disabled toggle behavior
     from v10_agent.config import V10Config

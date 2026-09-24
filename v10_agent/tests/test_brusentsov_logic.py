@@ -72,19 +72,20 @@ def test_brusentsov_null_contradiction_attribute():
     assert verdict == Ternary.FALSE  # NULL
 
 
-def test_brusentsov_null_destroyed_object():
+def test_brusentsov_null_destroyed_object_is_contradiction():
+    """Carroll nullity xy'_0 → NULL: expected=preserved + observed=destroyed is a physical contradiction."""
     # Expected: obj_0 preserved
     expected = PropositionSet.from_iterable([
         AtomicProposition(family="object_identity", subject_id="obj_0", predicate="preserved"),
     ])
 
-    # Observed: obj_0 was destroyed
+    # Observed: obj_0 was destroyed (Carroll nullity — direct physical contradiction)
     observed = PropositionSet.from_iterable([
         AtomicProposition(family="object_identity", subject_id="obj_0", predicate="destroyed"),
     ])
 
     verdict = implies_brusentsov(expected, observed)
-    assert verdict == Ternary.FALSE  # NULL
+    assert verdict == Ternary.FALSE  # NULL: Carroll nullity xy'_0 severs the trajectory
 
 
 def test_brusentsov_omit_passive_outcome():

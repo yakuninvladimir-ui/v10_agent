@@ -149,19 +149,17 @@ def test_coder_multimodal_dual_view_transmission():
 
 def test_full_session_all_roles_receive_dual_view():
     grid = [[0, 1, 0], [0, 0, 0]]
-    valid_py = "def action1(api):\n    return api.declare_environment_action('ACTION1')\n"
-    manifest = {"functions": [{"name": "action1", "parameters": []}]}
-    mock_spec = {
-        "schema_version": "v10.env_spec.1",
-        "researched_actions": [{"action_id": "ACTION1", "effect_summary": "ok"}],
-    }
+    grid2 = [[0, 2, 0], [0, 0, 0]]
+    valid_py = "def action6(api, x=0, y=0):\n    return api.declare_environment_action('ACTION6', data={'x': x, 'y': y})\n"
+    manifest = {"functions": [{"name": "action6", "parameters": [{"name": "x", "type": "int"}, {"name": "y", "type": "int"}]}]}
+    mock_coords = {"coordinate_hypotheses": [{"x": 1, "y": 0, "target_description": "point", "rationale": "test"}]}
     mock_traj = {
         "proposal_id": "p1",
-        "candidates": [{"trajectory_id": "c1", "steps": [{"dsl_function": "action1", "arguments": {}}]}]
+        "candidates": [{"trajectory_id": "c1", "steps": [{"dsl_function": "action6", "arguments": {"x": 1, "y": 0}}]}]
     }
 
     advisor = MockLLMAdvisor()
-    advisor.set_response("explorer", json.dumps(mock_spec))
+    advisor.set_response("explorer", json.dumps(mock_coords))
     advisor.set_response("coder", f"```python\n{valid_py}\n```\n```json\n{json.dumps(manifest)}\n```")
     advisor.set_response("solver", json.dumps(mock_traj))
 
@@ -171,10 +169,24 @@ def test_full_session_all_roles_receive_dual_view():
         explorer_multimodal_enabled=True,
         coder_multimodal_enabled=True,
         solver_multimodal_enabled=True,
+        enable_primitive_probing=True,
     )
     session = GameSession(config, advisor)
 
-    session.act({"grid": grid, "available_actions": ["ACTION1", "RESET"]})
+    # Step 1: Probe 1 proposed at (1, 0) via Explorer LLM with dual view
+    session.act({"grid": grid, "available_actions": ["ACTION6", "RESET"]})
+    session.observe_action_result({"grid": grid2, "available_actions": ["ACTION6", "RESET"]})
+
+    # Step 2: Probe 2 from initial candidate quota
+    session.act({"grid": grid2, "available_actions": ["ACTION6", "RESET"]})
+    session.observe_action_result({"grid": grid2, "available_actions": ["ACTION6", "RESET"]})
+
+    # Step 3: Probing complete, Reset to pristine
+    session.act({"grid": grid2, "available_actions": ["ACTION6", "RESET"]})
+    session.observe_action_result({"grid": grid, "available_actions": ["ACTION6", "RESET"]})
+
+    # Step 4: Pristine frame -> Coder & Solver with dual view
+    session.act({"grid": grid, "available_actions": ["ACTION6", "RESET"]})
 
     roles = [c["role"] for c in advisor.call_history]
     assert "explorer" in roles

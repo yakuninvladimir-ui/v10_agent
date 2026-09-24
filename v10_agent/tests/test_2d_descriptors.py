@@ -107,13 +107,15 @@ def test_solver_prompt_ascii_limit_and_single_pixel_filtering():
     pset = build_planning_set(snapshot, ["ACTION1", "ACTION2"])
     _, user_prompt = build_solver_prompts({"functions": []}, pset)
 
-    import json
-    json_str = user_prompt[user_prompt.index("{"):user_prompt.rindex("}") + 1]
-    payload = json.loads(json_str)
-
-    objs = payload["planning_objects"]
-    for o in objs:
-        if o["area"] <= 1:
-            assert "compact_ascii" not in o, f"Single-pixel object {o['id']} must NOT have compact_ascii"
-        elif o["area"] >= 4:
-            assert "compact_ascii" in o, f"Substantive object {o['id']} must have compact_ascii"
+    assert "OBJECT INDEX" in user_prompt
+    found_area_1 = False
+    found_area_4 = False
+    for line in user_prompt.splitlines():
+        if "area=1" in line:
+            found_area_1 = True
+            assert "ascii=" not in line, f"Single-pixel object line {line} must NOT have ascii"
+        elif "area=4" in line:
+            found_area_4 = True
+            assert "ascii=" in line, f"Substantive object line {line} must have ascii"
+    assert found_area_1
+    assert found_area_4

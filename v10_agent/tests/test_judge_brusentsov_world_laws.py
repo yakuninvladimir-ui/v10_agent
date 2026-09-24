@@ -8,7 +8,7 @@ from v10_agent.judge import LayeredVerifier
 from v10_agent.memory_contours import GameMemory
 from v10_agent.planning_set import build_planning_set
 from v10_agent.prompt_builders.solver_prompt import build_solver_prompts
-from v10_agent.types import PropositionSet
+from v10_agent.types import AtomicProposition, PropositionSet
 from v10_agent.verification import GroundedStep
 
 
@@ -77,7 +77,9 @@ def test_judge_valid_motion_returns_true(verifier):
         step_id="s1",
         dsl_function="move_right",
         arguments={},
-        expected_propositions=PropositionSet.from_iterable([]),
+        expected_propositions=PropositionSet.from_iterable([
+            AtomicProposition(family="object_identity", subject_id="obj_0", predicate="preserved"),
+        ]),
     )
 
     after_obs = {"grid": after_grid, "state": "IN_PROGRESS"}
@@ -172,7 +174,14 @@ def test_judge_execution_uninterrupted_by_distance_metrics(verifier):
         [0, 0, 0, 0, 3, 3, 0],
         [0, 0, 0, 0, 3, 3, 0],
     ]
-    step_down = GroundedStep(step_id="s1", dsl_function="move_down", arguments={}, expected_propositions=PropositionSet.from_iterable([]))
+    step_down = GroundedStep(
+        step_id="s1",
+        dsl_function="move_down",
+        arguments={},
+        expected_propositions=PropositionSet.from_iterable([
+            AtomicProposition(family="object_identity", subject_id="obj_0", predicate="preserved"),
+        ]),
+    )
     judgment_closer = verifier.evaluate_transition(
         step=step_down,
         before_snapshot=before_snap,
@@ -193,7 +202,14 @@ def test_judge_execution_uninterrupted_by_distance_metrics(verifier):
         [0, 0, 0, 0, 3, 3, 0],
         [0, 0, 0, 0, 3, 3, 0],
     ]
-    step_up = GroundedStep(step_id="s2", dsl_function="move_up", arguments={}, expected_propositions=PropositionSet.from_iterable([]))
+    step_up = GroundedStep(
+        step_id="s2",
+        dsl_function="move_up",
+        arguments={},
+        expected_propositions=PropositionSet.from_iterable([
+            AtomicProposition(family="object_identity", subject_id="obj_0", predicate="preserved"),
+        ]),
+    )
     judgment_away = verifier.evaluate_transition(
         step=step_up,
         before_snapshot=before_snap,
@@ -238,11 +254,8 @@ def test_solver_prompt_contains_grid_bounds_and_freedom_of_motion():
     manifest = {"functions": [{"name": "move_obj", "parameters": [{"name": "obj", "type": "str"}]}]}
     sys_p, user_p = build_solver_prompts(manifest, pset)
 
-    assert "grid_bounds" in user_p
-    assert '"height": 4' in user_p
-    assert '"width": 5' in user_p
-    assert "freedom_of_motion" in user_p
-    assert "up_to_border" in user_p
-    assert "down_to_border" in user_p
-    assert "left_to_border" in user_p
-    assert "right_to_border" in user_p
+    assert "GRID: 4x5" in user_p
+    assert "OBJECT INDEX" in user_p
+    assert "bbox=[1,1,2,2]" in user_p
+    assert "SPATIAL LAYOUT" in user_p
+    assert "rows 0-3 cols 0-4" in user_p

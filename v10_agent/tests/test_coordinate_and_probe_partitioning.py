@@ -156,3 +156,73 @@ def test_coordinate_hypothesis_prompt_num_hypotheses_sync():
     assert "Propose between 2 and 6" in sys_p
     assert "Propose between 2 and 6" in user_p
 
+
+def test_coordinate_probes_crop_offset_synchronization():
+    from v10_agent.memory_contours import EnvironmentSpecMemory, ProbeRecord
+
+    # Grid 62x62 simulating cropped 64x64 with crop_offset=1
+    grid = [[0] * 62 for _ in range(62)]
+    grid[10][10] = 1
+    grid[20][20] = 2
+    snapshot = extract_arga_snapshot(grid)
+    pset = build_planning_set(snapshot, ["ACTION6", "RESET"], crop_offset=1)
+    assert pset.crop_offset == 1
+
+    memory = EnvironmentSpecMemory(game_id="ft09", level_id="0")
+    # Record probe with local_x, local_y and engine x, y
+    memory.record_probe(
+        ProbeRecord(
+            probe_id="p1",
+            action_id="ACTION6",
+            action_data={"x": 32, "y": 32, "local_x": 31, "local_y": 31, "crop_offset": 1},
+            observed_effect="none",
+            confidence=0.8,
+        )
+    )
+    # Record another probe with engine coords only (x=48, y=48 -> local 47, 47)
+    memory.record_probe(
+        ProbeRecord(
+            probe_id="p2",
+            action_id="ACTION6",
+            action_data={"x": 48, "y": 48, "crop_offset": 1},
+            observed_effect="none",
+            confidence=0.8,
+        )
+    )
+
+    config = V10Config(llm_advisor_backend="fake")
+    advisor = MockLLMAdvisor()
+    # Mock explorer returning coordinate candidates, including (31, 31) and (47, 47) which were already tested
+    mock_payload = {
+        "coordinate_hypotheses": [
+            {"x": 31, "y": 31, "target_description": "center", "rationale": "center test"},
+            {"x": 47, "y": 47, "target_description": "diag", "rationale": "diag test"},
+            {"x": 10, "y": 10, "target_description": "obj1", "rationale": "object 1"},
+            {"x": 20, "y": 20, "target_description": "obj2", "rationale": "object 2"},
+        ]
+    }
+    advisor.set_response("explorer", f"```json\n{json.dumps(mock_payload)}\n```")
+    explorer = ExplorerAgent(config, advisor)
+
+    probes = explorer.propose_coordinate_probes(pset, memory=memory, crop_offset=1, max_coords=4)
+    coords = [(p.data["x"], p.data["y"]) for p in probes]
+    # (31, 31) and (47, 47) must be filtered out as already tested
+    assert (31, 31) not in coords
+    assert (47, 47) not in coords
+    assert (10, 10) in coords
+    assert (20, 20) in coords
+
+    # Check PrimitiveProbeManager.plan_targeted_coordinate_probes as well
+    mgr = PrimitiveProbeManager()
+    affordances = [
+        {"x": 31, "y": 31},
+        {"x": 47, "y": 47},
+        {"x": 10, "y": 10},
+    ]
+    targeted = mgr.plan_targeted_coordinate_probes(pset, affordances=affordances, memory=memory, crop_offset=1)
+    targeted_coords = [(p.data["x"], p.data["y"]) for p in targeted]
+    assert (31, 31) not in targeted_coords
+    assert (47, 47) not in targeted_coords
+    assert (10, 10) in targeted_coords
+
+

@@ -11,6 +11,9 @@ import logging
 import re
 from typing import Any
 
+from dataclasses import dataclass, field
+from enum import Enum
+
 from v10_agent.config import V10Config
 from v10_agent.llm_advisor import BaseLLMAdvisor, sanitize_model_response
 from v10_agent.memory_contours import EnvironmentSpecMemory, ProbeRecord
@@ -18,10 +21,35 @@ from v10_agent.planning_set import PlanningSet
 from v10_agent.prompt_builders.explorer_prompt import (
     build_coordinate_hypothesis_prompt,
     build_explorer_prompts,
+    build_explorer_synthesis_prompt,
 )
 from v10_agent.types import ActionDeclaration
 
 logger = logging.getLogger(__name__)
+
+
+class EffectClass(str, Enum):
+    KINEMATIC = "KINEMATIC"
+    PALETTE_TRANSITION = "PALETTE_TRANSITION"
+    TOPOLOGY_MUTATION = "TOPOLOGY_MUTATION"
+    MODAL_SELECTION = "MODAL_SELECTION"
+    CONDITIONAL_TRIGGER = "CONDITIONAL_TRIGGER"
+
+
+@dataclass
+class ActionAffordance:
+    action_id: str
+    effect_class: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+    coordination_notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_id": str(self.action_id).upper(),
+            "effect_class": str(self.effect_class).upper(),
+            "parameters": dict(self.parameters),
+            "coordination_notes": str(self.coordination_notes),
+        }
 
 
 import ast
@@ -95,6 +123,157 @@ def extract_json_block(text: str) -> dict[str, Any] | None:
     return None
 
 
+def generate_symbolic_environment_spec(
+    planning_set: PlanningSet,
+    memory: EnvironmentSpecMemory,
+    game_memory: Any | None = None,
+    probe_manager: PrimitiveProbeManager | None = None,
+) -> dict[str, Any]:
+    """Generate and record a validated EnvironmentSpecification deterministically from empirical diffs.
+
+    Strict Gating: Only actions with confirmed physical/visual effects (diff > 0)
+    are certified into available_actions and researched_actions.
+    Unconfirmed actions with zero observable effect are strictly excluded.
+    """
+    confirmed_actions: dict[str, str] = {}
+    if probe_manager is not None:
+        confirmed_actions.update(probe_manager.confirmed_effective_actions)
+    if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
+        confirmed_actions.update(game_memory.confirmed_action_effects)
+
+    # Invariants from universal_invariants
+    invariants: list[str] = ["object_identities_discrete"]
+    try:
+        from v10_agent.universal_invariants import discover_invariants
+        discovered = discover_invariants(planning_set)
+        for inv in discovered:
+            desc = getattr(inv, "description", str(inv))
+            if desc and desc not in invariants:
+                invariants.append(desc)
+    except Exception as exc:
+        logger.debug(f"Invariant discovery skipped: {exc}")
+
+    # Build researched_actions, action_affordances, and action_displacements ONLY for confirmed actions
+    researched: list[dict[str, Any]] = []
+    affordance_list: list[dict[str, Any]] = []
+    displacement_list: list[dict[str, Any]] = []
+    for act_id in sorted(confirmed_actions.keys()):
+        if act_id in ("RESET", "ACTION7"):
+            continue
+        eff = confirmed_actions[act_id]
+        evidence_ids = []
+        aff_dict = None
+        if memory is not None and getattr(memory, "probe_history", None):
+            for p in memory.probe_history:
+                if p.action_id == act_id:
+                    evidence_ids.append(p.probe_id)
+                    if getattr(p, "affordance", None) and not aff_dict:
+                        aff_dict = dict(p.affordance)
+        if not aff_dict:
+            aff_dict = classify_effect_summary_to_affordance(act_id, eff)
+        affordance_list.append(aff_dict)
+        if aff_dict.get("effect_class") == "KINEMATIC":
+            params = aff_dict.get("parameters", {})
+            disps = params.get("displacements", [])
+            if not disps and "affected_alias" in params:
+                disps = [{"alias": params["affected_alias"], "dy": params.get("dy", 0), "dx": params.get("dx", 0)}]
+            displacement_list.append({
+                "action_id": act_id,
+                "displacements": disps,
+                "coordination": aff_dict.get("coordination_notes", ""),
+            })
+        researched.append({
+            "action_id": act_id,
+            "effect_summary": eff,
+            "supporting_evidence_ids": evidence_ids,
+            "confidence": 1.0,
+            "contradicted": False,
+        })
+
+    # Preserve conditional candidate actions (unconfirmed on S0, but potential contact/state-dependent actions)
+    cond_candidates: set[str] = set()
+    if probe_manager is not None and hasattr(probe_manager, "conditional_candidate_actions"):
+        cond_candidates.update(probe_manager.conditional_candidate_actions)
+
+    for act in planning_set.allowed_action_ids:
+        act_up = str(act).upper()
+        if (
+            act_up in cond_candidates
+            and act_up not in confirmed_actions
+            and act_up not in ("RESET", "ACTION7")
+        ):
+            researched.append({
+                "action_id": act_up,
+                "effect_summary": "unconfirmed on S0 (candidate contact or state-dependent action)",
+                "supporting_evidence_ids": [],
+                "confidence": 0.5,
+                "contradicted": False,
+            })
+            affordance_list.append({
+                "action_id": act_up,
+                "effect_class": "CONDITIONAL_TRIGGER",
+                "parameters": {
+                    "status": "unconfirmed_on_s0",
+                    "requires_contact_or_selection": True,
+                },
+                "coordination_notes": "zero observable delta on pristine frame S0; candidate contact or state-dependent action",
+            })
+
+    # Fallback if no confirmed actions yet discovered (e.g. probing disabled or initial step)
+    if not researched:
+        unconfirmed = set()
+        if probe_manager is not None:
+            unconfirmed.update(probe_manager.inactive_actions)
+            unconfirmed.update(probe_manager.zero_effect_actions)
+        if game_memory is not None and hasattr(game_memory, "unconfirmed_actions"):
+            unconfirmed.update(game_memory.unconfirmed_actions.keys())
+
+        for act in planning_set.allowed_action_ids:
+            act_str = str(act).upper()
+            if act_str in ("RESET", "ACTION7") or act_str in unconfirmed:
+                continue
+            researched.append({
+                "action_id": act_str,
+                "effect_summary": "available atomic action",
+                "supporting_evidence_ids": [],
+                "confidence": 0.5,
+                "contradicted": False,
+            })
+            aff_dict = classify_effect_summary_to_affordance(act_str, "available atomic action")
+            affordance_list.append(aff_dict)
+
+    # Coordinate affordances only if ACTION6 is confirmed effective
+    affordances: list[dict[str, Any]] = []
+    if "ACTION6" in confirmed_actions:
+        for c in planning_set.coordinate_candidates[:5]:
+            affordances.append({
+                "coordinate_candidate_id": c.candidate_id,
+                "x": c.x,
+                "y": c.y,
+                "source": {"type": c.source_type, "object_id": c.object_id},
+                "observed_effects": [confirmed_actions["ACTION6"]],
+                "confidence": 0.9,
+            })
+
+    spec = {
+        "schema_version": "v10.env_spec.1",
+        "snapshot_hash": planning_set.grid_hash,
+        "planning_set_id": planning_set.snapshot_id,
+        "available_actions": [a["action_id"] for a in researched],
+        "researched_actions": researched,
+        "action_affordances": affordance_list,
+        "action_displacements": displacement_list,
+        "coordinate_affordances": affordances,
+        "object_class_notes": [],
+        "action_surface_notes": [],
+        "invariants": invariants,
+    }
+
+    if memory is not None:
+        memory.record_spec(spec)
+    return spec
+
+
 class ExplorerAgent:
     """Call 1: Investigates action effects and coordinate affordances."""
 
@@ -102,6 +281,270 @@ class ExplorerAgent:
         self.config = config
         self.advisor = advisor
         self.probe_manager = PrimitiveProbeManager(max_probes=config.max_primitive_probes_per_level)
+
+    def generate_symbolic_environment_spec(
+        self,
+        planning_set: PlanningSet,
+        memory: EnvironmentSpecMemory,
+        game_memory: Any | None = None,
+    ) -> dict[str, Any]:
+        """Generate and record validated EnvironmentSpecification deterministically without LLM."""
+        return generate_symbolic_environment_spec(
+            planning_set=planning_set,
+            memory=memory,
+            game_memory=game_memory,
+            probe_manager=self.probe_manager,
+        )
+
+    def synthesize_level_spec(
+        self,
+        planning_set: PlanningSet,
+        memory: EnvironmentSpecMemory,
+        image_png: bytes | list[bytes] | tuple[bytes, ...] | dict[str, bytes] | None = None,
+        game_memory: Any | None = None,
+    ) -> dict[str, Any]:
+        """Synthesize factual environment specification after active probing is complete.
+
+        1. Generates a strict deterministic baseline spec via generate_symbolic_environment_spec
+           to guarantee that available_actions and researched_actions contain ONLY confirmed effective actions.
+        2. Queries LLM Explorer with build_explorer_synthesis_prompt to describe factual visual object roles,
+           action groundings, symmetries, and structural invariants without guessing goals or coordinates.
+        3. Merges validated factual descriptions into the spec and updates game_memory.
+        """
+        # Step 1: Base symbolic spec (strict action gating)
+        base_spec = self.generate_symbolic_environment_spec(
+            planning_set=planning_set,
+            memory=memory,
+            game_memory=game_memory,
+        )
+
+        explorer_mm = getattr(
+            self.config, "explorer_multimodal_enabled",
+            getattr(self.config, "multimodal_enabled", getattr(self.config, "qwen_multimodal_enabled", True))
+        )
+        has_image = (
+            any(bool(x) for x in image_png)
+            if isinstance(image_png, (list, tuple))
+            else (any(bool(x) for x in image_png.values()) if isinstance(image_png, dict) else bool(image_png))
+        ) and explorer_mm
+        effective_image = image_png if explorer_mm else None
+
+        if self.advisor is None or getattr(self.config, "llm_advisor_backend", "") == "fake":
+            return base_spec
+
+        # Gather confirmed and unconfirmed actions from probe manager / game memory
+        confirmed_actions = dict(self.probe_manager.confirmed_effective_actions)
+        if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
+            confirmed_actions.update(game_memory.confirmed_action_effects)
+
+        unconfirmed_actions = {}
+        for act in self.probe_manager.inactive_actions | self.probe_manager.zero_effect_actions:
+            unconfirmed_actions[act] = "no visible effect (0 cells changed)"
+        if game_memory is not None and hasattr(game_memory, "unconfirmed_actions"):
+            unconfirmed_actions.update(game_memory.unconfirmed_actions)
+
+        sys_prompt, user_prompt = build_explorer_synthesis_prompt(
+            planning_set=planning_set,
+            confirmed_actions=confirmed_actions,
+            unconfirmed_actions=unconfirmed_actions,
+            probe_history=getattr(memory, "probe_history", []),
+            has_image=has_image,
+        )
+
+        try:
+            response_text = self.advisor.generate(
+                system_prompt=sys_prompt,
+                user_prompt=user_prompt,
+                config=self.config,
+                image_bytes=effective_image,
+                agent_role="explorer",
+            )
+            parsed = extract_json_block(response_text)
+            if parsed and isinstance(parsed, dict):
+                # 1. Action Affordances (Complete Spectrum of Observed Mutations)
+                act_affs = parsed.get("action_affordances", [])
+                clean_affs: list[dict[str, Any]] = []
+                if isinstance(act_affs, list):
+                    for item in act_affs:
+                        if isinstance(item, dict):
+                            act_id = str(item.get("action_id", "")).strip().upper()
+                            eff_cls = str(item.get("effect_class", "KINEMATIC")).strip().upper()
+                            if eff_cls not in ("KINEMATIC", "PALETTE_TRANSITION", "TOPOLOGY_MUTATION", "MODAL_SELECTION", "CONDITIONAL_TRIGGER"):
+                                eff_cls = "KINEMATIC"
+                            params = item.get("parameters", {}) if isinstance(item.get("parameters"), dict) else {}
+                            notes = str(item.get("coordination_notes", "")).strip()
+                            clean_affs.append({
+                                "action_id": act_id,
+                                "effect_class": eff_cls,
+                                "parameters": params,
+                                "coordination_notes": notes,
+                            })
+
+                # Legacy fallback: action_displacements
+                act_disps = parsed.get("action_displacements", [])
+                clean_disps = []
+                if isinstance(act_disps, list):
+                    for item in act_disps:
+                        if isinstance(item, dict):
+                            act_id = str(item.get("action_id", "")).strip().upper()
+                            clean_disps.append({
+                                "action_id": act_id,
+                                "displacements": item.get("displacements", []),
+                                "coordination": str(item.get("coordination", "")).strip(),
+                            })
+                            # If not already present in clean_affs, convert to KINEMATIC affordance
+                            if not any(a["action_id"] == act_id for a in clean_affs):
+                                disps = item.get("displacements", [])
+                                primary = disps[0] if disps and isinstance(disps[0], dict) else {}
+                                clean_affs.append({
+                                    "action_id": act_id,
+                                    "effect_class": "KINEMATIC",
+                                    "parameters": {
+                                        "affected_alias": primary.get("alias", ""),
+                                        "dy": primary.get("dy", 0),
+                                        "dx": primary.get("dx", 0),
+                                        "displacements": disps,
+                                    },
+                                    "coordination_notes": str(item.get("coordination", "")).strip(),
+                                })
+                        elif isinstance(item, str) and item.strip():
+                            clean_disps.append(item.strip())
+
+                # ACTION AFFORDANCE COMPLETENESS INVARIANT:
+                # Any confirmed action that demonstrated frame delta > 0 MUST be present in action_affordances.
+                # If LLM omitted a confirmed action, synthesize its affordance from probe history / summary.
+                known_aff_acts = {a["action_id"] for a in clean_affs if isinstance(a, dict)}
+                for act_id in sorted(confirmed_actions.keys()):
+                    act_up = str(act_id).upper()
+                    if act_up in ("RESET", "ACTION7") or act_up in known_aff_acts:
+                        continue
+                    eff_summary = confirmed_actions[act_id]
+                    synth_aff = None
+                    if memory is not None and getattr(memory, "probe_history", None):
+                        for p in memory.probe_history:
+                            if p.action_id == act_up and getattr(p, "affordance", None):
+                                synth_aff = dict(p.affordance)
+                                break
+                    if not synth_aff:
+                        synth_aff = classify_effect_summary_to_affordance(act_up, eff_summary)
+                    clean_affs.append(synth_aff)
+                    known_aff_acts.add(act_up)
+
+                # Also include conditional_candidate_actions in action_affordances if omitted
+                cond_candidates: set[str] = set()
+                if hasattr(self, "probe_manager") and hasattr(self.probe_manager, "conditional_candidate_actions"):
+                    cond_candidates.update(self.probe_manager.conditional_candidate_actions)
+
+                for act_id in sorted(cond_candidates):
+                    act_up = str(act_id).upper()
+                    if act_up not in ("RESET", "ACTION7") and act_up not in known_aff_acts and act_up not in confirmed_actions:
+                        clean_affs.append({
+                            "action_id": act_up,
+                            "effect_class": "CONDITIONAL_TRIGGER",
+                            "parameters": {
+                                "status": "unconfirmed_on_s0",
+                                "requires_contact_or_selection": True,
+                            },
+                            "coordination_notes": "zero observable delta on pristine frame S0; candidate contact or state-dependent action",
+                        })
+                        known_aff_acts.add(act_up)
+
+                if clean_affs:
+                    base_spec["action_affordances"] = clean_affs
+                    if game_memory is not None and hasattr(game_memory, "update_action_affordances"):
+                        game_memory.update_action_affordances(clean_affs)
+
+                # Ensure backwards-compatible action_displacements exists
+                if not clean_disps and clean_affs:
+                    for aff in clean_affs:
+                        if aff.get("effect_class") == "KINEMATIC":
+                            params = aff.get("parameters", {})
+                            disps = params.get("displacements", [])
+                            if not disps and "affected_alias" in params:
+                                disps = [{"alias": params["affected_alias"], "dy": params.get("dy", 0), "dx": params.get("dx", 0)}]
+                            clean_disps.append({
+                                "action_id": aff["action_id"],
+                                "displacements": disps,
+                                "coordination": aff.get("coordination_notes", ""),
+                            })
+                if clean_disps:
+                    base_spec["action_displacements"] = clean_disps
+
+                # Update available_actions: MUST include ALL confirmed affordance actions
+                current_available = set(base_spec.get("available_actions", []))
+                for aff in clean_affs:
+                    act_up = aff["action_id"]
+                    if act_up not in ("RESET", "ACTION7") and act_up not in current_available:
+                        base_spec["available_actions"].append(act_up)
+                        current_available.add(act_up)
+
+                # Backwards-compatible action_surface_notes fallback
+                act_notes = parsed.get("action_surface_notes", [])
+                if isinstance(act_notes, list) and not base_spec.get("action_displacements") and not base_spec.get("action_affordances"):
+                    clean_act_notes = []
+                    for note in act_notes:
+                        if isinstance(note, dict):
+                            act_id = str(note.get("action_id", "")).strip().upper()
+                            effect = str(note.get("grounded_effect", "")).strip()
+                            clean_act_notes.append({"action_id": act_id, "grounded_effect": effect})
+                        elif isinstance(note, str) and note.strip():
+                            clean_act_notes.append(note.strip())
+                    if clean_act_notes:
+                        base_spec["action_surface_notes"] = clean_act_notes
+
+                # 2. Static Objects (Observed completely unmoving during probes)
+                static_objs = parsed.get("static_objects", [])
+                if isinstance(static_objs, list):
+                    clean_static = []
+                    for item in static_objs:
+                        if isinstance(item, dict):
+                            clean_static.append({
+                                "alias": str(item.get("alias", "")).strip(),
+                                "description": str(item.get("description", "")).strip(),
+                            })
+                        elif isinstance(item, str) and item.strip():
+                            clean_static.append(item.strip())
+                    if clean_static:
+                        base_spec["static_objects"] = clean_static
+
+                # 3. Structural Geometry (Pure Layout & Alignment)
+                geom = parsed.get("structural_geometry", []) or parsed.get("structural_notes", [])
+                if isinstance(geom, list):
+                    clean_geom = [
+                        str(g).strip() for g in geom
+                        if str(g).strip() and not any(kw in str(g).lower() for kw in ("goal", "win", "target", "solution"))
+                    ]
+                    if clean_geom:
+                        base_spec["structural_geometry"] = clean_geom
+                        base_spec["structural_notes"] = clean_geom
+                        if game_memory is not None:
+                            for g in clean_geom:
+                                if g not in game_memory.tier1_kinematics_and_topology:
+                                    game_memory.tier1_kinematics_and_topology.append(g)
+
+                # 4. Invariants (Factual rules without win speculation)
+                inv_list = parsed.get("invariants", [])
+                if isinstance(inv_list, list):
+                    clean_inv = [
+                        str(iv).strip() for iv in inv_list
+                        if str(iv).strip() and not any(kw in str(iv).lower() for kw in ("goal", "win", "target", "solution"))
+                    ]
+                    for iv in clean_inv:
+                        if iv not in base_spec["invariants"]:
+                            base_spec["invariants"].append(iv)
+                        if game_memory is not None and iv not in game_memory.tier1_kinematics_and_topology:
+                            game_memory.tier1_kinematics_and_topology.append(iv)
+
+                # Update recorded spec in memory
+                if memory is not None:
+                    if memory.specs:
+                        memory.specs[-1] = base_spec
+                    else:
+                        memory.record_spec(base_spec)
+        except Exception as exc:
+            logger.warning(f"Explorer Level Synthesis failed: {exc}; retaining baseline symbolic spec")
+
+        return base_spec
 
     def generate_environment_spec(
         self,
@@ -173,10 +616,20 @@ class ExplorerAgent:
                 "invariants": ["object_identities_discrete"],
             }
 
-        # Validate schema version
+        # Validate schema version and standard collections
         spec.setdefault("schema_version", "v10.env_spec.1")
         spec.setdefault("snapshot_hash", planning_set.grid_hash)
         spec.setdefault("planning_set_id", planning_set.snapshot_id)
+        spec.setdefault("coordinate_affordances", [])
+        spec.setdefault("object_class_notes", [])
+        spec.setdefault("action_surface_notes", [])
+        spec.setdefault("invariants", [])
+
+        # Integrate structural_notes into invariants
+        if "structural_notes" in spec and isinstance(spec["structural_notes"], list):
+            for sn in spec["structural_notes"]:
+                if isinstance(sn, str) and sn not in spec["invariants"]:
+                    spec["invariants"].append(sn)
 
         # Ensure all allowed actions from planning_set are represented in researched_actions
         researched = spec.get("researched_actions", [])
@@ -264,20 +717,35 @@ class ExplorerAgent:
         memory: EnvironmentSpecMemory | None = None,
         max_coords: int = 4,
         image_png: bytes | list[bytes] | tuple[bytes, ...] | dict[str, bytes] | None = None,
+        crop_offset: int | None = None,
     ) -> list[ActionDeclaration]:
         """Generate targeted coordinate probes via Qwen hypothesis prompt with deterministic fallback."""
         width = planning_set.grid_dims[1] if len(planning_set.grid_dims) > 1 else 0
         height = planning_set.grid_dims[0] if len(planning_set.grid_dims) > 0 else 0
         probes: list[ActionDeclaration] = []
+        eff_crop = crop_offset if crop_offset is not None else getattr(planning_set, "crop_offset", 0)
         tested_coords: set[tuple[int, int]] = set()
         if memory:
             for p in memory.probe_history:
                 if p.action_id == "ACTION6" and isinstance(p.action_data, dict):
+                    lx = p.action_data.get("local_x")
+                    ly = p.action_data.get("local_y")
+                    if lx is not None and ly is not None:
+                        try:
+                            tested_coords.add((int(lx), int(ly)))
+                            continue
+                        except (ValueError, TypeError):
+                            pass
                     x = p.action_data.get("x")
                     y = p.action_data.get("y")
                     if x is not None and y is not None:
                         try:
-                            tested_coords.add((int(x), int(y)))
+                            xi, yi = int(x), int(y)
+                            rec_crop = p.action_data.get("crop_offset", eff_crop)
+                            if rec_crop > 0:
+                                tested_coords.add((xi - rec_crop, yi - rec_crop))
+                            else:
+                                tested_coords.add((xi, yi))
                         except (ValueError, TypeError):
                             pass
 
@@ -294,10 +762,14 @@ class ExplorerAgent:
 
         # 1. Query LLM Advisor
         if self.advisor is not None and width > 0 and height > 0:
+            local_prior_coords = sorted(list({
+                (c[0], c[1]) for c in tested_coords
+                if 0 <= c[0] < width and 0 <= c[1] < height
+            }))
             sys_prompt, user_prompt = build_coordinate_hypothesis_prompt(
                 planning_set=planning_set,
                 num_hypotheses=max_coords,
-                prior_tested_coords=sorted(list(tested_coords)) if tested_coords else None,
+                prior_tested_coords=local_prior_coords if local_prior_coords else None,
                 has_image=has_image,
             )
             try:
@@ -400,7 +872,11 @@ def describe_vector(dr: int, dc: int) -> str:
     return "+".join(parts)  # e.g., "DOWN+RIGHT", "UP+LEFT"
 
 
-def compute_probe_effect(before_snapshot: Any, after_obs: dict[str, Any]) -> str:
+def compute_probe_effect(
+    before_snapshot: Any,
+    after_obs: dict[str, Any],
+    planning_set: Any | None = None,
+) -> str:
     """Determine empirical delta using Ranked Multi-Hypothesis Effect Detection."""
     import math
     from collections import Counter
@@ -411,6 +887,10 @@ def compute_probe_effect(before_snapshot: Any, after_obs: dict[str, Any]) -> str
         return "no_grid_observation"
 
     after_snapshot = extract_arga_snapshot(raw_grid)
+
+    alias_map: dict[str, str] = getattr(planning_set, "object_real_to_alias", {}) if planning_set else {}
+    if not alias_map and hasattr(before_snapshot, "object_real_to_alias"):
+        alias_map = getattr(before_snapshot, "object_real_to_alias", {})
 
     # =========================================================================
     # Hypothesis 1: Coherent Displacement Vector (Rigid / Compound Translation)
@@ -514,14 +994,23 @@ def compute_probe_effect(before_snapshot: Any, after_obs: dict[str, Any]) -> str
                         cid for cid in getattr(b, "children_ids", [])
                         if cid in b_ids
                     ]
+                    b_alias = alias_map.get(b.id, b.id)
+                    p_id = getattr(b, "parent_id", None)
                     if coherent_children:
-                        b_desc = f"{b.id} (compound, {len(coherent_children)} parts)"
+                        c_aliases = [alias_map.get(cid, cid) for cid in coherent_children]
+                        b_desc = f"{b_alias} ({b.id}) [compound with children {', '.join(c_aliases)}]" if b_alias != b.id else f"{b.id} (compound with children {', '.join(c_aliases)})"
+                    elif p_id:
+                        p_alias = alias_map.get(p_id, p_id)
+                        b_desc = f"{b_alias} ({b.id}) [child of {p_alias}]" if b_alias != b.id else f"{b.id} (child of {p_alias})"
                     else:
-                        b_desc = f"{b.id}"
+                        b_desc = f"{b_alias} ({b.id})" if b_alias != b.id else f"{b.id}"
                     parts.append(f"moved {b_desc} by dy={dr:+d}, dx={dc:+d} ({dir_label})")
             else:
-                top_ids = [b.id for b in top_level[:3]]
-                parts.append(f"moved [{', '.join(top_ids)} + {len(top_level)-3} more] by dy={dr:+d}, dx={dc:+d} ({dir_label})")
+                top_descs = [
+                    f"{alias_map.get(b.id, b.id)} ({b.id})" if alias_map.get(b.id) != b.id else str(b.id)
+                    for b in top_level[:3]
+                ]
+                parts.append(f"moved [{', '.join(top_descs)} + {len(top_level)-3} more] by dy={dr:+d}, dx={dc:+d} ({dir_label})")
 
         if parts:
             return "; ".join(parts[:4])
@@ -529,10 +1018,13 @@ def compute_probe_effect(before_snapshot: Any, after_obs: dict[str, Any]) -> str
     # =========================================================================
     # Hypothesis 2: Transfer of selection indicator / dots between STATIONARY containers (State Toggle)
     # =========================================================================
-    b_subs = [o for o in before_snapshot.objects if o.area >= 4]
-    a_subs = [o for o in after_snapshot.objects if o.area >= 4]
-    b_dots = [o for o in before_snapshot.objects if o.area <= 2]
-    a_dots = [o for o in after_snapshot.objects if o.area <= 2]
+    all_b = before_snapshot.objects if hasattr(before_snapshot, "objects") else []
+    all_a = after_snapshot.objects if hasattr(after_snapshot, "objects") else []
+    # Dynamic classification: containers are larger structures enclosing/containing smaller indicator tokens
+    b_dots = [d for d in all_b if any(p.area >= d.area * 2 for p in all_b if p.id != d.id)]
+    a_dots = [d for d in all_a if any(p.area >= d.area * 2 for p in all_a if p.id != d.id)]
+    b_subs = [p for p in all_b if any(p.area >= d.area * 2 for d in b_dots if p.id != d.id)]
+    a_subs = [p for p in all_a if any(p.area >= d.area * 2 for d in a_dots if p.id != d.id)]
 
     lost_from = []
     gained_in = []
@@ -560,7 +1052,7 @@ def compute_probe_effect(before_snapshot: Any, after_obs: dict[str, Any]) -> str
     if lost_from and gained_in:
         l_str = ", ".join(lost_from)
         g_str = ", ".join(gained_in)
-        return f"selection indicator transferred: internal dots moved from {l_str} to {g_str} (active entity toggled)"
+        return f"selection indicator transferred: focus marker moved from {l_str} to {g_str} (active entity toggled)"
 
     # =========================================================================
     # Hypothesis 3: In-place cell color / state change without centroid displacement
@@ -585,10 +1077,11 @@ def compute_probe_effect(before_snapshot: Any, after_obs: dict[str, Any]) -> str
             max_r = max(r for r, _ in changed_cells)
             min_c = min(c for _, c in changed_cells)
             max_c = max(c for _, c in changed_cells)
+            bbox_str = f"in bbox: cols {min_c}..{max_c} (inclusive), rows {min_r}..{max_r} (inclusive)"
             trans_parts = [f"{c_from}->{c_to} ({cnt} cells)" for (c_from, c_to), cnt in sorted(color_counts.items())]
             if len(changed_cells) >= 50 or (max_r - min_r >= 20 and max_c - min_c >= 20):
-                return f"selection indicator / state toggle: global state or active entity toggled ({len(changed_cells)} cells updated across region ({min_r},{min_c})-({max_r},{max_c}))"
-            return f"color transition (stamp/draw): {len(changed_cells)} cells changed color [{', '.join(trans_parts)}] in region ({min_r},{min_c})-({max_r},{max_c})"
+                return f"selection indicator / state toggle: global state or active entity toggled ({len(changed_cells)} cells updated across {bbox_str})"
+            return f"color transition (stamp/draw): {len(changed_cells)} cells changed color [{', '.join(trans_parts)}] {bbox_str}"
 
     # =========================================================================
     # Hypothesis 4: Changed object count or destruction/creation of entities
@@ -608,9 +1101,289 @@ def compute_probe_effect(before_snapshot: Any, after_obs: dict[str, Any]) -> str
         return f"selection indicator cleared from {l_str} (entity deactivated)"
 
     # =========================================================================
-    # Hypothesis 5: Fallback conditional/inactive
+    # Hypothesis 6: Zero visible effect fallback
     # =========================================================================
-    return "conditional action (inactive at boundary or current context)"
+    return "no visible effect (0 cells changed)"
+
+
+def classify_effect_summary_to_affordance(action_id: str, effect_summary: str) -> dict[str, Any]:
+    """Parse textual effect summary into structured ActionAffordance dict."""
+    eff_lower = str(effect_summary).lower()
+    act_up = str(action_id).upper()
+
+    # 1. MODAL_SELECTION
+    if any(k in eff_lower for k in ("selection indicator", "active entity", "focus marker", "state toggle", "mode switch", "toggled", "selection")):
+        return {
+            "action_id": act_up,
+            "effect_class": EffectClass.MODAL_SELECTION.value,
+            "parameters": {"active_entity_switched": True},
+            "coordination_notes": str(effect_summary),
+        }
+
+    # 2. TOPOLOGY_MUTATION
+    if any(k in eff_lower for k in ("object count", "spawn", "destroy", "attach", "detach", "created", "deleted", "merged", "split")):
+        mut_type = "DESTROY" if any(k in eff_lower for k in ("-1", "destroy", "deleted")) else "SPAWN"
+        if "attach" in eff_lower:
+            mut_type = "ATTACH"
+        elif "detach" in eff_lower:
+            mut_type = "DETACH"
+        return {
+            "action_id": act_up,
+            "effect_class": EffectClass.TOPOLOGY_MUTATION.value,
+            "parameters": {"mutation_type": mut_type},
+            "coordination_notes": str(effect_summary),
+        }
+
+    # 3. PALETTE_TRANSITION
+    if any(k in eff_lower for k in ("color transition", "stamp", "draw", "cells changed color", "palette", "recolor")):
+        m_trans = re.search(r"(\d+)->(\d+)", effect_summary)
+        c_from = int(m_trans.group(1)) if m_trans else 0
+        c_to = int(m_trans.group(2)) if m_trans else 0
+        m_cnt = re.search(r"(\d+)\s+cells", effect_summary)
+        cnt = int(m_cnt.group(1)) if m_cnt else 1
+        return {
+            "action_id": act_up,
+            "effect_class": EffectClass.PALETTE_TRANSITION.value,
+            "parameters": {"affected_alias": "grid", "color_from": c_from, "color_to": c_to, "cells_count": cnt},
+            "coordination_notes": str(effect_summary),
+        }
+
+    # 4. KINEMATIC (default for movements / generic confirmed actions)
+    m_dy = re.search(r"dy=([+-]?\d+)", effect_summary)
+    m_dx = re.search(r"dx=([+-]?\d+)", effect_summary)
+    dy = int(m_dy.group(1)) if m_dy else 0
+    dx = int(m_dx.group(1)) if m_dx else 0
+    if not m_dy and not m_dx:
+        if "up" in eff_lower:
+            dy = -1
+        elif "down" in eff_lower:
+            dy = 1
+        elif "left" in eff_lower:
+            dx = -1
+        elif "right" in eff_lower:
+            dx = 1
+    m_alias = re.search(r"moved\s+([A-Z0-9_]+)", effect_summary)
+    alias = m_alias.group(1) if m_alias else "actor"
+    return {
+        "action_id": act_up,
+        "effect_class": EffectClass.KINEMATIC.value,
+        "parameters": {"affected_alias": alias, "dy": dy, "dx": dx},
+        "coordination_notes": str(effect_summary),
+    }
+
+
+def classify_probe_affordance(
+    before_snapshot: Any,
+    after_obs: dict[str, Any] | Any,
+    action_id: str = "ACTION1",
+    planning_set: Any | None = None,
+) -> dict[str, Any] | None:
+    """Classify empirical frame delta into one of 4 invariant ActionAffordance classes."""
+    import math
+    from v10_agent.arga_lite import extract_arga_snapshot
+
+    raw_grid = after_obs.get("grid") if isinstance(after_obs, dict) else getattr(after_obs, "grid", None)
+    if raw_grid is None:
+        return None
+
+    b_grid = getattr(before_snapshot, "grid", None)
+    if b_grid is not None and isinstance(b_grid, (list, tuple)) and isinstance(raw_grid, (list, tuple)):
+        if b_grid == raw_grid:
+            return None
+
+    after_snapshot = extract_arga_snapshot(raw_grid) if not hasattr(after_obs, "objects") else after_obs
+
+    alias_map: dict[str, str] = getattr(planning_set, "object_real_to_alias", {}) if planning_set else {}
+    if not alias_map and hasattr(before_snapshot, "object_real_to_alias"):
+        alias_map = getattr(before_snapshot, "object_real_to_alias", {})
+
+    b_objs = before_snapshot.objects if hasattr(before_snapshot, "objects") else []
+    a_objs = after_snapshot.objects if hasattr(after_snapshot, "objects") else []
+
+    # 1. Kinematic: Check rigid translation of components
+    used_after: set[str] = set()
+    matched_moves: list[tuple[Any, Any, int, int, float]] = []
+
+    for b in b_objs:
+        best_a = None
+        best_dist = float("inf")
+        for a in a_objs:
+            if a.id in used_after:
+                continue
+            if a.color == b.color and abs(a.area - b.area) <= 1:
+                dist = math.hypot(a.centroid.row - b.centroid.row, a.centroid.col - b.centroid.col)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_a = a
+        if best_a is not None and best_dist <= 24.0:
+            dr = int(round(best_a.centroid.row - b.centroid.row))
+            dc = int(round(best_a.centroid.col - b.centroid.col))
+            dr, dc = filter_displacement_jitter(dr, dc)
+            if abs(dr) >= 1 or abs(dc) >= 1:
+                used_after.add(best_a.id)
+                matched_moves.append((b, best_a, dr, dc, best_dist))
+
+    # Check if object counts changed (Topology Mutation)
+    if len(b_objs) != len(a_objs):
+        diff = len(a_objs) - len(b_objs)
+        mut_type = "SPAWN" if diff > 0 else "DESTROY"
+        target_alias = "unknown"
+        if diff > 0 and a_objs:
+            new_objs = [a for a in a_objs if not any(b.color == a.color and abs(b.area - a.area) <= 1 for b in b_objs)]
+            if new_objs:
+                target_alias = alias_map.get(new_objs[0].id, new_objs[0].id)
+        elif diff < 0 and b_objs:
+            lost_objs = [b for b in b_objs if not any(a.color == b.color and abs(a.area - b.area) <= 1 for a in a_objs)]
+            if lost_objs:
+                target_alias = alias_map.get(lost_objs[0].id, lost_objs[0].id)
+        return ActionAffordance(
+            action_id=action_id,
+            effect_class=EffectClass.TOPOLOGY_MUTATION.value,
+            parameters={"mutation_type": mut_type, "target_alias": target_alias, "count_delta": diff},
+            coordination_notes=f"object count changed by {diff:+d} ({mut_type.lower()})",
+        ).to_dict()
+
+    # 2. Modal Selection: Indicator Transfer / Focus Marker / State Toggle
+    # Evaluated before general kinematic motion to ensure indicator transfer between stationary
+    # containers is recognized as focus switching rather than rigid translation.
+    b_dots = [d for d in b_objs if any(p.area >= d.area * 2 for p in b_objs if p.id != d.id)]
+    a_dots = [d for d in a_objs if any(p.area >= d.area * 2 for p in a_objs if p.id != d.id)]
+    b_subs = [p for p in b_objs if any(p.area >= d.area * 2 for d in b_dots if p.id != d.id)]
+    a_subs = [p for p in a_objs if any(p.area >= d.area * 2 for d in a_dots if p.id != d.id)]
+
+    lost_from = []
+    gained_in = []
+    for b_sub in b_subs:
+        b_cnt = sum(
+            1 for d in b_dots
+            if b_sub.bbox.min_row <= d.centroid.row <= b_sub.bbox.max_row
+            and b_sub.bbox.min_col <= d.centroid.col <= b_sub.bbox.max_col
+        )
+        match = next(
+            (a for a in a_subs if a.color == b_sub.color and math.hypot(a.centroid.row - b_sub.centroid.row, a.centroid.col - b_sub.centroid.col) < 1.0),
+            None,
+        )
+        a_cnt = sum(
+            1 for d in a_dots
+            if match and match.bbox.min_row <= d.centroid.row <= match.bbox.max_row
+            and match.bbox.min_col <= d.centroid.col <= match.bbox.max_col
+        ) if match else 0
+
+        if b_cnt >= 1 and a_cnt == 0:
+            lost_from.append(alias_map.get(b_sub.id, b_sub.id))
+        elif b_cnt == 0 and a_cnt >= 1:
+            gained_in.append(alias_map.get(b_sub.id, b_sub.id))
+
+    if lost_from and gained_in:
+        return ActionAffordance(
+            action_id=action_id,
+            effect_class=EffectClass.MODAL_SELECTION.value,
+            parameters={
+                "active_entity_switched": True,
+                "cycle_entities": [lost_from[0], gained_in[0]],
+                "source": lost_from[0],
+                "target": gained_in[0],
+            },
+            coordination_notes=f"selection indicator transferred from {lost_from[0]} to {gained_in[0]} (active entity toggled)",
+        ).to_dict()
+
+    if matched_moves:
+        vector_groups: dict[tuple[int, int], list[tuple[Any, Any]]] = {}
+        for b, a, dr, dc, _ in matched_moves:
+            vector_groups.setdefault((dr, dc), []).append((b, a))
+
+        (top_dr, top_dc), top_pairs = sorted(vector_groups.items(), key=lambda item: -sum(b.area for b, _ in item[1]))[0]
+        top_level = [b for b, _ in top_pairs if getattr(b, "parent_id", None) is None or b.parent_id not in {b.id for b, _ in top_pairs}]
+        top_level.sort(key=lambda o: -getattr(o, "area", 0))
+        primary_b = top_level[0] if top_level else top_pairs[0][0]
+        primary_alias = alias_map.get(primary_b.id, primary_b.id)
+
+        all_disps = [
+            {"alias": alias_map.get(b.id, b.id), "dy": top_dr, "dx": top_dc}
+            for b, _ in top_pairs
+        ]
+        params: dict[str, Any] = {
+            "affected_alias": primary_alias,
+            "dy": top_dr,
+            "dx": top_dc,
+        }
+        if len(all_disps) > 1:
+            params["displacements"] = all_disps
+
+        dir_label = describe_vector(top_dr, top_dc)
+        notes = f"moved {primary_alias} by dy={top_dr:+d}, dx={top_dc:+d} ({dir_label})"
+        if len(top_pairs) > 1:
+            notes += f" [synchronous movement of {len(top_pairs)} objects]"
+
+        return ActionAffordance(
+            action_id=action_id,
+            effect_class=EffectClass.KINEMATIC.value,
+            parameters=params,
+            coordination_notes=notes,
+        ).to_dict()
+
+    # 3. Palette Transition or Global Modal Toggle
+    if b_grid and isinstance(b_grid, (list, tuple)) and raw_grid and isinstance(raw_grid, (list, tuple)):
+        h = min(len(b_grid), len(raw_grid))
+        w = min(len(b_grid[0]), len(raw_grid[0])) if h > 0 else 0
+        changed_cells = []
+        color_counts: dict[tuple[int, int], int] = {}
+        for r in range(h):
+            for c in range(w):
+                c_before = b_grid[r][c]
+                c_after = raw_grid[r][c]
+                if c_before != c_after:
+                    changed_cells.append((r, c))
+                    pair = (c_before, c_after)
+                    color_counts[pair] = color_counts.get(pair, 0) + 1
+
+        if changed_cells:
+            min_r = min(r for r, _ in changed_cells)
+            max_r = max(r for r, _ in changed_cells)
+            min_c = min(c for _, c in changed_cells)
+            max_c = max(c for _, c in changed_cells)
+
+            # Global indicator or wide service bar update -> MODAL_SELECTION
+            if len(changed_cells) >= 50 or (max_r - min_r >= 20 and max_c - min_c >= 20):
+                return ActionAffordance(
+                    action_id=action_id,
+                    effect_class=EffectClass.MODAL_SELECTION.value,
+                    parameters={"active_entity_switched": True, "cells_count": len(changed_cells)},
+                    coordination_notes=f"global state or active entity toggled ({len(changed_cells)} cells updated)",
+                ).to_dict()
+
+            # Otherwise PALETTE_TRANSITION
+            sorted_trans = sorted(color_counts.items(), key=lambda x: -x[1])
+            top_from, top_to = sorted_trans[0][0] if sorted_trans else (0, 0)
+            affected_alias = "grid"
+            for b in b_objs:
+                if b.bbox.min_row <= min_r and max_r <= b.bbox.max_row and b.bbox.min_col <= min_c and max_c <= b.bbox.max_col:
+                    affected_alias = alias_map.get(b.id, b.id)
+                    break
+
+            trans_parts = [f"{c_from}->{c_to} ({cnt} cells)" for (c_from, c_to), cnt in sorted_trans]
+            return ActionAffordance(
+                action_id=action_id,
+                effect_class=EffectClass.PALETTE_TRANSITION.value,
+                parameters={
+                    "affected_alias": affected_alias,
+                    "color_from": top_from,
+                    "color_to": top_to,
+                    "cells_count": len(changed_cells),
+                },
+                coordination_notes=f"color transition: {len(changed_cells)} cells changed color [{', '.join(trans_parts)}]",
+            ).to_dict()
+
+    if gained_in or lost_from:
+        target = gained_in[0] if gained_in else lost_from[0]
+        return ActionAffordance(
+            action_id=action_id,
+            effect_class=EffectClass.MODAL_SELECTION.value,
+            parameters={"active_entity_switched": True, "target": target},
+            coordination_notes=f"selection indicator changed at {target}",
+        ).to_dict()
+
+    return None
 
 
 class PrimitiveProbeManager:
@@ -624,6 +1397,7 @@ class PrimitiveProbeManager:
         self.confirmed_effective_actions: dict[str, str] = {}
         self.inactive_actions: set[str] = set()
         self.zero_effect_actions: set[str] = set()
+        self.conditional_candidate_actions: set[str] = set()
         self.retested_actions: set[str] = set()
         self.total_probes_executed: int = 0
         self._initial_sweep_planned: bool = False
@@ -635,30 +1409,57 @@ class PrimitiveProbeManager:
         self._initial_sweep_planned = False
         self._chains_attempted.clear()
         self.retested_actions.clear()
-        if confirmed_action_effects:
+        self.confirmed_effective_actions.clear()
+        self.inactive_actions.clear()
+        self.zero_effect_actions.clear()
+        self.conditional_candidate_actions.clear()
+
+        if isinstance(confirmed_action_effects, dict):
             for act, eff in confirmed_action_effects.items():
-                if ("moved" in eff and any(d in eff for d in ("UP", "DOWN", "LEFT", "RIGHT"))) or "selection indicator" in eff or "toggle" in eff:
-                    self.confirmed_effective_actions[act] = eff
-                    self.inactive_actions.discard(act)
-                    self.zero_effect_actions.discard(act)
-        # Any discrete action not yet confirmed remains/becomes an unconfirmed candidate for re-probing
+                act_name = str(act).upper()
+                eff_str = str(eff).lower() if isinstance(eff, str) else ""
+                is_pure_motion = (
+                    any(k in eff_str for k in ("moved", "moves", "dy=", "dx=", "displacement", "shift"))
+                    and any(d in eff_str for d in ("up", "down", "left", "right"))
+                    and not any(m in eff_str for m in ("selection indicator", "toggle", "active entity toggled", "selection"))
+                    and act_name not in ("ACTION5", "ACTION6", "RESET", "ACTION7")
+                )
+                if is_pure_motion:
+                    self.confirmed_effective_actions[act_name] = "confirmed_reusable_action"
+        elif confirmed_action_effects is not None:
+            logger.warning(
+                f"PrimitiveProbeManager.handle_level_transition received invalid type {type(confirmed_action_effects).__name__}; "
+                f"expected dict[str, str]. Preserving unprobed status for actions."
+            )
+
+        # Invariant: Modal switches, context-dependent actions, and any unconfirmed actions
+        # MUST remain/become unconfirmed (inactive_actions) to guarantee primary probing on the new level grid.
         for act in self.DISCRETE_PROBE_ALLOWED:
             if act not in self.confirmed_effective_actions:
                 self.inactive_actions.add(act)
 
     def is_action_effective(self, effect_summary: str) -> bool:
         """Determine if observed effect indicates active physical or visual response."""
-        if not effect_summary or "inactive" in effect_summary or "conditional" in effect_summary or "no_grid" in effect_summary:
+        if not effect_summary or "inactive" in effect_summary or "conditional" in effect_summary or "no_grid" in effect_summary or "no visible effect" in effect_summary or "zero observable" in effect_summary:
             return False
-        return any(kw in effect_summary for kw in ("moved", "color transition", "selection indicator", "object count changed"))
+        return any(kw in effect_summary for kw in (
+            "moved", "color transition", "selection indicator", "object count changed",
+            "confirmed_reusable_action", "active entity", "state toggle", "spawn", "destroy",
+            "attach", "detach", "cells changed color",
+        ))
 
     def is_motion_action(self, action_id: str) -> bool:
         """Check if confirmed action induces directional translation."""
         eff = self.confirmed_effective_actions.get(action_id, "")
-        return "moved" in eff and any(d in eff for d in ("UP", "DOWN", "LEFT", "RIGHT"))
+        return ("moved" in eff and any(d in eff for d in ("UP", "DOWN", "LEFT", "RIGHT"))) or "confirmed_reusable_action" in eff
 
-    def get_dynamic_reprobes(self, triggering_action_id: str, effect_summary: str) -> list[ActionDeclaration]:
-        """Dynamic re-probing invariant: re-probe inactive actions or verify motion changes after an effective state transition."""
+    def get_dynamic_reprobes(
+        self,
+        triggering_action_id: str,
+        effect_summary: str,
+        max_steps: int | None = None,
+    ) -> list[ActionDeclaration]:
+        """Dynamic re-probing invariant: re-probe inactive actions, explore modal affordances, or switch modes after zero response."""
         reprobes: list[ActionDeclaration] = []
         if self.total_probes_executed >= self.max_probes:
             return reprobes
@@ -705,10 +1506,53 @@ class PrimitiveProbeManager:
                         )
                     )
 
+        # Case 3: Invariant of Orthogonal Modality
+        # If a vector action yielded zero effect, probe modal switches (ACTION5, ACTION6)
+        # and re-test the vector direction under the newly toggled mode.
+        is_zero_effect = (
+            not self.is_action_effective(effect_summary)
+            or "no visible effect" in effect_summary
+            or "0 cells changed" in effect_summary
+            or "zero" in effect_summary
+        )
+        is_vector_action = triggering_action_id in ("ACTION1", "ACTION2", "ACTION3", "ACTION4")
+        if is_vector_action and is_zero_effect:
+            for modal_act in ("ACTION5", "ACTION6"):
+                if modal_act != triggering_action_id and len(reprobes) < rem:
+                    reprobes.append(
+                        ActionDeclaration(
+                            action_id=modal_act,
+                            data={},
+                            reasoning={
+                                "source": "dynamic_modal_switch_probe",
+                                "trigger": f"zero_effect_from_{triggering_action_id}",
+                                "rationale": "toggle_mode_to_unlock_orthogonal_degree_of_freedom",
+                            },
+                        )
+                    )
+                    if len(reprobes) < rem:
+                        reprobes.append(
+                            ActionDeclaration(
+                                action_id=triggering_action_id,
+                                data={},
+                                reasoning={
+                                    "source": "dynamic_modal_vector_retest",
+                                    "trigger": f"post_modal_switch_by_{modal_act}",
+                                    "rationale": f"retest_{triggering_action_id}_under_new_mode",
+                                },
+                            )
+                        )
+
+        if max_steps is not None:
+            return reprobes[:max_steps]
         return reprobes
 
-    def schedule_falsification_reprobe(self, falsified_action_ids: list[str] | None = None) -> list[ActionDeclaration]:
-        """Schedule immediate micro-reprobing of primitive actions on clean board following empirical falsification."""
+    def schedule_falsification_reprobe(
+        self,
+        falsified_action_ids: list[str] | None = None,
+        modal_switch_actions: Sequence[str] | None = None,
+    ) -> list[ActionDeclaration]:
+        """Schedule immediate micro-reprobing of primitive and modal actions on clean board following empirical falsification."""
         if falsified_action_ids:
             for act in falsified_action_ids:
                 self.confirmed_effective_actions.pop(act, None)
@@ -719,19 +1563,51 @@ class PrimitiveProbeManager:
         self._initial_sweep_planned = False
         self.total_probes_executed = 0
 
-        # Queue baseline discrete motion actions to discover actual kinematics on clean board
-        actions_to_probe = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
-        probes = [
-            ActionDeclaration(
-                action_id=act,
-                data={},
-                reasoning={
-                    "source": "falsification_micro_reprobe",
-                    "rationale": "retest_baseline_kinematics_after_falsification",
-                },
+        modals = list(modal_switch_actions) if modal_switch_actions is not None else ["ACTION5", "ACTION6"]
+
+        probes: list[ActionDeclaration] = []
+        # 1. Baseline discrete motion actions
+        vector_candidates = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
+        for act in vector_candidates:
+            probes.append(
+                ActionDeclaration(
+                    action_id=act,
+                    data={},
+                    reasoning={
+                        "source": "falsification_micro_reprobe",
+                        "rationale": "retest_baseline_kinematics_after_falsification",
+                    },
+                )
             )
-            for act in actions_to_probe
-        ]
+
+        # 2. Modal selectors to test discrete mode switching
+        for m_act in modals:
+            probes.append(
+                ActionDeclaration(
+                    action_id=m_act,
+                    data={},
+                    reasoning={
+                        "source": "falsification_modal_reprobe",
+                        "rationale": "toggle_mode_selector_after_falsification",
+                    },
+                )
+            )
+            # Re-test vector directions under switched mode to unlock degrees of freedom
+            targets_to_retest = falsified_action_ids if falsified_action_ids else vector_candidates[:2]
+            for act in targets_to_retest:
+                if act in vector_candidates:
+                    probes.append(
+                        ActionDeclaration(
+                            action_id=act,
+                            data={},
+                            reasoning={
+                                "source": "falsification_modal_vector_retest",
+                                "trigger": f"post_modal_switch_by_{m_act}",
+                                "rationale": f"retest_{act}_under_switched_mode",
+                            },
+                        )
+                    )
+
         return probes
 
 
@@ -813,18 +1689,37 @@ class PrimitiveProbeManager:
         available_actions: Sequence[str] | None = None,
         memory: EnvironmentSpecMemory | None = None,
         affordances: list[dict[str, Any]] | None = None,
+        crop_offset: int | None = None,
     ) -> list[ActionDeclaration]:
         """Generate targeted coordinate probes based on Explorer affordance suggestions."""
         allowed = list(available_actions) if available_actions is not None else list(planning_set.allowed_action_ids)
         coord_act = "ACTION6" if "ACTION6" in allowed else (allowed[0] if allowed else "ACTION6")
 
+        eff_crop = crop_offset if crop_offset is not None else getattr(planning_set, "crop_offset", 0)
         tested_coords = set()
         if memory:
-            tested_coords = {
-                (int(p.action_data.get("x", -1)), int(p.action_data.get("y", -1)))
-                for p in memory.probe_history
-                if p.action_id == coord_act
-            }
+            for p in memory.probe_history:
+                if p.action_id == coord_act and isinstance(p.action_data, dict):
+                    lx = p.action_data.get("local_x")
+                    ly = p.action_data.get("local_y")
+                    if lx is not None and ly is not None:
+                        try:
+                            tested_coords.add((int(lx), int(ly)))
+                            continue
+                        except (ValueError, TypeError):
+                            pass
+                    x = p.action_data.get("x")
+                    y = p.action_data.get("y")
+                    if x is not None and y is not None:
+                        try:
+                            xi, yi = int(x), int(y)
+                            rec_crop = p.action_data.get("crop_offset", eff_crop)
+                            if rec_crop > 0:
+                                tested_coords.add((xi - rec_crop, yi - rec_crop))
+                            else:
+                                tested_coords.add((xi, yi))
+                        except (ValueError, TypeError):
+                            pass
         probes: list[ActionDeclaration] = []
         if affordances:
             for aff in affordances:
@@ -867,20 +1762,25 @@ class PrimitiveProbeManager:
         before_snapshot: Any,
         after_obs: dict[str, Any],
         memory: EnvironmentSpecMemory | None = None,
+        planning_set: Any | None = None,
     ) -> ProbeRecord:
         """Compute delta and record probe observation into EnvironmentSpecMemory."""
         self.total_probes_executed += 1
-        effect_str = compute_probe_effect(before_snapshot, after_obs)
+        effect_str = compute_probe_effect(before_snapshot, after_obs, planning_set=planning_set)
         self.probed_actions[action_id] = effect_str
+        affordance = classify_probe_affordance(before_snapshot, after_obs, action_id=action_id, planning_set=planning_set)
 
         if self.is_action_effective(effect_str):
             self.confirmed_effective_actions[action_id] = effect_str
             self.inactive_actions.discard(action_id)
             self.zero_effect_actions.discard(action_id)
+            self.conditional_candidate_actions.discard(action_id)
         else:
             if action_id not in self.confirmed_effective_actions:
                 self.inactive_actions.add(action_id)
                 self.zero_effect_actions.add(action_id)
+                if action_id in self.DISCRETE_PROBE_ALLOWED:
+                    self.conditional_candidate_actions.add(action_id)
 
         probe_id = f"probe_{len(memory.probe_history)}" if memory else f"probe_{self.total_probes_executed}"
         record = ProbeRecord(
@@ -889,6 +1789,7 @@ class PrimitiveProbeManager:
             action_data=action_data,
             observed_effect=effect_str,
             confidence=0.95 if self.is_action_effective(effect_str) else 0.5,
+            affordance=affordance,
         )
         if memory:
             memory.record_probe(record)

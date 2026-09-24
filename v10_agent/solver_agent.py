@@ -57,7 +57,226 @@ def _parse_fn_call_args(call_str: str) -> tuple[str, dict]:
             return name, {}
         pairs = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^,]+)', arg_str)
         return name, {k: v.strip() for k, v in pairs}
-    return call_str, {}
+def parse_expect_grammar_str(exp_str: str, planning_set: Any = None) -> list[dict[str, Any]]:
+    """Parse typed EXPECT grammar clauses into AtomicProposition dictionaries."""
+    props: list[dict[str, Any]] = []
+    # Tokenize by comma, respecting parentheses e.g. moved(A, 0, 1)
+    items: list[str] = []
+    current: list[str] = []
+    paren_depth = 0
+    for char in exp_str:
+        if char == "(":
+            paren_depth += 1
+            current.append(char)
+        elif char == ")":
+            paren_depth = max(0, paren_depth - 1)
+            current.append(char)
+        elif char == "," and paren_depth == 0:
+            items.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if current:
+        items.append("".join(current).strip())
+
+    for item in items:
+        if not item:
+            continue
+
+        # 1. moved(ALIAS, dy, dx)
+        m_moved = re.match(r"^moved\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*([+-]?\d+)\s*,\s*([+-]?\d+)\s*\)$", item, re.IGNORECASE)
+        if m_moved:
+            alias, dy, dx = m_moved.group(1), int(m_moved.group(2)), int(m_moved.group(3))
+            subj_id = alias
+            if planning_set is not None and hasattr(planning_set, "resolve_object_id"):
+                resolved = planning_set.resolve_object_id(alias)
+                if resolved:
+                    subj_id = resolved
+            s_dy = 1 if dy > 0 else (-1 if dy < 0 else 0)
+            s_dx = 1 if dx > 0 else (-1 if dx < 0 else 0)
+            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "moved", "value": (dy, dx)})
+            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "step_moved", "value": (s_dy, s_dx)})
+            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "dy", "value": dy})
+            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "dx", "value": dx})
+            continue
+
+        # 2. color(ALIAS)=C
+        m_color = re.match(r"^color\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*=\s*([0-9]+)$", item, re.IGNORECASE)
+        if m_color:
+            alias, c = m_color.group(1), int(m_color.group(2))
+            subj_id = alias
+            if planning_set is not None and hasattr(planning_set, "resolve_object_id"):
+                resolved = planning_set.resolve_object_id(alias)
+                if resolved:
+                    subj_id = resolved
+            props.append({"family": "attribute_delta", "subject_id": subj_id, "predicate": "color", "value": c})
+            continue
+
+        # 3. unchanged(ALIAS)
+        m_unchanged = re.match(r"^unchanged\s*\(\s*([a-zA-Z0-9_]+)\s*\)$", item, re.IGNORECASE)
+        if m_unchanged:
+            alias = m_unchanged.group(1)
+            subj_id = alias
+            if planning_set is not None and hasattr(planning_set, "resolve_object_id"):
+                resolved = planning_set.resolve_object_id(alias)
+                if resolved:
+                    subj_id = resolved
+            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "unchanged", "value": (0, 0)})
+            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "dy", "value": 0})
+            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "dx", "value": 0})
+            props.append({"family": "object_identity", "subject_id": subj_id, "predicate": "preserved"})
+            continue
+
+        # 4. appears(ALIAS) / gone(ALIAS)
+        m_app = re.match(r"^appears\s*\(\s*([a-zA-Z0-9_]+)\s*\)$", item, re.IGNORECASE)
+        if m_app:
+            alias = m_app.group(1)
+            subj_id = alias
+            if planning_set is not None and hasattr(planning_set, "resolve_object_id"):
+                resolved = planning_set.resolve_object_id(alias)
+                if resolved:
+                    subj_id = resolved
+            props.append({"family": "object_identity", "subject_id": subj_id, "predicate": "preserved"})
+            continue
+        m_gone = re.match(r"^gone\s*\(\s*([a-zA-Z0-9_]+)\s*\)$", item, re.IGNORECASE)
+        if m_gone:
+            alias = m_gone.group(1)
+            subj_id = alias
+            if planning_set is not None and hasattr(planning_set, "resolve_object_id"):
+                resolved = planning_set.resolve_object_id(alias)
+                if resolved:
+                    subj_id = resolved
+            props.append({"family": "object_identity", "subject_id": subj_id, "predicate": "destroyed"})
+            continue
+
+        # 5. state=S / levels_completed=N
+        m_state = re.match(r"^state\s*=\s*([a-zA-Z0-9_]+)$", item, re.IGNORECASE)
+        if m_state:
+            props.append({"family": "terminal_metadata", "subject_id": "game", "predicate": "state", "value": m_state.group(1).upper()})
+            continue
+        m_lvl = re.match(r"^levels_completed\s*=\s*(\d+)$", item, re.IGNORECASE)
+        if m_lvl:
+            props.append({"family": "terminal_metadata", "subject_id": "game", "predicate": "levels_completed", "value": int(m_lvl.group(1))})
+            continue
+
+        # 6. region(x0,y0,x1,y1): C1->C2
+        m_reg = re.match(r"^region\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)\s*:\s*(\d+)\s*->\s*(\d+)$", item, re.IGNORECASE)
+        if m_reg:
+            props.append({
+                "family": "region_transition",
+                "predicate": "color_transition",
+                "value": f"{m_reg.group(5)}->{m_reg.group(6)}",
+                "bbox": [int(m_reg.group(1)), int(m_reg.group(2)), int(m_reg.group(3)), int(m_reg.group(4))],
+            })
+            continue
+
+        # 7. Legacy fallback k=v
+        kv = item.split("=")
+        if len(kv) == 2:
+            k = kv[0].strip()
+            v_str = kv[1].strip()
+            val: Any
+            try:
+                val = int(v_str)
+            except ValueError:
+                val = v_str
+            props.append({"family": "metric_sign", "predicate": k, "value": val})
+
+    return props
+
+
+def _decompose_expected_propositions_for_substep(
+    exp_props: list[dict[str, Any]],
+    substep_idx: int,
+    total_substeps: int,
+) -> list[dict[str, Any]]:
+    """Decompose macro EXPECT propositions across atomic substeps.
+
+    Invariant rules:
+    1. State invariants (unchanged, preserved, zero metric delta) apply to EVERY substep.
+    2. Kinematic movements (moved, step_moved, non-zero dy/dx) emit incremental single-step
+       expectations (sgn(dy), sgn(dx)) on every intermediate substep.
+    3. The full cumulative vector is preserved on the final substep.
+    """
+    def _sgn(v: Any) -> int:
+        try:
+            vi = int(v)
+            return 1 if vi > 0 else (-1 if vi < 0 else 0)
+        except (ValueError, TypeError):
+            return 0
+
+    sub_props: list[dict[str, Any]] = []
+    is_final_step = (substep_idx == total_substeps - 1)
+
+    for prop in exp_props:
+        p_dict = dict(prop) if isinstance(prop, dict) else prop.to_dict()
+        pred = p_dict.get("predicate", "").lower()
+        fam = p_dict.get("family", "metric_sign")
+        subj = p_dict.get("subject_id", "")
+        val = p_dict.get("value")
+
+        # 1. Invariants of state: unchanged, preserved, zero displacement
+        if pred in ("unchanged", "preserved") or (
+            fam == "metric_sign" and pred in ("dy", "dx", "row_delta", "col_delta") and val == 0
+        ):
+            sub_props.append(dict(p_dict))
+            continue
+
+        # 2. Kinematic movement tuple: moved, step_moved
+        if pred in ("moved", "step_moved"):
+            dy, dx = 0, 0
+            if isinstance(val, (tuple, list)) and len(val) >= 2:
+                dy, dx = _sgn(val[0]), _sgn(val[1])
+            elif isinstance(val, str):
+                v_clean = val.strip().strip("()[]")
+                parts = [p.strip() for p in v_clean.split(",") if p.strip()]
+                if len(parts) >= 2:
+                    dy, dx = _sgn(parts[0]), _sgn(parts[1])
+
+            # Every substep expects incremental single-step motion
+            sub_props.append({
+                "family": fam,
+                "subject_id": subj,
+                "predicate": "step_moved",
+                "value": (dy, dx),
+            })
+            sub_props.append({
+                "family": fam,
+                "subject_id": subj,
+                "predicate": "moved",
+                "value": (dy, dx),
+            })
+            if is_final_step:
+                sub_props.append(dict(p_dict))
+            continue
+
+        # 3. Scalar metric sign: dy, dx, row_delta, col_delta
+        if fam == "metric_sign" and pred in ("dy", "dx", "row_delta", "col_delta"):
+            s_val = _sgn(val)
+            sub_props.append({
+                "family": fam,
+                "subject_id": subj,
+                "predicate": pred,
+                "value": s_val,
+            })
+            if is_final_step:
+                sub_props.append(dict(p_dict))
+            continue
+
+        # 4. Other propositions (e.g. terminal metadata, color transition) on the final substep
+        if is_final_step:
+            sub_props.append(dict(p_dict))
+
+    # Deduplicate while preserving order
+    dedup: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for p in sub_props:
+        k = (str(p.get("family")), str(p.get("subject_id")), str(p.get("predicate")), str(p.get("value")))
+        if k not in seen:
+            seen.add(k)
+            dedup.append(p)
+
+    return dedup
 
 
 def parse_text_trajectory(
@@ -102,14 +321,19 @@ def parse_text_trajectory(
             return nl
         return name
 
-    # 0. Invariant / Hypothesis extraction (supports both XML <invariant_analysis> and markdown [HYPOTHESIS])
+    # 0. Invariant / Hypothesis extraction (supports XML <analysis>, <invariant_analysis> and markdown [HYPOTHESIS])
     inv_evo_text = ""
     hypothesis_text = ""
+    analysis_text = ""
+
+    xml_an = re.search(r"<analysis>(.*?)(?:</analysis>|\Z)", text, re.DOTALL | re.IGNORECASE)
+    if xml_an:
+        analysis_text = xml_an.group(1).strip()
 
     xml_ia = re.search(r"<invariant_analysis>(.*?)(?:</invariant_analysis>|\Z)", text, re.DOTALL | re.IGNORECASE)
     if xml_ia:
         inv_evo_text = xml_ia.group(1).strip()
-        hypothesis_text = inv_evo_text
+        hypothesis_text = f"{analysis_text}\n\n{inv_evo_text}".strip() if analysis_text else inv_evo_text
     else:
         ie_match = re.search(
             r"(?i)(?:\[\s*invariant_evolution\s*\]|#+\s*invariant_evolution|invariant_evolution\s*:)(.*?)(?=(?:\[\s*hypothesis\s*\]|#+\s*hypothesis|hypothesis\s*:|\[\s*trajectory\s*\]|#+\s*trajectory|trajectory\s*:|\[\s*plan\s*\]|\Z))",
@@ -126,6 +350,8 @@ def parse_text_trajectory(
         )
         if h_match:
             hypothesis_text = h_match.group(1).strip()
+        elif analysis_text:
+            hypothesis_text = analysis_text
 
     # 1. Trajectory blocks extraction (supports XML tags <trajectory_1>... and markdown [TRAJECTORY] / **Trajectory 1**)
     raw_chunks: list[tuple[str, str]] = []
@@ -210,13 +436,30 @@ def parse_text_trajectory(
                             raw_fn = item.get("dsl_function") or item.get("action") or item.get("name") or "step"
                             fn = canonicalize_func_name(raw_fn)
                             if not valid_func_names or fn in valid_func_names:
-                                cand_steps.append({
-                                    "step_id": f"s{step_idx}",
-                                    "dsl_function": fn,
-                                    "arguments": item.get("arguments") or item.get("params") or {},
-                                    "expected_propositions": item.get("expected_propositions") or [],
-                                })
-                                step_idx += 1
+                                item_args = item.get("arguments") or item.get("params") or {}
+                                item_exp = item.get("expected_propositions") or []
+                                count = item_args.pop("count", 1) if isinstance(item_args, dict) else 1
+                                if isinstance(count, int) and count > 1:
+                                    actual_count = min(count, 30)
+                                    for i in range(actual_count):
+                                        sub_exp = _decompose_expected_propositions_for_substep(item_exp, i, actual_count)
+                                        cand_steps.append({
+                                            "step_id": f"s{step_idx}",
+                                            "dsl_function": fn,
+                                            "arguments": copy.deepcopy(item_args),
+                                            "expected_propositions": sub_exp,
+                                            "repeat_index": i,
+                                            "repeat_total": actual_count,
+                                        })
+                                        step_idx += 1
+                                else:
+                                    cand_steps.append({
+                                        "step_id": f"s{step_idx}",
+                                        "dsl_function": fn,
+                                        "arguments": item_args,
+                                        "expected_propositions": item_exp,
+                                    })
+                                    step_idx += 1
                 except Exception:
                     pass
 
@@ -246,21 +489,7 @@ def parse_text_trajectory(
                         except Exception:
                             pass
                     else:
-                        for item in exp_str.split(","):
-                            kv = item.strip().split("=")
-                            if len(kv) == 2:
-                                k = kv[0].strip()
-                                v_str = kv[1].strip()
-                                val: Any
-                                try:
-                                    val = int(v_str)
-                                except ValueError:
-                                    val = v_str
-                                exp_props.append({
-                                    "family": "metric_sign",
-                                    "predicate": k,
-                                    "value": val,
-                                })
+                        exp_props.extend(parse_expect_grammar_str(exp_str, planning_set=planning_set))
 
                 m = re.search(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\)", line_s)
                 if m:
@@ -290,14 +519,14 @@ def parse_text_trajectory(
                         if isinstance(count, int) and count > 1:
                             actual_count = min(count, 30)
                             for i in range(actual_count):
+                                sub_exp = _decompose_expected_propositions_for_substep(exp_props, i, actual_count)
                                 cand_steps.append({
                                     "step_id": f"s{step_idx}",
                                     "dsl_function": fn,
                                     "arguments": copy.deepcopy(args),
-                                    "expected_propositions": exp_props if i == actual_count - 1 else [],
+                                    "expected_propositions": sub_exp,
                                     "repeat_index": i,
                                     "repeat_total": actual_count,
-                                    "break_on_null": True,
                                 })
                                 step_idx += 1
                         else:
@@ -328,6 +557,8 @@ def parse_text_trajectory(
     }
     if inv_evo_text:
         res["invariant_evolution"] = inv_evo_text
+    if analysis_text:
+        res["analysis"] = analysis_text
     return res
 
 
@@ -352,6 +583,11 @@ class SolverAgent:
         budget: int = 50,
         image_png: bytes | list[bytes] | tuple[bytes, ...] | dict[str, bytes] | None = None,
         game_memory: Any | None = None,
+        attempts_remaining: int | None = None,
+        max_attempts: int | None = None,
+        probes_remaining: int | None = None,
+        max_probes: int | None = None,
+        env_spec: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Propose candidate trajectories adhering strictly to schema v10.trajectory_package.1."""
         solver_mm = getattr(
@@ -372,6 +608,12 @@ class SolverAgent:
             action_budget=budget,
             game_memory=game_memory,
             has_image=has_image,
+            level_index=getattr(game_memory, "completed_levels", None),
+            attempts_remaining=attempts_remaining,
+            max_attempts=max_attempts or getattr(self.config, "max_chain_attempts_per_level", 5),
+            probes_remaining=probes_remaining,
+            max_probes=max_probes or getattr(self.config, "max_evidence_probes_per_level", 3),
+            env_spec=env_spec,
         )
 
         retries = max(1, getattr(self.config, "max_solver_retries_per_level", 5))
@@ -625,14 +867,15 @@ class SolverAgent:
             f"   - [ENTITIES]: Persistent entity types, symmetries, and structures\n"
             f"   - [CONTROL]: How actions and entity toggling/selection operate\n"
             f"   - [PHYSICS]: Kinematics, movement displacement, walls, boundaries, and collisions\n\n"
-            f"Format your revised invariant list strictly inside <revised_invariants>...</revised_invariants> with bullet points:\n"
-            f"<revised_invariants>\n"
+            f"Format your revised invariant list strictly inside <invariants_update>...</invariants_update> with bullet points and Brusentsov classification:\n"
+            f"<invariants_update>\n"
+            f"- [NEGATIVE_BARRIER] Contact(ACTOR, Color_X) => DefeatReset() : ...\n"
+            f"- [POSITIVE_CANON] Contact(ACTOR, Color_Y) => LevelVictory() : ...\n"
             f"- [PHYSICS]: ...\n"
             f"- [CONTROL]: ...\n"
             f"- [ENTITIES]: ...\n"
-            f"- [GOAL]: ...\n"
-            f"- [PALETTE & ROLES]: ...\n"
-            f"</revised_invariants>"
+            f"- [PALETTE & ROLES]: Color X is HAZARD, Color Y is TARGET\n"
+            f"</invariants_update>"
         )
 
         messages_to_send: list[dict[str, Any]]
@@ -657,7 +900,9 @@ class SolverAgent:
             response = ""
 
         invariants: list[str] = []
-        xml_m = re.search(r"<revised_invariants>(.*?)(?:</revised_invariants>|\Z)", response, re.DOTALL | re.IGNORECASE)
+        xml_m = re.search(r"<invariants_update>(.*?)(?:</invariants_update>|\Z)", response, re.DOTALL | re.IGNORECASE)
+        if not xml_m:
+            xml_m = re.search(r"<revised_invariants>(.*?)(?:</revised_invariants>|\Z)", response, re.DOTALL | re.IGNORECASE)
         if not xml_m:
             xml_m = re.search(r"<distilled_invariants>(.*?)(?:</distilled_invariants>|\Z)", response, re.DOTALL | re.IGNORECASE)
         inv_text = xml_m.group(1).strip() if xml_m else response.strip()

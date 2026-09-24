@@ -250,3 +250,41 @@ def test_synthesize_invariant_trajectory_and_fallback():
     assert res.verdict in ("APPROVED", "REPAIRED")
     assert res.goal_reached is True
 
+
+def test_in_grid_divider_or_axis_does_not_reject_trajectory():
+    """Verify that moving towards or across an in-grid divider or axis does not cause a false collision rejection."""
+    grid = [[0] * 30 for _ in range(30)]
+    # Piece at cols 10..12
+    grid[5][10] = 5
+    grid[5][11] = 5
+    grid[6][10] = 5
+    # Central divider/axis at col 18
+    for r in range(30):
+        grid[r][18] = 10
+    # Symmetric target at cols 24..26
+    grid[5][24] = 4
+    grid[5][25] = 4
+    grid[6][25] = 4
+
+    snapshot = extract_arga_snapshot(grid)
+    planning_set = build_planning_set(
+        snapshot, ["ACTION1", "ACTION2", "ACTION3", "ACTION4"], grid_to_hex_rows(grid)
+    )
+
+    game_mem = GameMemory(game_id="ar25")
+    game_mem.record_action_effect("action4", "moved RIGHT by dy=0, dx=3")
+
+    sandbox = VirtualKinematicSandbox(planning_set, game_mem)
+    manifest_map = {
+        "action4": {"name": "action4", "docstring": "shift entity right"},
+    }
+
+    # Propose 3 steps of action4 moving right (10 -> 13 -> 16 -> 19, crossing col 18)
+    steps = [
+        {"dsl_function": "action4", "arguments": {}},
+        {"dsl_function": "action4", "arguments": {}},
+        {"dsl_function": "action4", "arguments": {}},
+    ]
+    res = sandbox.evaluate_and_repair_trajectory(steps, manifest_map)
+    assert res.verdict != "REJECTED"
+    assert res.has_boundary_violation is False

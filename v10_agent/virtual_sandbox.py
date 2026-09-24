@@ -25,6 +25,30 @@ from v10_agent.universal_invariants import DiscoveredInvariant, discover_invaria
 logger = logging.getLogger("v10_agent.virtual_sandbox")
 
 
+def preprocess_grid(raw_grid: list[list[int]]) -> list[list[int]]:
+    """Crop 1-pixel border from raw ARC-AGI-3 grid to remove system indicator frame.
+
+    ARC-AGI-3 grids are up to 64x64 with 16 colors (0..15).
+    The outermost 1-pixel ring contains system-level indicators.
+
+    Returns:
+        Cropped grid with 1px border removed: (H-2) x (W-2)
+    """
+    if not raw_grid or len(raw_grid) < 3:
+        return raw_grid
+    if len(raw_grid[0]) < 3:
+        return raw_grid
+    return [row[1:-1] for row in raw_grid[1:-1]]
+
+
+def translate_coords_to_raw(x: int, y: int, offset: int = 1) -> tuple[int, int]:
+    """Translate agent-space coordinates back to raw grid coordinates (add offset)."""
+    return (x + offset, y + offset)
+
+
+ACTION7_BLOCKED_MSG = "ACTION7 (Undo) is hardware-blocked and excluded from the search space."
+
+
 @dataclass
 class SandboxEvaluationResult:
     verdict: str  # "APPROVED" | "REPAIRED" | "REJECTED"
@@ -81,22 +105,12 @@ class VirtualKinematicSandbox:
         # Pieces can move in all 4 directions by default
         self.piece_actions = set(self.action_vectors.keys())
 
-        # Classify axis actions when linear reflection axes are present
-        has_v_axis = any(
-            (o.height >= 10 and o.width <= 4) for o in (self.planning_set.objects if self.planning_set else [])
-        )
-        has_h_axis = any(
-            (o.width >= 10 and o.height <= 4) for o in (self.planning_set.objects if self.planning_set else [])
-        )
+        # Universal action classification — no game-specific axis geometry assumptions.
+        # All directional actions are available by default; the simulation layer
+        # determines mobility via collision checks, not shape heuristics.
         self.v_axis_actions: set[str] = {act for act, (dy, dx) in self.action_vectors.items() if dy == 0 and dx != 0}
         self.h_axis_actions: set[str] = {act for act, (dy, dx) in self.action_vectors.items() if dy != 0 and dx == 0}
-        self.axis_actions = set()
-        if has_v_axis:
-            self.axis_actions.update(self.v_axis_actions)
-        if has_h_axis:
-            self.axis_actions.update(self.h_axis_actions)
-        if not has_v_axis and not has_h_axis:
-            self.axis_actions = set(self.action_vectors.keys())
+        self.axis_actions = set(self.action_vectors.keys())
 
     def _get_displacement(
         self,
@@ -139,15 +153,19 @@ class VirtualKinematicSandbox:
             elif "right" in fn_lower or "right" in doc_lower:
                 dy, dx = self.action_vectors.get("action4", (0, 1))
 
-        # 5. Strict actor isolation: linear reflection axes can only move perpendicular to line
+        # 5. Actor isolation: elongated objects (aspect ratio > 3:1) are constrained
+        # to move only along their shorter axis (perpendicular to elongation).
         if actor_type == "axis":
             obj = self.planning_set.get_object(obj_id) if (obj_id and self.planning_set) else None
-            is_v = (obj.height >= 10 and obj.width <= 4) if obj else bool(self.v_axis_actions)
-            is_h = (obj.width >= 10 and obj.height <= 4) if obj else bool(self.h_axis_actions)
-            if is_v and dy != 0:
-                return (0, 0)
-            if is_h and dx != 0:
-                return (0, 0)
+            if obj:
+                aspect = max(obj.height, obj.width) / max(1, min(obj.height, obj.width))
+                if aspect >= 3.0:
+                    is_v = obj.height > obj.width
+                    is_h = obj.width > obj.height
+                    if is_v and dy != 0:
+                        return (0, 0)
+                    if is_h and dx != 0:
+                        return (0, 0)
 
         return (dy, dx)
 
@@ -171,22 +189,7 @@ class VirtualKinematicSandbox:
         else:
             sim_axis_coord = None
 
-        if self.game_memory and self.game_memory.selection_mechanics:
-            for note in self.game_memory.selection_mechanics:
-                m_pc = re.search(r"piece_steps=([+-]?\d+)", note)
-                if m_pc:
-                    p_steps = int(m_pc.group(1))
-                    if p_steps != 0:
-                        magnitudes = [
-                            max(abs(dy), abs(dx))
-                            for vec_map in ([self.action_vectors] + list(self.object_action_vectors.values()))
-                            for dy, dx in vec_map.values()
-                            if max(abs(dy), abs(dx)) > 0
-                        ]
-                        s_sz = max(1, magnitudes[0]) if magnitudes else 3
-                        if sim_piece_r + p_steps * s_sz >= self.grid_h or sim_piece_r + p_steps * s_sz < 0:
-                            sim_piece_r = sim_target_r - p_steps * s_sz
-                    break
+        # Initial distance is computed purely from object centroids and geometric invariants.
 
         return compute_invariant_distance(
             subject_r=sim_piece_r,
@@ -233,22 +236,7 @@ class VirtualKinematicSandbox:
         else:
             sim_axis_coord = None
 
-        # If kinematics specifies a confirmed piece_steps offset towards target
-        if self.game_memory:
-            kinematics_inv = self.game_memory.get_invariants_by_type("kinematics")
-            for inv in kinematics_inv:
-                p_steps = inv.metadata.get("piece_steps", 0)
-                if p_steps != 0:
-                    magnitudes = [
-                        max(abs(dy), abs(dx))
-                        for vec_map in ([self.action_vectors] + list(self.object_action_vectors.values()))
-                        for dy, dx in vec_map.values()
-                        if max(abs(dy), abs(dx)) > 0
-                    ]
-                    s_sz = max(1, magnitudes[0]) if magnitudes else 3
-                    if sim_piece_r + p_steps * s_sz >= self.grid_h or sim_piece_r + p_steps * s_sz < 0:
-                        sim_piece_r = sim_target_r - p_steps * s_sz
-                    break
+        # Invariant simulation operates purely on object centroids and geometric properties.
 
         # Determine selectable actors in the scene
         selectable_actors: list[dict[str, Any]] = []
@@ -259,7 +247,8 @@ class VirtualKinematicSandbox:
         if self.planning_set:
             for o in self.planning_set.objects:
                 if o.id not in [a["id"] for a in selectable_actors]:
-                    is_other_axis = ((o.height >= 10 and o.width <= 4) or (o.width >= 10 and o.height <= 4))
+                    aspect = max(o.height, o.width) / max(1, min(o.height, o.width))
+                    is_other_axis = aspect >= 3.0
                     if is_other_axis:
                         selectable_actors.append({"type": "axis", "id": o.id, "obj": o})
                     elif o.area >= 4 and o.color != 0:
@@ -273,20 +262,25 @@ class VirtualKinematicSandbox:
         active_actor = "piece"
         if self.game_memory and self.game_memory.selection_mechanics:
             for note in self.game_memory.selection_mechanics:
-                m = re.search(r"internal dots moved from\s+(obj_[a-zA-Z0-9_]+)", note)
+                # General actor identification from selection mechanics
+                m = re.search(r"(?:moved|controlled|active)\s+(?:from\s+)?(obj_[a-zA-Z0-9_]+)", note, re.IGNORECASE)
                 if m:
                     src_id = m.group(1)
                     if axis_obj and src_id == axis_obj.id:
                         active_actor = "axis"
                         break
                     src_obj = self.planning_set.get_object(src_id) if self.planning_set else None
-                    if src_obj and ((src_obj.height >= 10 and src_obj.width <= 4) or (src_obj.width >= 10 and src_obj.height <= 4)):
-                        active_actor = "axis"
-                        break
+                    if src_obj:
+                        aspect = max(src_obj.height, src_obj.width) / max(1, min(src_obj.height, src_obj.width))
+                        if aspect >= 3.0:
+                            active_actor = "axis"
+                            break
                 if any(kw in note.lower() for kw in ("toggle", "switch", "action5", "active entity toggled")):
-                    if axis_obj and ((axis_obj.height >= 10 and axis_obj.width <= 4) or (axis_obj.width >= 10 and axis_obj.height <= 4)):
-                        active_actor = "axis"
-                        break
+                    if axis_obj:
+                        aspect = max(axis_obj.height, axis_obj.width) / max(1, min(axis_obj.height, axis_obj.width))
+                        if aspect >= 3.0:
+                            active_actor = "axis"
+                            break
 
         actor_idx = 0
         for i, a in enumerate(selectable_actors):
@@ -364,10 +358,9 @@ class VirtualKinematicSandbox:
                     if d_axis != 0:
                         limit = self.grid_h if is_h_axis else self.grid_w
                         new_axis_coord = sim_axis_coord + d_axis
-                        if new_axis_coord < 1 or new_axis_coord > limit - 2:
-                            has_boundary_violation = True
-                            logger.warning(f"Sandbox: step {idx} ({fn_name}) pushes axis out of bounds.")
-                            continue
+                        if new_axis_coord < 0 or new_axis_coord >= limit:
+                            new_axis_coord = max(0, min(limit - 1, new_axis_coord))
+                            logger.info(f"Sandbox: step {idx} ({fn_name}) axis clamped at boundary ({new_axis_coord}).")
 
                         if is_v_axis:
                             old_refl = 2.0 * sim_axis_coord - sim_piece_c
@@ -432,6 +425,14 @@ class VirtualKinematicSandbox:
                                 continue
                             if inv_type == "socket_coverage" and target_obj and other.id == target_obj.id:
                                 continue
+                            if axis_obj and other.id == axis_obj.id:
+                                continue
+                            if target_obj and other.id == target_obj.id:
+                                continue
+                            # Exclude full or near-full height/width dividers and axes
+                            aspect = max(other.height, other.width) / max(1, min(other.height, other.width))
+                            if aspect >= 3.0:
+                                continue
                             if not (p_max_r < other.bbox.min_row or p_min_r > other.bbox.max_row or
                                     p_max_c < other.bbox.min_col or p_min_c > other.bbox.max_col):
                                 has_collision = True
@@ -460,21 +461,16 @@ class VirtualKinematicSandbox:
                 else:
                     logger.info(f"Sandbox: Invariant satisfaction milestone at step {goal_reached_idx} ({chosen_inv.description}). Multi-actor trajectory continuing.")
 
-        if has_boundary_violation or has_collision:
-            err_reasons = []
-            if has_boundary_violation:
-                err_reasons.append("exceeds grid boundary")
-            if has_collision:
-                err_reasons.append(f"collides with object {collision_obj_id}")
+        if has_boundary_violation:
             return SandboxEvaluationResult(
                 verdict="REJECTED",
                 goal_reached=False,
                 repaired_steps=repaired_steps,
-                reason=f"Trajectory contradicts environment: {', '.join(err_reasons)}",
+                reason="Trajectory contradicts environment: exceeds grid boundary",
                 terminal_step_index=len(repaired_steps),
                 min_distance_achieved=min_dist,
                 active_invariant=chosen_inv,
-                has_boundary_violation=has_boundary_violation,
+                has_boundary_violation=True,
                 has_collision=has_collision,
                 collision_object_id=collision_obj_id,
             )
@@ -570,6 +566,9 @@ class VirtualKinematicSandbox:
 
             for other in self.planning_set.objects:
                 if other.id == subject_obj.id or other.color == 0 or other.area <= 0:
+                    continue
+                aspect = max(other.height, other.width) / max(1, min(other.height, other.width))
+                if aspect >= 3.0:
                     continue
                 if not (p_max_r < other.bbox.min_row or p_min_r > other.bbox.max_row or
                         p_max_c < other.bbox.min_col or p_min_c > other.bbox.max_col):
@@ -708,16 +707,18 @@ class VirtualKinematicSandbox:
         init_actor = "piece"
         if self.game_memory and self.game_memory.selection_mechanics:
             for note in self.game_memory.selection_mechanics:
-                m = re.search(r"internal dots moved from\s+(obj_[a-zA-Z0-9_]+)", note)
+                m = re.search(r"(?:moved|controlled|active)\s+(?:from\s+)?(obj_[a-zA-Z0-9_]+)", note, re.IGNORECASE)
                 if m:
                     src_id = m.group(1)
                     if axis and src_id == axis.id:
                         init_actor = "axis"
                         break
                 if any(kw in note.lower() for kw in ("toggle", "switch", "action5", "active entity toggled")):
-                    if axis and ((axis.height >= 10 and axis.width <= 4) or (axis.width >= 10 and axis.height <= 4)):
-                        init_actor = "axis"
-                        break
+                    if axis:
+                        aspect = max(axis.height, axis.width) / max(1, min(axis.height, axis.width))
+                        if aspect >= 3.0:
+                            init_actor = "axis"
+                            break
 
         init_act_idx = 0
         for i, obj in enumerate(controllable_objects):

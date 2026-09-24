@@ -15,6 +15,8 @@ class CandidateTrajectory:
     confidence: float = 1.0
     cursor: int = 0
     active: bool = True
+    initial_grid: list[list[int]] | None = None
+    step_effects: list[str] = field(default_factory=list)
 
     def current_step(self) -> dict[str, Any] | None:
         """Return the current step at the cursor, or None if trajectory is exhausted."""

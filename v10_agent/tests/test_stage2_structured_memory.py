@@ -249,7 +249,7 @@ def test_solver_prompt_integration_with_stage2():
         game_memory=gm,
     )
 
-    assert "structured_failures" in user_prompt
+    assert "FAILED CANDIDATES" in user_prompt
     assert "Blocked by obstacle" in user_prompt
-    assert "confirmed_game_model" in user_prompt
-    assert "GAME MODEL" in user_prompt
+    assert "ACCUMULATED GAME KNOWLEDGE" in user_prompt
+    assert "Action ACTION1 moves UP by dy=-1" in user_prompt

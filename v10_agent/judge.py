@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 from v10_agent.arga_lite import ARGALiteSnapshot, extract_arga_snapshot
-from v10_agent.brusentsov_logic import BrusentsovJudgment, Ternary, Verdict, implies_brusentsov
+from v10_agent.brusentsov_logic import BrusentsovJudgment, Ternary, Verdict, contradicts, implies_brusentsov
 from v10_agent.config import V10Config
 from v10_agent.observe import compute_grid_hash
 from v10_agent.planning_set import PlanningSet
@@ -120,14 +121,20 @@ class LayeredVerifier:
             else:
                 # Object destroyed or disappeared
                 props.append(AtomicProposition(family="object_identity", subject_id=b_obj.id, predicate="destroyed"))
+                alias = planning_set.object_real_to_alias.get(b_obj.id) if planning_set and hasattr(planning_set, "object_real_to_alias") else None
+                if alias and alias != b_obj.id:
+                    props.append(AtomicProposition(family="object_identity", subject_id=alias, predicate="destroyed"))
 
         # Process matched pairs
         for b_id, best_match in matched_pairs:
             b_obj = before_snapshot.get_object(b_id)
             if not b_obj:
                 continue
-            # Object identity preserved
-            props.append(AtomicProposition(family="object_identity", subject_id=b_obj.id, predicate="preserved"))
+
+            alias = planning_set.object_real_to_alias.get(b_obj.id) if planning_set and hasattr(planning_set, "object_real_to_alias") else None
+            subjects = [b_obj.id]
+            if alias and alias != b_obj.id:
+                subjects.append(alias)
 
             # Positional metric signs
             dr = best_match.centroid.row - b_obj.centroid.row
@@ -135,17 +142,27 @@ class LayeredVerifier:
             r_sign = 1 if dr >= move_thresh else (-1 if dr <= -move_thresh else 0)
             c_sign = 1 if dc >= move_thresh else (-1 if dc <= -move_thresh else 0)
 
-            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="row_delta", value=r_sign))
-            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="delta_r", value=r_sign))
-            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="dy", value=r_sign))
+            for s_id in subjects:
+                # Object identity preserved
+                props.append(AtomicProposition(family="object_identity", subject_id=s_id, predicate="preserved"))
 
-            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="col_delta", value=c_sign))
-            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="delta_c", value=c_sign))
-            props.append(AtomicProposition(family="metric_sign", subject_id=b_obj.id, predicate="dx", value=c_sign))
+                props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="row_delta", value=r_sign))
+                props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="delta_r", value=r_sign))
+                props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="dy", value=r_sign))
 
-            # Attribute deltas
-            props.append(AtomicProposition(family="attribute_delta", subject_id=b_obj.id, predicate="color", value=best_match.color))
-            props.append(AtomicProposition(family="attribute_delta", subject_id=b_obj.id, predicate="area", value=best_match.area))
+                props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="col_delta", value=c_sign))
+                props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="delta_c", value=c_sign))
+                props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="dx", value=c_sign))
+
+                # Step-level and cumulative motion tuples
+                props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="step_moved", value=(r_sign, c_sign)))
+                props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="moved", value=(r_sign, c_sign)))
+                if r_sign == 0 and c_sign == 0:
+                    props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="unchanged", value=(0, 0)))
+
+                # Attribute deltas
+                props.append(AtomicProposition(family="attribute_delta", subject_id=s_id, predicate="color", value=best_match.color))
+                props.append(AtomicProposition(family="attribute_delta", subject_id=s_id, predicate="area", value=best_match.area))
 
         # 2. Pairwise distance metric signs
         for i in range(len(matched_pairs)):
@@ -274,6 +291,8 @@ class LayeredVerifier:
         if not isinstance(before_snapshot, ARGALiteSnapshot):
             if isinstance(before_snapshot, (list, tuple)):
                 before_snapshot = extract_arga_snapshot(before_snapshot)
+            elif hasattr(before_snapshot, "grid") and isinstance(before_snapshot.grid, (list, tuple)):
+                before_snapshot = extract_arga_snapshot(before_snapshot.grid)
             else:
                 before_snapshot = extract_arga_snapshot([])
 
@@ -296,7 +315,6 @@ class LayeredVerifier:
         if action_dict:
             act_id = str(action_dict.get("action_id") or action_dict.get("id") or "").upper()
         if not act_id:
-            import re
             m = re.search(r"action(\d+)", step.dsl_function, re.IGNORECASE)
             if m:
                 act_id = f"ACTION{m.group(1)}"
@@ -306,9 +324,22 @@ class LayeredVerifier:
             confirmed_eff = game_memory.confirmed_action_effects.get(act_id, "")
 
         eff_lower = confirmed_eff.lower()
+        is_modal_selection = (
+            act_id in ("ACTION5", "ACTION6")
+            or any(k in eff_lower for k in ("selection", "toggle", "indicator", "modal", "active entity"))
+            or any(k in step.dsl_function.lower() for k in ("selection", "toggle", "switch", "modal"))
+        )
+        if game_memory is not None and hasattr(game_memory, "action_affordances"):
+            for aff in getattr(game_memory, "action_affordances", []):
+                if isinstance(aff, dict) and str(aff.get("action_id", "")).upper() == act_id:
+                    cls_name = str(aff.get("effect_class", "")).upper()
+                    if cls_name == "MODAL_SELECTION":
+                        is_modal_selection = True
+
         is_confirmed_motion = (
-            any(k in eff_lower for k in ("dy=", "dx=", "moved", "displace"))
-            and not any(k in eff_lower for k in ("blocked", "wall", "no_effect", "null"))
+            not is_modal_selection
+            and any(k in eff_lower for k in ("dy=", "dx=", "moved", "moves", "displace"))
+            and not any(k in eff_lower for k in ("blocked", "wall", "no_effect", "null", "selection", "toggle", "indicator"))
         )
 
         # 1. Tier 1: Terminal Victory or Level Completed (Follow)
@@ -337,10 +368,73 @@ class LayeredVerifier:
                 is_effective=False,
             )
 
-        # 3. Tier 3: Zero Grid Delta on a Confirmed Motion Action (Nullity)
-        # Global environment fact: an action confirmed to produce physical motion produced zero grid change.
-        # Boundary/obstacle collision overrides tracking uncertainty.
+        # 3. Tier 3: Zero Grid Delta on a Confirmed Motion Action
+        # Distinguish hard contradiction (NULL) from wall/boundary collision (OMIT) or modal locking (UNDECIDED).
+        # Wall collision is a soft stop — the trajectory step failed to advance,
+        # but no physical law was violated. The actor simply cannot pass through obstacles.
         if zero_delta and is_confirmed_motion and act_id not in ("ACTION5", "ACTION6", "RESET"):
+            # Check if this could be a boundary/obstacle collision (soft stop)
+            is_boundary_collision = False
+            if game_memory is not None:
+                inv_rules = getattr(game_memory, "invariant_rules", [])
+                is_boundary_collision = any(
+                    re.search(r"\b(?:wall|blocked|boundary|obstacle|barrier|collision|impassable)\b", r, re.IGNORECASE)
+                    for r in inv_rules
+                )
+            if is_boundary_collision:
+                return BrusentsovJudgment(
+                    trajectory_id=step.step_id,
+                    step_id=step.step_id,
+                    verdict=Verdict.OMIT,
+                    expected_propositions=step.expected_propositions,
+                    observed_propositions=observed,
+                    explanation=(
+                        f"Step {step.step_id} ({step.dsl_function} / {act_id}): "
+                        f"Motion action produced zero grid delta (wall/boundary collision). "
+                        f"Soft stop — Brusentsov omit x'y' (trajectory step did not advance but no physical law broken)."
+                    ),
+                    action_dict=act_dict,
+                    is_effective=False,
+                )
+
+            # Invariant of Orthogonal Modality: Check if a modal selector / switch is available
+            allowed_acts = []
+            if planning_set and hasattr(planning_set, "allowed_action_ids"):
+                raw_acts = planning_set.allowed_action_ids
+                if isinstance(raw_acts, (list, tuple, set)):
+                    allowed_acts = [str(a).upper() for a in raw_acts]
+
+            has_selection_mechanics = bool(game_memory and getattr(game_memory, "selection_mechanics", None))
+            modal_switch_actions = [
+                act for act in allowed_acts
+                if act in ("ACTION5", "ACTION6")
+                or (game_memory and any(kw in getattr(game_memory, "confirmed_action_effects", {}).get(act, "").lower() for kw in ("selection", "toggle", "indicator")))
+            ]
+            unconfirmed_actions = [
+                act for act in allowed_acts
+                if act not in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "RESET", "ACTION7")
+                and (not game_memory or act not in getattr(game_memory, "confirmed_action_effects", {}))
+            ]
+            if modal_switch_actions or has_selection_mechanics or unconfirmed_actions:
+                modal_target = modal_switch_actions[0] if modal_switch_actions else (unconfirmed_actions[0] if unconfirmed_actions else "ACTION5")
+                enable_undecided = getattr(self.config, "enable_undecided_verdict", True)
+                u_verdict = Verdict.UNDECIDED if enable_undecided else Verdict.OMIT
+                return BrusentsovJudgment(
+                    trajectory_id=step.step_id,
+                    step_id=step.step_id,
+                    verdict=u_verdict,
+                    expected_propositions=step.expected_propositions,
+                    observed_propositions=observed,
+                    explanation=(
+                        f"Step {step.step_id} ({step.dsl_function} / {act_id}): "
+                        f"Motion action produced zero grid delta along kinematic axis, but modal selector is available ({modal_target}). "
+                        f"Orthogonal modality: degree of freedom may be blocked in current mode. Epistemic signal seek evidence."
+                    ),
+                    evidence_hint=f"probe_{modal_target}",
+                    action_dict=act_dict,
+                    is_effective=False,
+                )
+
             return BrusentsovJudgment(
                 trajectory_id=step.step_id,
                 step_id=step.step_id,
@@ -376,51 +470,195 @@ class LayeredVerifier:
             )
 
         # (b) Ambiguous tracker matching (difference between top candidates < matching_ambiguity_threshold)
-        if active_tracker is not None and getattr(active_tracker, "last_ambiguity_score", None) is not None:
+        # Restricted strictly to the main controllable / participating actors of the step
+        # (b) Ambiguous tracker matching (difference between top candidates < matching_ambiguity_threshold)
+        # Point 1: Participating filter is strictly mandatory (expected_propositions OR non-zero observed delta)
+        # Point 2: Ambiguity between internal identical micro-dots of the same parent is ignored
+        # Point 3: Raw last_ambiguity_score is never used as a sufficient condition
+        participating_ids: set[str] = set()
+        if active_tracker is not None:
             amb_thresh = getattr(self.config, "matching_ambiguity_threshold", 0.15)
-            if active_tracker.last_ambiguity_score < amb_thresh:
-                u_verdict = Verdict.UNDECIDED if enable_undecided else Verdict.OMIT
-                return BrusentsovJudgment(
-                    trajectory_id=step.step_id,
-                    step_id=step.step_id,
-                    verdict=u_verdict,
-                    expected_propositions=step.expected_propositions,
-                    observed_propositions=observed,
-                    explanation=(
-                        f"Step {step.step_id} ({step.dsl_function}): Ambiguous object matching detected "
-                        f"(score difference {active_tracker.last_ambiguity_score:.3f} < {amb_thresh})."
-                    ),
-                    ambiguity_score=active_tracker.last_ambiguity_score,
-                    evidence_hint="probe_motion",
-                    matching_candidates=[active_tracker.last_ambiguous_track] if getattr(active_tracker, "last_ambiguous_track", None) else [],
-                    action_dict=act_dict,
-                    is_effective=is_effective,
+
+            # 1. Point 1 & 3: Participating filter:
+            # When expected_propositions are specified, evaluate ambiguity on tracks influencing EXPECT.
+            # When expected_propositions are empty (e.g. repeat steps), evaluate on tracks with observed motion.
+            expected_ids: set[str] = set()
+            for p in step.expected_propositions:
+                if p.subject_id:
+                    expected_ids.add(p.subject_id)
+                if p.secondary_id:
+                    expected_ids.add(p.secondary_id)
+            if getattr(step, "target_object_ids", None):
+                expected_ids.update(step.target_object_ids)
+
+            if expected_ids:
+                participating_ids = expected_ids
+            else:
+                # Narrow participating actors strictly to objects with real physical motion
+                # (rigid coordinate displacement + preserved area), explicitly excluding passive objects
+                # whose visible form only changed due to occlusion/overlap (e.g. static target sockets).
+                observed_motion_ids: set[str] = set()
+
+                if before_snapshot and after_snapshot:
+                    matched_after_ids: set[str] = set()
+                    for b_obj in before_snapshot.objects:
+                        best_match = None
+                        best_dist = float("inf")
+                        for a_obj in after_snapshot.objects:
+                            if a_obj.id in matched_after_ids:
+                                continue
+                            if a_obj.color == b_obj.color:
+                                d = math.hypot(b_obj.centroid.row - a_obj.centroid.row, b_obj.centroid.col - a_obj.centroid.col)
+                                if d < best_dist:
+                                    best_dist = d
+                                    best_match = a_obj
+                        if best_match is not None and best_dist <= max(2.5, b_obj.bbox.height, b_obj.bbox.width):
+                            matched_after_ids.add(best_match.id)
+                            # 1. Area preservation: an object that lost >25% area was occluded/overlapped
+                            area_max = max(b_obj.area, best_match.area)
+                            area_min = min(b_obj.area, best_match.area)
+                            if area_max > 0 and (area_min / area_max) < 0.75:
+                                continue
+                            # 2. Rigid translation: bounding box boundaries must shift uniformly
+                            dr_min = best_match.bbox.min_row - b_obj.bbox.min_row
+                            dr_max = best_match.bbox.max_row - b_obj.bbox.max_row
+                            dc_min = best_match.bbox.min_col - b_obj.bbox.min_col
+                            dc_max = best_match.bbox.max_col - b_obj.bbox.max_col
+                            if abs(dr_min - dr_max) <= 1 and abs(dc_min - dc_max) <= 1:
+                                if abs(dr_min) >= 1 or abs(dc_min) >= 1:
+                                    observed_motion_ids.add(b_obj.id)
+                                    observed_motion_ids.add(best_match.id)
+
+                # Fallback to observed propositions if snapshots comparison was unavailable
+                if not observed_motion_ids:
+                    for p in observed:
+                        if p.family == "metric_sign" and p.predicate in (
+                            "row_delta", "col_delta", "delta_r", "delta_c", "dy", "dx"
+                        ):
+                            if p.value != 0 and p.subject_id:
+                                observed_motion_ids.add(p.subject_id)
+
+                participating_ids = observed_motion_ids
+
+            # Map participating IDs to track persistent IDs
+            participating_track_ids: set[str] = set()
+            for pid in participating_ids:
+                if pid.startswith("trk_"):
+                    participating_track_ids.add(pid)
+
+            for snap_src in (getattr(planning_set, "objects", []), getattr(before_snapshot, "objects", []), getattr(after_snapshot, "objects", [])):
+                for o in snap_src:
+                    oid = getattr(o, "id", None)
+                    pid = getattr(o, "persistent_id", None)
+                    if oid in participating_ids and pid:
+                        participating_track_ids.add(pid)
+
+            for trk in active_tracker.get_tracked():
+                if getattr(trk, "source_object_id", None) in participating_ids or trk.persistent_id in participating_ids:
+                    participating_track_ids.add(trk.persistent_id)
+
+            # 2. Point 2: Check ambiguity ONLY among participating tracks, ignoring internal sibling 1x1 micro-dots
+            ambiguity_by_track = getattr(active_tracker, "ambiguity_by_track", {})
+            relevant_ambiguities: list[tuple[float, str]] = []
+            for trk_id in participating_track_ids:
+                entry = ambiguity_by_track.get(trk_id)
+                if entry is None:
+                    continue
+                diff = entry["diff"] if isinstance(entry, dict) else entry
+                is_internal = entry.get("is_internal_sibling", False) if isinstance(entry, dict) else False
+
+                # Sibling micro-dots of the same parent / cluster are ignored for verdict purposes
+                if is_internal:
+                    continue
+
+                trk = active_tracker.get_track(trk_id)
+                if trk and (trk.occluded or (hasattr(trk, "shape_stability_score") and trk.shape_stability_score < 0.7)):
+                    continue
+
+                # If object is destroyed/missing, it is an empirical event (OMIT), not a tracking ambiguity
+                is_destroyed = any(
+                    p.family == "object_identity"
+                    and (p.subject_id == trk_id or (trk and p.subject_id == getattr(trk, "source_object_id", None)))
+                    and p.predicate in ("destroyed", "missing", "vanished")
+                    for p in observed
                 )
+                if is_destroyed:
+                    continue
+
+                # Also verify directly on track: if belongs to a composite parent
+                if trk and getattr(trk, "source_object_id", None):
+                    src_id = trk.source_object_id
+                    has_parent = False
+                    for snap_src in (getattr(planning_set, "objects", []), getattr(before_snapshot, "objects", [])):
+                        for o in snap_src:
+                            if getattr(o, "id", None) == src_id and getattr(o, "parent_id", None):
+                                has_parent = True
+                                break
+                        if has_parent:
+                            break
+                    if has_parent:
+                        continue
+
+                relevant_ambiguities.append((diff, trk_id))
+
+            # 3. Point 3: Do NOT use raw last_ambiguity_score as a sufficient condition.
+            # Only evaluated participating tracks can trigger UNDECIDED.
+            if relevant_ambiguities:
+                min_amb_score, worst_track = min(relevant_ambiguities, key=lambda x: x[0])
+                if min_amb_score < amb_thresh:
+                    u_verdict = Verdict.UNDECIDED if enable_undecided else Verdict.OMIT
+                    return BrusentsovJudgment(
+                        trajectory_id=step.step_id,
+                        step_id=step.step_id,
+                        verdict=u_verdict,
+                        expected_propositions=step.expected_propositions,
+                        observed_propositions=observed,
+                        explanation=(
+                            f"Step {step.step_id} ({step.dsl_function}): Ambiguous object matching detected for participating actor "
+                            f"{worst_track} (score difference {min_amb_score:.3f} < {amb_thresh})."
+                        ),
+                        ambiguity_score=min_amb_score,
+                        evidence_hint="probe_motion",
+                        matching_candidates=[worst_track] if worst_track else [],
+                        action_dict=act_dict,
+                        is_effective=is_effective,
+                    )
 
         # (c) Low tracking confidence on any participating object
         if active_tracker is not None:
-            participating_ids = set()
-            for p in step.expected_propositions:
-                if p.subject_id:
-                    participating_ids.add(p.subject_id)
-                if p.secondary_id:
-                    participating_ids.add(p.secondary_id)
-            for p in observed:
-                if p.family in ("metric_sign", "attribute_delta", "relation_delta", "cumulative_motion"):
-                    if p.family == "metric_sign" and p.value != 0:
-                        participating_ids.add(p.subject_id)
-                    elif p.family == "cumulative_motion" and p.value != (0.0, 0.0):
-                        participating_ids.add(p.subject_id)
-
             conf_thresh = getattr(self.config, "track_confidence_threshold", 0.6)
             for trk in active_tracker.get_tracked():
-                is_part = trk.persistent_id in participating_ids
+                if trk.occluded or trk.last_frame_id < getattr(active_tracker, "frame_index", 0) or (hasattr(trk, "shape_stability_score") and trk.shape_stability_score < 0.7):
+                    continue
+                is_destr = any(
+                    p.family == "object_identity"
+                    and (p.subject_id == trk.persistent_id or p.subject_id == getattr(trk, "source_object_id", None))
+                    and p.predicate in ("destroyed", "missing", "vanished")
+                    for p in observed
+                )
+                if is_destr:
+                    continue
+
+                is_part = (
+                    trk.persistent_id in participating_ids
+                    or getattr(trk, "source_object_id", None) in participating_ids
+                )
                 if not is_part and hasattr(planning_set, "objects"):
                     for po in planning_set.objects:
                         if getattr(po, "persistent_id", None) == trk.persistent_id and po.id in participating_ids:
                             is_part = True
                             break
+                # Ignore low confidence on internal child components of composite objects
                 if is_part and trk.confidence < conf_thresh:
+                    if getattr(trk, "source_object_id", None):
+                        src_id = trk.source_object_id
+                        has_parent = any(
+                            getattr(o, "parent_id", None)
+                            for o in getattr(planning_set, "objects", [])
+                            if getattr(o, "id", None) == src_id
+                        )
+                        if has_parent:
+                            continue
                     u_verdict = Verdict.UNDECIDED if enable_undecided else Verdict.OMIT
                     return BrusentsovJudgment(
                         trajectory_id=step.step_id,
@@ -443,22 +681,109 @@ class LayeredVerifier:
         if len(step.expected_propositions) > 0:
             prop_verdict = implies_brusentsov(step.expected_propositions, observed)
             if prop_verdict == Ternary.FALSE:
+                # Epistemic reservation: if action is unconfirmed with zero grid delta, or metric delta is below
+                # the measurement noise threshold (< min_reliable_delta), observation cannot reliably refute expectations.
+                # Such transitions are epistemically uncertain and must be deferred to Tier 7.
+                is_unconfirmed_zero = (
+                    zero_delta
+                    and act_id
+                    and act_id.startswith("ACTION")
+                    and not is_confirmed_motion
+                    and act_id != "RESET"
+                )
+                min_reliable = getattr(self.config, "min_reliable_delta", 0.8)
+                is_sub_threshold = False
+                if not zero_delta and state not in {"WIN", "WON", "DONE", "VICTORY", "GAME_OVER", "LOST", "FAILED"}:
+                    max_disp = 0.0
+                    has_displacement_data = False
+                    if active_tracker is not None:
+                        for trk in active_tracker.get_tracked():
+                            speed = math.hypot(trk.velocity[0], trk.velocity[1])
+                            if speed > max_disp:
+                                max_disp = speed
+                            has_displacement_data = True
+                    if before_snapshot and after_snapshot:
+                        for b_obj in before_snapshot.objects:
+                            for a_obj in after_snapshot.objects:
+                                if b_obj.color == a_obj.color:
+                                    d = math.hypot(a_obj.centroid.row - b_obj.centroid.row, a_obj.centroid.col - b_obj.centroid.col)
+                                    if d < 5.0:
+                                        if d > max_disp:
+                                            max_disp = d
+                                        has_displacement_data = True
+                    if has_displacement_data and 0.0 < max_disp < min_reliable:
+                        is_sub_threshold = True
+
+                # Check if there are non-kinematic contradictions (e.g. color, identity, state)
+                has_non_kinematic_contradiction = False
+                for p_exp in step.expected_propositions:
+                    is_kinematic = (
+                        p_exp.family == "metric_sign"
+                        or p_exp.predicate in ("moved", "step_moved", "delta_r", "delta_c", "row_delta", "col_delta", "dy", "dx")
+                    )
+                    if not is_kinematic:
+                        for p_obs in observed:
+                            if contradicts(p_exp, p_obs):
+                                has_non_kinematic_contradiction = True
+                                break
+                    if has_non_kinematic_contradiction:
+                        break
+
+                if has_non_kinematic_contradiction or (not is_unconfirmed_zero and not is_sub_threshold):
+                    return BrusentsovJudgment(
+                        trajectory_id=step.step_id,
+                        step_id=step.step_id,
+                        verdict=Verdict.NULL,
+                        expected_propositions=step.expected_propositions,
+                        observed_propositions=observed,
+                        explanation=(
+                            f"Step {step.step_id} ({step.dsl_function}): Step proposition contradiction: "
+                            f"asserted expected propositions physically refuted by observation. Brusentsov nullity xy'_0."
+                        ),
+                        action_dict=act_dict,
+                        is_effective=is_effective,
+                    )
+
+        # 6. Tier 6: Explicit EXPECT Necessary Containment (Follow: implies_brusentsov == TRUE)
+        if prop_verdict == Ternary.TRUE:
+            if is_modal_selection:
                 return BrusentsovJudgment(
                     trajectory_id=step.step_id,
                     step_id=step.step_id,
-                    verdict=Verdict.NULL,
+                    verdict=Verdict.FOLLOW,
                     expected_propositions=step.expected_propositions,
                     observed_propositions=observed,
                     explanation=(
-                        f"Step {step.step_id} ({step.dsl_function}): Step proposition contradiction: "
-                        f"asserted expected propositions physically refuted by observation. Brusentsov nullity xy'_0."
+                        f"Step {step.step_id} ({step.dsl_function} / {act_id}): Modal selection verified with "
+                        f"confirmed predicate expectations. Brusentsov follow xy."
                     ),
                     action_dict=act_dict,
                     is_effective=is_effective,
                 )
-
-        # 6. Tier 6: Explicit EXPECT Necessary Containment (Follow: implies_brusentsov == TRUE)
-        if prop_verdict == Ternary.TRUE:
+            # Guard against vacuous truth for mode changes:
+            # Absence of effect upon mode change (ACTION5, ACTION6, or selection/toggle)
+            # must evaluate to OMIT or UNDECIDED, strictly preventing vacuous truth.
+            is_modal_act = (
+                act_id in ("ACTION5", "ACTION6")
+                or "selection" in step.dsl_function.lower()
+                or "toggle" in step.dsl_function.lower()
+            )
+            if zero_delta and is_modal_act:
+                u_verdict = Verdict.UNDECIDED if enable_undecided else Verdict.OMIT
+                return BrusentsovJudgment(
+                    trajectory_id=step.step_id,
+                    step_id=step.step_id,
+                    verdict=u_verdict,
+                    expected_propositions=step.expected_propositions,
+                    observed_propositions=observed,
+                    explanation=(
+                        f"Step {step.step_id} ({step.dsl_function} / {act_id}): Absence of effect upon mode change "
+                        f"with zero grid delta. Brusentsov non-vacuity: {u_verdict.value} (no vacuous confirmation)."
+                    ),
+                    evidence_hint=f"probe_{act_id}" if act_id else "probe_motion",
+                    action_dict=act_dict,
+                    is_effective=False,
+                )
             return BrusentsovJudgment(
                 trajectory_id=step.step_id,
                 step_id=step.step_id,
@@ -481,7 +806,7 @@ class LayeredVerifier:
             and act_id.startswith("ACTION")
             and not is_confirmed_motion
             and len(step.expected_propositions) > 0
-            and act_id not in ("ACTION5", "ACTION6", "RESET")
+            and act_id != "RESET"
         ):
             u_verdict = Verdict.UNDECIDED if enable_undecided else Verdict.OMIT
             return BrusentsovJudgment(
@@ -537,18 +862,36 @@ class LayeredVerifier:
                 )
 
         # 8. Tier 8: Positive certificate from GameMemory (verified by non-zero delta)
+        # Guard against material implication paradox: empty/unverified expected propositions
+        # with non-zero delta must NOT produce FOLLOW (Brusentsov: x'y → OMIT, not FOLLOW).
         if act_id and confirmed_eff:
             if not zero_delta:
-                return BrusentsovJudgment(
-                    trajectory_id=step.step_id,
-                    step_id=step.step_id,
-                    verdict=Verdict.FOLLOW,
-                    expected_propositions=step.expected_propositions,
-                    observed_propositions=observed,
-                    explanation=f"Step {step.step_id} ({step.dsl_function} / {act_id}): Certified action effect verified against GameMemory. Brusentsov follow xy.",
-                    action_dict=act_dict,
-                    is_effective=True,
-                )
+                if len(step.expected_propositions) > 0 and prop_verdict == Ternary.TRUE:
+                    return BrusentsovJudgment(
+                        trajectory_id=step.step_id,
+                        step_id=step.step_id,
+                        verdict=Verdict.FOLLOW,
+                        expected_propositions=step.expected_propositions,
+                        observed_propositions=observed,
+                        explanation=f"Step {step.step_id} ({step.dsl_function} / {act_id}): Certified action effect verified against GameMemory with confirmed propositions. Brusentsov follow xy.",
+                        action_dict=act_dict,
+                        is_effective=True,
+                    )
+                else:
+                    return BrusentsovJudgment(
+                        trajectory_id=step.step_id,
+                        step_id=step.step_id,
+                        verdict=Verdict.OMIT,
+                        expected_propositions=step.expected_propositions,
+                        observed_propositions=observed,
+                        explanation=(
+                            f"Step {step.step_id} ({step.dsl_function} / {act_id}): Certified action produced non-zero delta "
+                            f"but expected propositions {'empty' if len(step.expected_propositions) == 0 else 'unverified'}. "
+                            f"Brusentsov omit x'y' (no vacuous confirmation)."
+                        ),
+                        action_dict=act_dict,
+                        is_effective=is_effective,
+                    )
 
         # Default Fallthrough (ISO-10)
         # If expected propositions were inessential or omitted without physical contradiction -> OMIT

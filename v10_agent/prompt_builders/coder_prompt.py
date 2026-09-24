@@ -13,36 +13,29 @@ from v10_agent.memory_contours import SyntaxErrorRecord
 CODER_SYSTEM_PROMPT = """\
 You are a Python DSL (Domain Specific Language) generator.
 Think step by step and reason through the environment mechanics, object structures, and coordinate affordances before writing the code.
-Your task is to translate environment specifications into a pure Python module and a JSON manifest.
+Your task is to translate environment specifications into a pure Python module defining the available game actions.
 
 CONSTRAINTS:
 - You DO NOT know the puzzle goal. Do not attempt to solve it.
 - Generate pure functions that ONLY call `api.declare_environment_action(...)`.
 - Allowed imports: math, typing, dataclasses, enum, collections. NO os, sys, eval, exec.
-- You MUST implement a function for EVERY action listed in the available actions.
+- Preserve all previously confirmed actions from earlier levels (e.g., action1..action4). The game mechanics are persistent across levels and only augment or expand.
+- You MUST implement functions ONLY for the confirmed effective actions listed in the available actions / RESEARCHED ACTION MECHANICS. Do NOT generate functions for unconfirmed or zero-effect actions.
+- Do NOT omit, rename, or delete existing confirmed actions. Augment the DSL with newly discovered actions (e.g. adding action5 or action6).
 - Function names must be canonical: `action1`, `action2`, ..., `action6`.
-- Coordinate actions (e.g., ACTION6) must accept `x: int = 0, y: int = 0`.
+- Coordinate actions (e.g., ACTION6) must accept `x: int = 0, y: int = 0` where x is the column (horizontal) and y is the row (vertical).
 
 OUTPUT FORMAT:
-Provide exactly two blocks:
-1. ```python ... ``` containing the DSL module.
-2. ```json ... ``` containing the manifest matching schema 'v10.dsl_manifest.1'.
+Provide a single ```python ... ``` block containing the DSL module.
+Do NOT provide a JSON manifest: signatures, parameters, and docstrings are extracted automatically from your Python functions.
 """
 
 SANDBOX_API_DOC = """\
 The SandboxAPI injected into your functions exposes:
-  - api.planning_set: PlanningSet (read-only access to objects, relations, allowed actions)
-  - api.get_object(obj_id_or_alias: str) -> PlanningObject | None
-  - api.query_objects(predicate: Callable) -> list[PlanningObject]
-  - api.metric_distance(obj_a: str, obj_b: str, metric_name: str = "centroid_distance") -> float
-  - api.declare_environment_action(
-        action_id: str,
-        data: dict | None = None,
-        reasoning: dict | None = None,
-        expected_metric_deltas: dict | None = None,
-        target_object_ids: list[str] | None = None,
-        confidence: float = 1.0,
-    ) -> EffectDeclaration
+  api.declare_environment_action(
+      action_id: str,
+      data: dict | None = None,
+  ) -> EffectDeclaration
 """
 
 
@@ -65,18 +58,40 @@ def build_coder_prompts(
             if isinstance(inv, str) and not any(kw in inv.lower() for kw in ("goal", "win", "target", "curriculum"))
         ]
 
-    # Resolve ground-truth available actions from planning_set or env_spec
+    # Resolve confirmed effective available actions from env_spec, game_memory, or planning_set
     available_actions: list[str] = []
-    if planning_set is not None and getattr(planning_set, "allowed_action_ids", None):
-        available_actions = [str(a).upper() for a in planning_set.allowed_action_ids if str(a).upper() not in ("RESET", "ACTION7")]
-    elif "available_actions" in compact_spec:
-        available_actions = [str(a).upper() for a in compact_spec["available_actions"] if str(a).upper() not in ("RESET", "ACTION7")]
-    elif "researched_actions" in compact_spec:
+    if "action_affordances" in compact_spec and compact_spec["action_affordances"]:
+        for aff in compact_spec["action_affordances"]:
+            if isinstance(aff, dict):
+                act_id = str(aff.get("action_id", "")).upper()
+                if act_id and act_id not in ("RESET", "ACTION7") and act_id not in available_actions:
+                    available_actions.append(act_id)
+    if "available_actions" in compact_spec and compact_spec["available_actions"]:
+        for a in compact_spec["available_actions"]:
+            act_up = str(a).upper()
+            if act_up not in ("RESET", "ACTION7") and act_up not in available_actions:
+                available_actions.append(act_up)
+    elif "researched_actions" in compact_spec and compact_spec["researched_actions"]:
+        for a in compact_spec["researched_actions"]:
+            if isinstance(a, dict) and "action_id" in a:
+                act_up = str(a["action_id"]).upper()
+                if act_up not in ("RESET", "ACTION7") and act_up not in available_actions:
+                    if not any(neg in str(a.get("effect_summary", "")).lower() for neg in ("no visible effect", "unconfirmed", "inactive", "zero effect")):
+                        available_actions.append(act_up)
+    elif planning_set is not None and getattr(planning_set, "allowed_action_ids", None):
+        unconfirmed = set()
+        if game_memory is not None and hasattr(game_memory, "unconfirmed_actions"):
+            unconfirmed = {str(a).upper() for a in game_memory.unconfirmed_actions}
         available_actions = [
-            str(a["action_id"]).upper()
-            for a in compact_spec["researched_actions"]
-            if isinstance(a, dict) and "action_id" in a and str(a["action_id"]).upper() not in ("RESET", "ACTION7")
+            str(a).upper() for a in planning_set.allowed_action_ids
+            if str(a).upper() not in ("RESET", "ACTION7") and str(a).upper() not in unconfirmed
         ]
+    # Always ensure confirmed actions from game_memory are included to preserve earlier levels
+    if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
+        for act in game_memory.confirmed_action_effects:
+            act_up = str(act).upper()
+            if act_up not in ("RESET", "ACTION7") and act_up not in available_actions:
+                available_actions.append(act_up)
 
     image_note = (
         "coder_raw_frame.png is the exact same frame as coder_annotated_frame.png, but without object annotations.\n\n"
@@ -87,15 +102,46 @@ def build_coder_prompts(
     sections: list[str] = []
     if image_note:
         sections.append(image_note.strip())
+
+    spec_lines = []
+    affordances = compact_spec.get("action_affordances", [])
+    if affordances:
+        spec_lines.append("ACTION AFFORDANCES (Observed State Mutations):")
+        for aff in affordances:
+            if isinstance(aff, dict):
+                act_id = aff.get("action_id", "")
+                eff_cls = aff.get("effect_class", "KINEMATIC")
+                params = aff.get("parameters", {})
+                notes = aff.get("coordination_notes", "")
+                param_parts = [f"{k}={v}" for k, v in sorted(params.items())]
+                p_str = f" ({', '.join(param_parts)})" if param_parts else ""
+                notes_str = f" - {notes}" if notes else ""
+                spec_lines.append(f"- {act_id} [{eff_cls}]:{p_str}{notes_str}")
+    researched = compact_spec.get("researched_actions", [])
+    if researched and not affordances:
+        spec_lines.append("RESEARCHED ACTION MECHANICS:")
+        for a in researched:
+            if isinstance(a, dict) and "action_id" in a:
+                eff = a.get("effect_summary", "available action")
+                spec_lines.append(f"- {a['action_id']}: {eff}")
+
+    invariants = compact_spec.get("invariants", [])
+    if invariants:
+        spec_lines.append("\nPHYSICS INVARIANTS:")
+        for inv in invariants:
+            spec_lines.append(f"- {inv}")
+
+    env_spec_text = "\n".join(spec_lines) if spec_lines else "No prior probe research available."
+
     sections.extend([
-        "Environment Specification (Observed Facts & Affordances):",
-        json.dumps(compact_spec, indent=2),
+        "ENVIRONMENT SPECIFICATION (Observed Action Mechanics):",
+        env_spec_text,
         "",
     ])
 
     if available_actions:
         sections.extend([
-            "ALL AVAILABLE ENVIRONMENT ACTIONS (You MUST define a function for EVERY action in this list):",
+            "CONFIRMED EFFECTIVE ACTIONS (Define a function ONLY for each action in this list):",
             "\n".join(f"- {act}" for act in sorted(set(available_actions))),
             "",
         ])
@@ -126,7 +172,7 @@ def build_coder_prompts(
                 sections.append(f"Faulty Source Snippet:\n```python\n{err.source_code[:1500]}\n```")
 
     user_instructions = """\
-Generate the Python DSL functions and matching function manifest.
+Generate the Python DSL functions for all confirmed effective actions listed above.
 Example format:
 ```python
 import math
@@ -144,41 +190,7 @@ def action6(api, x: int = 0, y: int = 0):
     \"\"\"Declare spatial action ACTION6 at target coordinates (x, y).\"\"\"
     return api.declare_environment_action(action_id="ACTION6", data={"x": int(x), "y": int(y)})
 ```
-
-```json
-{
-  "schema_version": "v10.dsl_manifest.1",
-  "functions": [
-    {
-      "name": "action1",
-      "parameters": [],
-      "returns": "effect_declaration",
-      "docstring": "Declare discrete button action ACTION1.",
-      "purity": "pure_declaration",
-      "expected_effect_template": {}
-    },
-    {
-      "name": "action5",
-      "parameters": [],
-      "returns": "effect_declaration",
-      "docstring": "Declare entity selection/cycling action ACTION5.",
-      "purity": "pure_declaration",
-      "expected_effect_template": {}
-    },
-    {
-      "name": "action6",
-      "parameters": [
-        {"name": "x", "type": "int", "default": 0},
-        {"name": "y", "type": "int", "default": 0}
-      ],
-      "returns": "effect_declaration",
-      "docstring": "Declare spatial action ACTION6 at coordinates (x, y).",
-      "purity": "pure_declaration",
-      "expected_effect_template": {}
-    }
-  ]
-}
-```
+Output ONLY the ```python ... ``` block. No JSON manifest required (signatures and parameters are derived automatically from your Python functions).
 """
     sections.append(user_instructions)
     return CODER_SYSTEM_PROMPT, "\n".join(sections)

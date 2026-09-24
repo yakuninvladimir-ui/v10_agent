@@ -62,19 +62,43 @@ def test_tier3_explicit_expect_contradiction():
     snap = _make_dummy_snapshot()
     pset = build_planning_set(snap, ["ACTION1"])
 
-    step_destr = GroundedStep(
+    step_contra = GroundedStep(
         step_id="s2",
         dsl_function="action1",
         arguments={},
         expected_propositions=PropositionSet.from_iterable([
-            AtomicProposition(family="object_identity", subject_id="obj_0", predicate="destroyed")
+            AtomicProposition(family="attribute_delta", subject_id="obj_0", predicate="color", value=99)
         ]),
     )
-    # observed still has obj_0 preserved
+    # observed has obj_0 with original color != 99, giving explicit physical contradiction
+    j_contra = verifier.evaluate_transition(
+        step=step_contra,
+        before_snapshot=snap,
+        after_obs={"grid": snap.grid, "state": "IN_PROGRESS"},
+        planning_set=pset,
+    )
+    assert j_contra.verdict == Verdict.NULL
+
+
+def test_tier5_destroyed_object_is_null_on_contradiction():
+    """Carroll nullity: expected preserved vs observed destroyed is a strict NULL contradiction."""
+    verifier = LayeredVerifier(V10Config())
+    snap = _make_dummy_snapshot()
+    pset = build_planning_set(snap, ["ACTION1"])
+
+    step_destr = GroundedStep(
+        step_id="s3",
+        dsl_function="action1",
+        arguments={},
+        expected_propositions=PropositionSet.from_iterable([
+            AtomicProposition(family="object_identity", subject_id="obj_0", predicate="preserved")
+        ]),
+    )
+    # After observation with empty grid (obj_0 destroyed/missing)
     j_destr = verifier.evaluate_transition(
         step=step_destr,
         before_snapshot=snap,
-        after_obs={"grid": snap.grid, "state": "IN_PROGRESS"},
+        after_obs={"grid": [[0] * 10 for _ in range(10)], "state": "IN_PROGRESS"},
         planning_set=pset,
     )
     assert j_destr.verdict == Verdict.NULL
@@ -211,18 +235,39 @@ def test_tier7_positive_certificate_from_game_memory():
     gmem = GameMemory(game_id="g1")
     gmem.record_action_effect("ACTION1", "Object displaced")
 
-    step = GroundedStep(step_id="s1", dsl_function="action1", arguments={})
+    # Case A: Empty expected propositions -> OMIT (avoids material implication paradox)
+    step_empty = GroundedStep(step_id="s1", dsl_function="action1", arguments={})
     after_obs = {"grid": [[0, 0, 1], [0, 0, 0]], "state": "IN_PROGRESS"}
-    judgment = verifier.evaluate_transition(
-        step=step,
+    judgment_empty = verifier.evaluate_transition(
+        step=step_empty,
         before_snapshot=snap,
         after_obs=after_obs,
         planning_set=pset,
         game_memory=gmem,
         action_dict={"action_id": "ACTION1"},
     )
-    assert judgment.verdict == Verdict.FOLLOW
-    assert "Certified action effect verified against GameMemory" in judgment.explanation
+    assert judgment_empty.verdict == Verdict.OMIT
+    assert "no vacuous confirmation" in judgment_empty.explanation
+
+    # Case B: Verified expected propositions -> FOLLOW
+    step_verified = GroundedStep(
+        step_id="s2",
+        dsl_function="action1",
+        arguments={},
+        expected_propositions=PropositionSet.from_iterable([
+            AtomicProposition(family="object_identity", subject_id="obj_0", predicate="preserved")
+        ]),
+    )
+    judgment_verified = verifier.evaluate_transition(
+        step=step_verified,
+        before_snapshot=snap,
+        after_obs=after_obs,
+        planning_set=pset,
+        game_memory=gmem,
+        action_dict={"action_id": "ACTION1"},
+    )
+    assert judgment_verified.verdict == Verdict.FOLLOW
+    assert "follow xy" in judgment_verified.explanation
 
 
 def test_iso_10_no_null_on_mere_expect_mismatch():

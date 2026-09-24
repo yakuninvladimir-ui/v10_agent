@@ -165,9 +165,9 @@ def test_primitive_probe_manager_schedule_falsification_reprobe():
     assert "ACTION3" not in mgr.confirmed_effective_actions
     assert mgr._initial_sweep_planned is False
     assert mgr.total_probes_executed == 0
-    assert len(probes) == 4
     probe_ids = [p.action_id for p in probes]
-    assert probe_ids == ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
+    for act in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"):
+        assert act in probe_ids
 
 
 def test_game_memory_invalidate_action_effect():
@@ -240,7 +240,7 @@ def test_session_falsification_triggers_clean_reset_and_micro_reprobe():
     assert session.probing_phase is True
     assert session.solver_reset_pending is True
     assert session.solver_reset_reason == "falsification_clean_reprobe_reset"
-    assert len(session.probe_queue) == 4
+    assert len(session.probe_queue) >= 6
 
     # 4. act() must first emit RESET
     action_1 = session.act({"grid": grid, "state": "RUNNING", "levels_completed": 0, "available_actions": ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "RESET"]})

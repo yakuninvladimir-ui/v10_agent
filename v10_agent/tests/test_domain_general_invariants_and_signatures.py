@@ -97,7 +97,7 @@ def test_solver_prompt_dynamic_function_template():
         ]
     }
     sys_p, user_p = build_solver_prompts(manifest, pset)
-    assert "action6(x=10, y=10)" in user_p
+    assert "action6(x: int = 0, y: int = 0)" in user_p
     assert "discovered_invariants" not in user_p
 
 

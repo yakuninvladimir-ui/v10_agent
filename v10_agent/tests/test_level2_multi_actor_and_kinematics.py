@@ -112,8 +112,8 @@ def test_multi_actor_three_entity_cycling_simulation():
     assert [s["dsl_function"] for s in res.repaired_steps] == [s["dsl_function"] for s in steps]
 
 
-def test_solver_prompt_marker_dots_aggregation():
-    """Verify that small dots (area <= 2) are aggregated into marker groups rather than flooding prompt."""
+def test_solver_prompt_compact_object_indexing():
+    """Verify that objects are indexed concisely in OBJECT INDEX without blowing up prompt size."""
     grid = [[0] * 20 for _ in range(20)]
     # Main piece (color 5, area 9)
     for r in range(5, 8):
@@ -133,11 +133,8 @@ def test_solver_prompt_marker_dots_aggregation():
         manifest=manifest,
     )
 
-    # Must contain marker group for color 1
-    assert "marker_group_color_1" in user_prompt
-    assert "indicator_marker_pattern" in user_prompt
-    assert "dot_count" in user_prompt
-    # Must NOT list 10 separate individual obj_... entries for color 1
-    import re
-    color1_entries = re.findall(r"'id': 'obj_\d+'.*?'color': 1\b", user_prompt)
-    assert len(color1_entries) == 0
+    assert "OBJECT INDEX" in user_prompt
+    assert "c=5" in user_prompt
+    assert "area=9" in user_prompt
+    # Ensure prompt remains lean (< 4000 characters)
+    assert len(user_prompt) < 4000

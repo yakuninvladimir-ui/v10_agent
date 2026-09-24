@@ -47,6 +47,45 @@ def test_action(api, obj):
     assert len(syntax_mem.entries) == 0
 
 
+def test_coder_derives_manifest_from_pure_python():
+    """Verify that if Coder outputs only Python code (no JSON manifest), manifest is derived via AST."""
+    pure_py = """
+def action1(api):
+    \"\"\"Declare discrete button action ACTION1.\"\"\"
+    return api.declare_environment_action("ACTION1")
+
+def action6(api, x: int = 0, y: int = 0):
+    \"\"\"Declare spatial action ACTION6 at target coordinates (x, y).\"\"\"
+    return api.declare_environment_action("ACTION6", data={"x": int(x), "y": int(y)})
+"""
+    response_text = f"```python\n{pure_py}\n```"
+
+    advisor = MockLLMAdvisor()
+    advisor.set_response("coder", response_text)
+
+    config = V10Config(llm_advisor_backend="fake", max_coder_retries_per_level=2)
+    coder = DSLCoder(config, advisor, SandboxExecutor())
+
+    grid = [[0, 1, 0]]
+    snapshot = extract_arga_snapshot(grid)
+    planning_set = build_planning_set(snapshot, available_actions=["ACTION1", "ACTION6", "RESET"])
+    syntax_mem = SyntaxErrorMemory(level_id="l0")
+
+    module, manifest, errors = coder.generate_dsl({}, syntax_mem, planning_set)
+    assert module is not None
+    assert manifest is not None
+    assert len(errors) == 0
+    assert len(manifest["functions"]) == 2
+    f_names = [f["name"] for f in manifest["functions"]]
+    assert f_names == ["action1", "action6"]
+    # Check action6 parameters
+    f_a6 = next(f for f in manifest["functions"] if f["name"] == "action6")
+    assert len(f_a6["parameters"]) == 2
+    assert f_a6["parameters"][0]["name"] == "x"
+    assert f_a6["parameters"][1]["name"] == "y"
+    assert f_a6["docstring"] == "Declare spatial action ACTION6 at target coordinates (x, y)."
+
+
 def test_coder_retry_on_syntax_error():
     # Attempt 1: bad import with valid manifest structure
     bad_resp = """```python

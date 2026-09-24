@@ -102,7 +102,7 @@ class V10Config:
     coder_exhaustion_forces_fallback: bool = True
     solver_exhaustion_forces_fallback: bool = True
     abort_on_dsl_exhaustion: bool = False
-    max_primitive_probes_per_level: int = 30
+    max_primitive_probes_per_level: int = 16
     enable_primitive_probing: bool = False
     probe_reset_after_discrete: bool = False
 
@@ -144,7 +144,7 @@ class V10Config:
     cumulative_window: int = 3
     enable_undecided_verdict: bool = True
     max_undecided_streak: int = 2
-    max_evidence_probes_per_level: int = 2
+    max_evidence_probes_per_level: int = 3
 
     # Deadline reserve & Time budgeting (Flash Loop Recovery port)
     deadline_reserve_seconds: float = 15.0
@@ -359,7 +359,7 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         coder_exhaustion_forces_fallback=_bool_from_env("ARC_CODER_EXHAUSTION_FORCES_FALLBACK", True),
         solver_exhaustion_forces_fallback=_bool_from_env("ARC_SOLVER_EXHAUSTION_FORCES_FALLBACK", True),
         abort_on_dsl_exhaustion=_bool_from_env("ARC_ABORT_ON_DSL_EXHAUSTION", False),
-        max_primitive_probes_per_level=_int_from_env("ARC_MAX_PRIMITIVE_PROBES", 30),
+        max_primitive_probes_per_level=_int_from_env("ARC_MAX_PRIMITIVE_PROBES", 16),
         enable_primitive_probing=_bool_from_env("ARC_ENABLE_PRIMITIVE_PROBING", True),
         probe_reset_after_discrete=_bool_from_env("ARC_PROBE_RESET_AFTER_DISCRETE", False),
         max_actions_per_game=_int_from_env("LCLD_MAX_ACTIONS_PER_GAME", 250),
@@ -393,7 +393,7 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         cumulative_window=_int_from_env("ARC_CUMULATIVE_WINDOW", 3),
         enable_undecided_verdict=_bool_from_env("ARC_ENABLE_UNDECIDED_VERDICT", True),
         max_undecided_streak=_int_from_env("ARC_MAX_UNDECIDED_STREAK", 2),
-        max_evidence_probes_per_level=_int_from_env("ARC_MAX_EVIDENCE_PROBES", 2),
+        max_evidence_probes_per_level=_int_from_env("ARC_MAX_EVIDENCE_PROBES", 3),
     )
     if overrides:
         cfg.update_runtime(overrides)

@@ -131,44 +131,140 @@ class BrusentsovJudgment:
         return d
 
 
+def _unpack_dy_dx(v: Any) -> tuple[int, int] | None:
+    """Safely unpack a 2D motion vector (dy, dx) from tuple, list, or string."""
+    if isinstance(v, (tuple, list)) and len(v) >= 2:
+        try:
+            return int(v[0]), int(v[1])
+        except (ValueError, TypeError):
+            return None
+    if isinstance(v, str):
+        cleaned = v.strip().strip("()[]")
+        parts = [p.strip() for p in cleaned.split(",") if p.strip()]
+        if len(parts) >= 2:
+            try:
+                return int(parts[0]), int(parts[1])
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
 def contradicts(expected: AtomicProposition, observed: AtomicProposition) -> bool:
-    """Check if an observed proposition physically contradicts an expected proposition."""
-    # 1. Object Identity preservation contradiction:
-    # Expected object preserved, but observed destroyed/missing
-    if expected.family == "object_identity":
-        if expected.subject_id == observed.subject_id:
-            if expected.predicate == "preserved" and observed.predicate in {"destroyed", "missing", "vanished"}:
+    """Check if an observed proposition physically contradicts an expected proposition (Carrollian nullity xy'_0)."""
+    # 0. Subject matching: propositions regarding different distinct entities cannot directly contradict each other
+    if expected.subject_id and observed.subject_id and expected.subject_id != observed.subject_id:
+        return False
+
+    # 1. Object Identity preservation (Carroll nullity xy'_0 → NULL):
+    # When the antecedent explicitly expects preservation and observation confirms destruction,
+    # this is a direct physical contradiction — the object cannot be simultaneously preserved and destroyed.
+    if expected.family == "object_identity" and observed.family == "object_identity":
+        if expected.subject_id == observed.subject_id or not expected.subject_id:
+            if expected.predicate == "preserved" and observed.predicate in ("destroyed", "vanished", "missing"):
                 return True
-            if expected.predicate in {"destroyed", "vanished"} and observed.predicate == "preserved":
+            if expected.predicate in ("destroyed", "vanished", "missing") and observed.predicate == "preserved":
                 return True
 
     # 2. Attribute Delta contradiction:
     # Same subject, same attribute, but differing values (e.g. expected color 2, observed color 3)
     if expected.family == "attribute_delta" and observed.family == "attribute_delta":
-        if expected.subject_id == observed.subject_id and expected.predicate == observed.predicate:
+        if (expected.subject_id == observed.subject_id or not expected.subject_id) and expected.predicate == observed.predicate:
             if expected.value is not None and observed.value is not None:
-                if expected.value != observed.value:
+                if _normalize_value(expected.value) != _normalize_value(observed.value):
                     return True
 
-    # 3. Metric Sign contradiction:
-    # Expected change in a specific direction (+1 or -1), but observed opposite direction
-    if expected.family == "metric_sign" and observed.family == "metric_sign":
-        # Match predicates accounting for aliases (row_delta/delta_r/dy and col_delta/delta_c/dx)
-        exp_p = expected.predicate.lower()
-        obs_p = observed.predicate.lower()
-        p_matches = (
-            exp_p == obs_p
-            or (exp_p in ("row_delta", "delta_r", "dy") and obs_p in ("row_delta", "delta_r", "dy"))
-            or (exp_p in ("col_delta", "delta_c", "dx") and obs_p in ("col_delta", "delta_c", "dx"))
-        )
-        if p_matches and (expected.subject_id == observed.subject_id or not expected.subject_id):
+    # 3. Kinematic motion & Invariant Nullity (Physical Stagnation, Unintended Mutation, Direction Inversion)
+    exp_p = expected.predicate.lower()
+    obs_p = observed.predicate.lower()
+    subj_matches = (expected.subject_id == observed.subject_id or not expected.subject_id)
+
+    # 3a. Tuple-based kinematics: ("moved", "step_moved")
+    if subj_matches and exp_p in ("moved", "step_moved") and obs_p in ("moved", "step_moved"):
+        exp_vec = _unpack_dy_dx(expected.value)
+        obs_vec = _unpack_dy_dx(observed.value)
+        if exp_vec is not None and obs_vec is not None:
+            exp_dy, exp_dx = exp_vec
+            obs_dy, obs_dx = obs_vec
+            # 1. Stagnation: expected motion on an axis, but observed stationary (0)
+            if (exp_dy != 0 and obs_dy == 0) or (exp_dx != 0 and obs_dx == 0):
+                return True
+            # 2. Unintended Mutation: expected 0 on an axis, but observed motion
+            if (exp_dy == 0 and obs_dy != 0) or (exp_dx == 0 and obs_dx != 0):
+                return True
+            # 3. Direction Inversion
+            if (exp_dy * obs_dy < 0) or (exp_dx * obs_dx < 0):
+                return True
+
+    # 3b. Invariant violation: expected unchanged / stationary, but observed motion
+    if subj_matches and exp_p in ("unchanged", "stationary"):
+        if obs_p in ("moved", "step_moved"):
+            obs_vec = _unpack_dy_dx(observed.value)
+            if obs_vec is not None and (obs_vec[0] != 0 or obs_vec[1] != 0):
+                return True
+        elif obs_p in ("row_delta", "delta_r", "dy", "col_delta", "delta_c", "dx"):
+            try:
+                if int(observed.value) != 0:
+                    return True
+            except (ValueError, TypeError):
+                pass
+
+    # 3c. Scalar metric sign contradictions (dy / dx / row_delta / col_delta)
+    if expected.family == "metric_sign" and observed.family == "metric_sign" and subj_matches:
+        is_row = exp_p in ("row_delta", "delta_r", "dy") and obs_p in ("row_delta", "delta_r", "dy")
+        is_col = exp_p in ("col_delta", "delta_c", "dx") and obs_p in ("col_delta", "delta_c", "dx")
+        if is_row or is_col:
             if expected.secondary_id == observed.secondary_id:
                 try:
                     exp_sign = int(expected.value)
                     obs_sign = int(observed.value)
-                    # Contradiction strictly when opposite directions are observed (e.g. expected +1, observed -1)
-                    # Note: zero displacement is an inessential missing effect (OMIT/UNDECIDED), not a physical contradiction.
-                    if exp_sign != 0 and obs_sign != 0 and exp_sign != obs_sign:
+                    # 1. Stagnation: expected motion, observed 0
+                    if exp_sign != 0 and obs_sign == 0:
+                        return True
+                    # 2. Unintended mutation: expected 0, observed motion
+                    if exp_sign == 0 and obs_sign != 0:
+                        return True
+                    # 3. Direction inversion
+                    if exp_sign * obs_sign < 0:
+                        return True
+                except (ValueError, TypeError):
+                    pass
+
+    # 3d. Cross-check: tuple expected vs scalar observed
+    if subj_matches and exp_p in ("moved", "step_moved") and observed.family == "metric_sign":
+        exp_vec = _unpack_dy_dx(expected.value)
+        if exp_vec is not None:
+            exp_dy, exp_dx = exp_vec
+            if obs_p in ("row_delta", "delta_r", "dy"):
+                try:
+                    obs_dy = int(observed.value)
+                    if (exp_dy != 0 and obs_dy == 0) or (exp_dy == 0 and obs_dy != 0) or (exp_dy * obs_dy < 0):
+                        return True
+                except (ValueError, TypeError):
+                    pass
+            elif obs_p in ("col_delta", "delta_c", "dx"):
+                try:
+                    obs_dx = int(observed.value)
+                    if (exp_dx != 0 and obs_dx == 0) or (exp_dx == 0 and obs_dx != 0) or (exp_dx * obs_dx < 0):
+                        return True
+                except (ValueError, TypeError):
+                    pass
+
+    # 3e. Cross-check: scalar expected vs tuple observed
+    if subj_matches and expected.family == "metric_sign" and obs_p in ("moved", "step_moved"):
+        obs_vec = _unpack_dy_dx(observed.value)
+        if obs_vec is not None:
+            obs_dy, obs_dx = obs_vec
+            if exp_p in ("row_delta", "delta_r", "dy"):
+                try:
+                    exp_dy = int(expected.value)
+                    if (exp_dy != 0 and obs_dy == 0) or (exp_dy == 0 and obs_dy != 0) or (exp_dy * obs_dy < 0):
+                        return True
+                except (ValueError, TypeError):
+                    pass
+            elif exp_p in ("col_delta", "delta_c", "dx"):
+                try:
+                    exp_dx = int(expected.value)
+                    if (exp_dx != 0 and obs_dx == 0) or (exp_dx == 0 and obs_dx != 0) or (exp_dx * obs_dx < 0):
                         return True
                 except (ValueError, TypeError):
                     pass
@@ -210,12 +306,18 @@ def contradicts(expected: AtomicProposition, observed: AtomicProposition) -> boo
 
 def _normalize_value(v: Any) -> Any:
     """Normalize proposition value for safe type-coerced equality comparisons."""
+    if isinstance(v, (list, tuple)):
+        return tuple(_normalize_value(x) for x in v)
     if isinstance(v, str):
         v_s = v.strip()
         if v_s.lower() == "true":
             return True
         if v_s.lower() == "false":
             return False
+        if (v_s.startswith("(") and v_s.endswith(")")) or (v_s.startswith("[") and v_s.endswith("]")):
+            inner = v_s[1:-1]
+            parts = [p.strip() for p in inner.split(",") if p.strip()]
+            return tuple(_normalize_value(p) for p in parts)
         try:
             return int(v_s)
         except ValueError:
@@ -269,16 +371,6 @@ def implies_brusentsov(expected: PropositionSet, observed: PropositionSet) -> Te
             if contradicts(e, o):
                 return Ternary.FALSE
 
-        # Object preservation check
-        if e.family == "object_identity" and e.predicate == "preserved":
-            is_destroyed = any(
-                o.family == "object_identity"
-                and o.subject_id == e.subject_id
-                and o.predicate in {"destroyed", "missing", "vanished"}
-                for o in observed
-            )
-            if is_destroyed:
-                return Ternary.FALSE
 
     # 2. Necessary containment check (FOLLOW check)
     if all(is_necessarily_contained(e, observed) for e in expected):
@@ -353,6 +445,11 @@ def evaluate_invariant_across_levels(
             if m:
                 raw_act = m.group(1).upper()
                 act_id = raw_act if raw_act.startswith("ACTION") else f"ACTION{raw_act}"
+
+        if not act_id:
+            # Guard: On pristine frame S₀ (no actions taken), kinematic invariants
+            # cannot be empirically confirmed or falsified. Return IRRELEVANT.
+            return Ternary.IRRELEVANT
 
         relevant_metric_props = [
             p for p in props

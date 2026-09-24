@@ -40,12 +40,12 @@ def test_progressive_phase_instructions():
     assert "EXPLOITATION PHASE" in phase_4
     assert "Execute optimal trajectories" in phase_4
 
-    # Verify build_solver_prompts incorporates the phase instruction
+    # Verify build_solver_prompts reflects level index in state
     grid = [[0, 1], [0, 0]]
     snap = extract_arga_snapshot(grid)
     pset = build_planning_set(snap, available_actions=["ACTION1"])
-    sys_p, _ = build_solver_prompts({"functions": []}, pset, level_index=4)
-    assert "EXPLOITATION PHASE" in sys_p
+    _, user_p = build_solver_prompts({"functions": []}, pset, level_index=4)
+    assert "level index 4" in user_p
 
 
 def test_game_model_block_in_solver_prompt():
@@ -57,8 +57,9 @@ def test_game_model_block_in_solver_prompt():
     gm.record_action_effect("ACTION1", "moves entity UP by dy=-1")
 
     _, user_p = build_solver_prompts({"functions": []}, pset, game_memory=gm)
-    assert "confirmed_game_model" in user_p
-    assert "GAME MODEL" in user_p
+    assert "ACCUMULATED GAME KNOWLEDGE" in user_p
+    assert "TIER 1 - physics & kinematics:" in user_p
+    assert "ACTION1: moves entity UP by dy=-1" in user_p
 
 
 def test_domain_agnostic_distillation_prompt():
@@ -94,30 +95,30 @@ def test_explorer_prompt_structural_observations():
 
 
 def test_coder_prompt_action5_example():
-    """3.5: Verify Coder prompt includes action5 example in code and manifest."""
+    """3.5: Verify Coder prompt includes action5 example in code."""
     _, user_p = build_coder_prompts({}, syntax_errors=[])
     assert "def action5(api):" in user_p
     assert "Declare entity selection/cycling action ACTION5" in user_p
-    assert '"name": "action5"' in user_p
+    assert 'action_id="ACTION5"' in user_p
 
 
 def test_solver_prompt_ternary_semantics():
-    """3.6: Verify Solver system prompt explains TRUE/FOLLOW, IRRELEVANT/OMIT, FALSE/NULL."""
-    assert "TERNARY EVALUATION SEMANTICS:" in SOLVER_SYSTEM_PROMPT
-    assert "TRUE (FOLLOW)" in SOLVER_SYSTEM_PROMPT
-    assert "IRRELEVANT (OMIT)" in SOLVER_SYSTEM_PROMPT
-    assert "FALSE (NULL)" in SOLVER_SYSTEM_PROMPT
+    """3.6: Verify Solver system prompt explains NULL, FOLLOW, and OMIT verdicts."""
+    assert "EXECUTION LOOP FACTS" in SOLVER_SYSTEM_PROMPT
+    assert "verdict NULL" in SOLVER_SYSTEM_PROMPT
+    assert "verdict FOLLOW or OMIT" in SOLVER_SYSTEM_PROMPT
 
 
 def test_solver_prompt_freedom_of_motion_disclaimer():
-    """3.7: Verify freedom_of_motion contains boundary_distance_only and WARNING disclaimer."""
+    """3.7: Verify lean prompt contains SPATIAL LAYOUT and OBJECT INDEX."""
     grid = [[0, 0, 0], [0, 1, 0], [0, 0, 0]]
     snap = extract_arga_snapshot(grid)
     pset = build_planning_set(snap, available_actions=["ACTION1"])
     _, user_p = build_solver_prompts({"functions": []}, pset)
 
-    assert "boundary_distance_only" in user_p
-    assert "These are distances to GRID EDGES only" in user_p
+    assert "SPATIAL LAYOUT" in user_p
+    assert "OBJECT INDEX" in user_p
+    assert "canvas" in user_p
 
 
 def test_distillation_button_macro_filtering():
@@ -148,8 +149,8 @@ def test_distillation_button_macro_filtering():
 
 
 def test_structured_invariant_analysis_format():
-    """3.9: Verify invariant_analysis format in Solver prompt contains the 4 structured questions."""
-    assert "1. What is the likely goal of this level?" in SOLVER_SYSTEM_PROMPT
-    assert "2. Which confirmed invariants apply here?" in SOLVER_SYSTEM_PROMPT
-    assert "3. What is NEW or DIFFERENT about this level vs previous ones?" in SOLVER_SYSTEM_PROMPT
-    assert "4. Strategy for this level:" in SOLVER_SYSTEM_PROMPT
+    """3.9: Verify invariant_analysis format in Solver prompt contains relied, proposed, conflicts."""
+    assert "<invariant_analysis>" in SOLVER_SYSTEM_PROMPT
+    assert "relied:" in SOLVER_SYSTEM_PROMPT
+    assert "proposed:" in SOLVER_SYSTEM_PROMPT
+    assert "conflicts:" in SOLVER_SYSTEM_PROMPT
