@@ -37,10 +37,10 @@ def test_four_directional_piece_motion_with_horizontal_axis():
     sandbox = VirtualKinematicSandbox(planning_set, game_mem)
 
     # piece_actions must contain all 4 directional primitives
-    assert "action1" in sandbox.piece_actions
-    assert "action2" in sandbox.piece_actions
-    assert "action3" in sandbox.piece_actions
-    assert "action4" in sandbox.piece_actions
+    assert "ACTION1" in sandbox.piece_actions
+    assert "ACTION2" in sandbox.piece_actions
+    assert "ACTION3" in sandbox.piece_actions
+    assert "ACTION4" in sandbox.piece_actions
 
     # Piece displacement for action2 (DOWN) must NOT be (0, 0)
     piece_obj = next(o for o in planning_set.objects if o.color == 5)

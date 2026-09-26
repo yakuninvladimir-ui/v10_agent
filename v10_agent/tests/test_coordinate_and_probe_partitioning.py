@@ -28,6 +28,25 @@ def test_action7_strictly_excluded():
     assert "ACTION6" in pset.allowed_action_ids
 
 
+def test_normalize_observation_excludes_action7_and_reset():
+    from v10_agent.observe import normalize_observation
+    obs = {
+        "grid": [[0, 0], [0, 0]],
+        "available_actions": ["ACTION1", "ACTION2", "ACTION7", "RESET"],
+    }
+    norm = normalize_observation(obs)
+    assert "ACTION7" not in norm["available_actions"]
+    assert "RESET" not in norm["available_actions"]
+    assert "ACTION7" not in norm["allowed_action_ids"]
+    assert "RESET" not in norm["allowed_action_ids"]
+    assert norm["available_actions"] == ["ACTION1", "ACTION2"]
+
+    # Test default action space when none provided
+    norm_default = normalize_observation({"grid": [[0, 0], [0, 0]]})
+    assert "ACTION7" not in norm_default["available_actions"]
+    assert "RESET" not in norm_default["available_actions"]
+
+
 def test_discrete_probes_restricted_to_action1_to_action5():
     mgr = PrimitiveProbeManager(max_probes=10)
     all_actions = ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "ACTION7", "RESET"]
@@ -112,7 +131,8 @@ def move_obj(api, obj):
     advisor.set_response("coder", f"```python\n{valid_py}\n```\n```json\n{json.dumps(manifest)}\n```")
     advisor.set_response("solver", f"```json\n{json.dumps(traj_pkg)}\n```")
 
-    config = V10Config(llm_advisor_backend="fake")
+    # Primitive probing is on in production; this test targets the DSL candidate path.
+    config = V10Config(llm_advisor_backend="fake", enable_primitive_probing=False)
     session = GameSession(config, advisor)
 
     grid = [[0, 1, 0], [0, 0, 0]]

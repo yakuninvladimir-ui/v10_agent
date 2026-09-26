@@ -176,6 +176,18 @@ def test_subject_isolation_no_false_contradiction():
     assert contradicts(p_exp_A, p_obs_B) is False
 
 
+def test_diagonal_motion_unconstrained_axis_no_false_null():
+    """Unconstrained zero-component in active vector does not contradict diagonal movement."""
+    # Expected rightward motion (0, 1) should not contradict diagonal (1, 1) or (-1, 1)
+    p_exp = AtomicProposition(family="metric_sign", subject_id="obj_A", predicate="step_moved", value=(0, 1))
+    p_obs_diag = AtomicProposition(family="metric_sign", subject_id="obj_A", predicate="step_moved", value=(1, 1))
+    assert contradicts(p_exp, p_obs_diag) is False
+
+    # But explicit lock unchanged / stationary DOES contradict diagonal movement
+    p_lock = AtomicProposition(family="metric_sign", subject_id="obj_A", predicate="unchanged", value=(0, 0))
+    assert contradicts(p_lock, p_obs_diag) is True
+
+
 # =============================================================================
 # 2. Macro-step Decomposition in solver_agent.py
 # =============================================================================

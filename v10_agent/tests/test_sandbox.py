@@ -98,3 +98,52 @@ def move_obj(api, obj, target):
     assert isinstance(effect, EffectDeclaration)
     assert effect.declared_action.action_id == "ACTION1"
     assert effect.target_object_ids == ["obj_0", "obj_1"]
+
+
+def test_sandbox_dry_run_handles_optional_none_defaults_and_click():
+    """Verify dry_run_manifest safely handles functions with Optional[int]=None, default=None, and empty defaults."""
+    source = """
+from typing import Optional
+
+def action6(api, target: str = "", x: Optional[int] = None, y: Optional[int] = None):
+    if target:
+        return api.click_object(target=target)
+    else:
+        return api.declare_environment_action(
+            action_id="ACTION6",
+            data={"x": int(x or 0), "y": int(y or 0)}
+        )
+
+def click(api, target: str = "", x: Optional[int] = None, y: Optional[int] = None):
+    return action6(api, target=target, x=x, y=y)
+"""
+    manifest = {
+        "functions": [
+            {
+                "name": "action6",
+                "parameters": [
+                    {"name": "target", "type": "str", "default": ""},
+                    {"name": "x", "type": "int", "default": None},
+                    {"name": "y", "type": "int", "default": None},
+                ],
+            },
+            {
+                "name": "click",
+                "parameters": [
+                    {"name": "target", "type": "str", "default": ""},
+                    {"name": "x", "type": "int", "default": None},
+                    {"name": "y", "type": "int", "default": None},
+                ],
+            },
+        ]
+    }
+    grid = [[0, 1]]
+    snapshot = extract_arga_snapshot(grid)
+    planning_set = build_planning_set(snapshot, available_actions=["ACTION6", "RESET"])
+
+    executor = SandboxExecutor()
+    module = executor.load_module(source, manifest)
+
+    ok, err = executor.dry_run_manifest(module, planning_set)
+    assert ok is True, f"Dry run failed unexpectedly: {err}"
+

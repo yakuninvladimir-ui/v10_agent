@@ -173,3 +173,25 @@ def test_telemetry_records_all_v10_1_fields():
     assert "undecided_fallback_to_null" in telem
     assert "evidence_probes_executed" in telem
     assert "epistemic_signals_count" in telem
+
+
+def test_game_over_guard_aborts_evidence_seeking_probe():
+    """When a probe action results in GAME_OVER, evidence seeking is deactivated immediately."""
+    cfg = V10Config()
+    session = GameSession(cfg)
+
+    grid = [[1, 0], [0, 0]]
+    session.last_snapshot = extract_arga_snapshot(grid)
+    session.last_planning_set = build_planning_set(session.last_snapshot, ["ACTION1", "RESET"])
+    session.pending_action = {"action_id": "ACTION1", "id": "ACTION1", "data": {}}
+    session.last_probe_action = {"action_id": "ACTION1", "data": {}}
+    session.evidence_seeking_active = True
+    session.pending_step_snapshot = GroundedStep(step_id="s1", dsl_function="action1", arguments={})
+
+    # Observe GAME_OVER result from the probe
+    res = session.observe_action_result({"grid": grid, "state": "GAME_OVER", "action_space": {"actions": ["ACTION1", "RESET"]}})
+    assert res is True
+    assert session.evidence_seeking_active is False
+    assert session.pending_step_snapshot is None
+    assert session.last_probe_action is None
+

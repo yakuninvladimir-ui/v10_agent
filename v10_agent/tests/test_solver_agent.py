@@ -395,3 +395,26 @@ def test_solver_core_principles_in_prompt():
 
     assert "shortest sufficient plan" not in SOLVER_SYSTEM_PROMPT.lower()
     assert "minimal discriminating experiment" not in SOLVER_SYSTEM_PROMPT.lower()
+
+
+def test_solver_prompt_dynamic_click_guidance():
+    """Verify solver prompt adapts guidance based on ACTION6 availability."""
+    from v10_agent.prompt_builders.solver_prompt import build_solver_prompts
+
+    grid = [[0, 1], [0, 0]]
+    snap = extract_arga_snapshot(grid)
+
+    # 1. Discrete only (no ACTION6)
+    pset_discrete = build_planning_set(snap, available_actions=["ACTION1", "ACTION2", "RESET"])
+    manifest_discrete = {"functions": [{"name": "action1", "parameters": []}, {"name": "action2", "parameters": []}]}
+    _, user_p_discrete = build_solver_prompts(manifest_discrete, pset_discrete)
+    assert "DISCRETE BUTTON ACTIONS ONLY" in user_p_discrete
+    assert "DO NOT propose click() or action6() calls" in user_p_discrete
+
+    # 2. Click available (ACTION6 present)
+    pset_click = build_planning_set(snap, available_actions=["ACTION1", "ACTION6", "RESET"])
+    manifest_click = {"functions": [{"name": "action1", "parameters": []}, {"name": "action6", "parameters": []}]}
+    _, user_p_click = build_solver_prompts(manifest_click, pset_click)
+    assert "Prefer click(target=ALIAS) or action6(target=ALIAS)" in user_p_click
+    assert "DO NOT propose click() or action6() calls" not in user_p_click
+

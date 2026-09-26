@@ -36,6 +36,8 @@ def step_action(api, obj):
         solver_exhaustion_forces_fallback=True,
         max_actions_per_game=250,
         max_actions_per_level=250,
+        # Primitive probing is on in production; this test counts Solver chain attempts.
+        enable_primitive_probing=False,
     )
     session = GameSession(config, advisor)
 
@@ -65,6 +67,8 @@ def test_persistent_fallback_does_not_emit_board_reset():
         solver_exhaustion_forces_fallback=True,
         max_actions_per_game=250,
         max_actions_per_level=250,
+        # Primitive probing is on in production; this test counts Solver chain attempts.
+        enable_primitive_probing=False,
     )
     session = GameSession(config, MockLLMAdvisor())
     session.in_persistent_fallback = True
@@ -95,6 +99,8 @@ def test_level_win_resets_persistent_fallback_for_next_level():
         solver_exhaustion_forces_fallback=True,
         max_actions_per_game=250,
         max_actions_per_level=250,
+        # Primitive probing is on in production; this test counts Solver chain attempts.
+        enable_primitive_probing=False,
     )
     session = GameSession(config, MockLLMAdvisor())
     session.in_persistent_fallback = True
@@ -125,6 +131,8 @@ def test_coder_exhaustion_default_engages_fallback():
     config = V10Config(
         llm_advisor_backend="fake",
         max_coder_retries_per_level=1,
+        # Primitive probing is on in production; this test targets Coder exhaustion.
+        enable_primitive_probing=False,
     )
     # Default config has coder_exhaustion_forces_fallback=True, abort_on_dsl_exhaustion=False
     assert config.coder_exhaustion_forces_fallback is True

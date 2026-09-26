@@ -11,7 +11,7 @@ from v10_agent.session import GameSession, LevelAttemptsExhaustedError
 
 
 def test_explorer_quota_allocation_pure_and_mixed():
-    """Verify Explorer allocates 5 probes for pure ACTION6 and 3 probes for mixed actions."""
+    """Verify Explorer allocates at most 2 coordinate probes."""
     grid = [[0, 0, 0], [0, 1, 0], [0, 0, 0]]
 
     # Case 1: Pure ACTION6
@@ -24,23 +24,11 @@ def test_explorer_quota_allocation_pure_and_mixed():
 
     explorer_calls = [c for c in advisor1.call_history if c["role"] == "explorer"]
     assert len(explorer_calls) == 1
-    assert "between 2 and 5" in explorer_calls[0]["user_prompt"]
-
-    # Case 2: Mixed (ACTION1 + ACTION6)
-    advisor2 = MockLLMAdvisor()
-    config2 = V10Config(llm_advisor_backend="fake", enable_primitive_probing=True)
-    session2 = GameSession(config2, advisor2)
-
-    obs_mixed = {"grid": grid, "available_actions": ["ACTION1", "ACTION6", "RESET"], "levels_completed": 0}
-    session2.act(obs_mixed)
-
-    explorer_calls2 = [c for c in advisor2.call_history if c["role"] == "explorer"]
-    assert len(explorer_calls2) == 1
-    assert "between 2 and 3" in explorer_calls2[0]["user_prompt"]
+    assert "between 2 and 2" in explorer_calls[0]["user_prompt"]
 
 
-def test_explorer_recursive_loop_and_5_attempt_exhaustion():
-    """Verify Explorer repeats probing across up to 5 attempts when 0 effects are observed, then aborts."""
+def test_explorer_recursive_loop_and_2_attempt_exhaustion_yields_invariants():
+    """Verify Explorer executes up to 2 probe attempts when 0 effects observed, then yields invariants without aborting."""
     grid = [[0, 0, 0], [0, 1, 0], [0, 0, 0]]
     obs = {"grid": grid, "available_actions": ["ACTION6", "RESET"], "levels_completed": 0}
 
@@ -49,7 +37,6 @@ def test_explorer_recursive_loop_and_5_attempt_exhaustion():
         "coordinate_hypotheses": [
             {"x": 0, "y": 0, "target_description": "t0", "rationale": "test"},
             {"x": 1, "y": 0, "target_description": "t1", "rationale": "test"},
-            {"x": 2, "y": 0, "target_description": "t2", "rationale": "test"},
         ]
     }
     advisor.set_response("explorer", f"```json\n{json.dumps(mock_payload)}\n```")
@@ -57,23 +44,20 @@ def test_explorer_recursive_loop_and_5_attempt_exhaustion():
     config = V10Config(
         llm_advisor_backend="fake",
         enable_primitive_probing=True,
-        max_explorer_attempts_per_level=5,
+        max_explorer_attempts_per_level=2,
     )
     session = GameSession(config, advisor)
 
-    reset_reasons = []
+    # Execute steps until probing phase finishes
+    for step in range(10):
+        if not session.probing_phase:
+            break
+        act = session.act(obs)
+        session.observe_action_result(obs)
 
-    with pytest.raises(LevelAttemptsExhaustedError, match=r"Explorer probe budget exhausted \(5 attempts\)"):
-        for step in range(50):
-            act = session.act(obs)
-            session.observe_action_result(obs)
-            if act["id"] == "RESET":
-                src = act.get("reasoning", {}).get("source", "")
-                reset_reasons.append(src)
-
-    assert len(reset_reasons) == 0  # Continuous probing without intermediate resets
-    assert session.explorer_attempts_this_level == 5
-    assert session.session_aborted is True
+    assert session.explorer_attempts_this_level == 2
+    assert session.probing_phase is False
+    assert session.session_aborted is False
 
 
 def test_explorer_stops_loop_when_action_confirmed():
@@ -131,3 +115,38 @@ def test_explorer_stops_loop_when_action_confirmed():
 
     assert session.probing_phase is False
     assert act3["reasoning"]["strategy"] == "solver_candidate"
+
+
+def test_invariant_verification_module_budget_and_yield():
+    """Verify invariant verification module is limited to 3 zero-effect invariant probes, then yields invariants without reprobing."""
+    from v10_agent.explorer_agent import PrimitiveProbeManager
+
+    mgr = PrimitiveProbeManager(max_probes=16, max_invariant_probes=3, max_steps_per_probe=2)
+    mgr.available_discrete_actions = {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"}
+    mgr.inactive_actions = {"ACTION2"}
+
+    # Effective-action reprobe (moved UP): Case 1 retest — does NOT consume invariant budget
+    reprobes_eff = mgr.get_dynamic_reprobes("ACTION1", "moved UP")
+    assert len(reprobes_eff) <= 2
+    assert mgr.invariant_probes_count == 0, "Effective-action reprobes should not increment invariant count"
+
+    # Zero-effect invariant probe 1: vector action with no visible effect (Case 3)
+    mgr.inactive_actions = {"ACTION3"}
+    reprobes1 = mgr.get_dynamic_reprobes("ACTION2", "no visible effect")
+    assert mgr.invariant_probes_count == 1
+
+    # Zero-effect invariant probe 2
+    reprobes2 = mgr.get_dynamic_reprobes("ACTION3", "0 cells changed")
+    assert mgr.invariant_probes_count == 2
+
+    # Zero-effect invariant probe 3
+    reprobes3 = mgr.get_dynamic_reprobes("ACTION4", "zero delta observed")
+    assert mgr.invariant_probes_count == 3
+
+    # Attempt 4: Budget exhausted -> returns empty and yields unverified invariant
+    mgr.inactive_actions = {"ACTION5"}
+    reprobes4 = mgr.get_dynamic_reprobes("ACTION1", "no visible effect")
+    assert reprobes4 == []
+    assert mgr.invariant_probes_count == 3
+    assert "ACTION5" in mgr.confirmed_effective_actions
+    assert mgr.confirmed_effective_actions["ACTION5"] == "unverified_invariant"

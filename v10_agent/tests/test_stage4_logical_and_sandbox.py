@@ -100,6 +100,105 @@ def test_evaluate_invariant_across_levels_area_conservation():
     ])
     assert evaluate_invariant_across_levels(inv, props_destroyed) == Ternary.FALSE
 
+    # Vacuity guard: a zero-area observation is not surviving mass, so it may
+    # not be reported as confirmation of conservation.
+    props_zero_area = PropositionSet([
+        AtomicProposition(family="attribute_delta", subject_id="obj_0", predicate="area", value=0),
+    ])
+    assert evaluate_invariant_across_levels(inv, props_zero_area) == Ternary.IRRELEVANT
+
+    # Vacuity guard: an invariant that never asserts conservation is not
+    # confirmed merely because some area attribute happens to be observable.
+    inv_no_claim = StructuredInvariant(
+        invariant_id="inv_area_2",
+        invariant_type="generic",
+        tier=1,
+        description="Object area attribute is measurable",
+    )
+    assert evaluate_invariant_across_levels(inv_no_claim, props_ok) == Ternary.IRRELEVANT
+
+
+def test_evaluate_invariant_across_levels_never_confirms_on_mere_observability():
+    """Non-emptiness of an observation set is not evidence: it must yield IRRELEVANT, not TRUE."""
+    silence_cases = [
+        (
+            StructuredInvariant(
+                invariant_id="inv_ctrl_1",
+                invariant_type="control",
+                tier=1,
+                description="Some entity is controllable",
+            ),
+            AtomicProposition(family="action_surface", subject_id="obj_0", predicate="selectable", value=None),
+        ),
+        (
+            StructuredInvariant(
+                invariant_id="inv_pal_1",
+                invariant_type="palette",
+                tier=1,
+                description="A colour is present in the palette",
+            ),
+            AtomicProposition(family="attribute_delta", subject_id="obj_0", predicate="color", value=None),
+        ),
+        (
+            StructuredInvariant(
+                invariant_id="inv_tf_1",
+                invariant_type="transformation",
+                tier=1,
+                description="Something rotates",
+            ),
+            AtomicProposition(family="attribute_delta", subject_id="obj_0", predicate="area", value=10),
+        ),
+        (
+            StructuredInvariant(
+                invariant_id="inv_sym_1",
+                invariant_type="symmetry",
+                tier=1,
+                description="A relational symmetry holds",
+            ),
+            AtomicProposition(family="relation_existence", subject_id="obj_0", predicate="touching", value=None),
+        ),
+    ]
+    for invariant, prop in silence_cases:
+        verdict = evaluate_invariant_across_levels(invariant, PropositionSet([prop]))
+        assert verdict == Ternary.IRRELEVANT, (invariant.invariant_id, verdict)
+
+
+def test_evaluate_invariant_across_levels_palette_confirms_only_declared_color():
+    """A palette invariant confirms only against the colour it actually names."""
+    inv = StructuredInvariant(
+        invariant_id="inv_pal_2",
+        invariant_type="palette",
+        tier=1,
+        description="Colour 7 marks the target",
+        metadata={"target_color": 7},
+    )
+    assert evaluate_invariant_across_levels(
+        inv,
+        PropositionSet([AtomicProposition(family="attribute_delta", subject_id="obj_0", predicate="color", value=7)]),
+    ) == Ternary.TRUE
+    assert evaluate_invariant_across_levels(
+        inv,
+        PropositionSet([AtomicProposition(family="attribute_delta", subject_id="obj_0", predicate="color", value=3)]),
+    ) == Ternary.IRRELEVANT
+
+
+def test_evaluate_invariant_across_levels_transformation_requires_event_shape():
+    """A static identity snapshot is not a state change."""
+    inv = StructuredInvariant(
+        invariant_id="inv_tf_2",
+        invariant_type="transformation",
+        tier=1,
+        description="Pieces rotate when toggled",
+    )
+    assert evaluate_invariant_across_levels(
+        inv,
+        PropositionSet([AtomicProposition(family="object_identity", subject_id="obj_0", predicate="present", value=True)]),
+    ) == Ternary.IRRELEVANT
+    assert evaluate_invariant_across_levels(
+        inv,
+        PropositionSet([AtomicProposition(family="object_identity", subject_id="obj_0", predicate="rotated", value=True)]),
+    ) == Ternary.TRUE
+
 
 def test_compare_invariants_across_levels_multi_instances():
     """Verify compare_invariants_across_levels handles multiple invariants of same type without collapsing."""

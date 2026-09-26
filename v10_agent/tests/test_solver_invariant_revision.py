@@ -126,7 +126,8 @@ def test_solver_revise_invariants_failure_flow():
 
 def test_session_triggers_revision_on_win_and_not_on_failure():
     """Verify GameSession triggers Solver invariant revision ONLY on level win, not on intra-level attempt failure."""
-    config = V10Config(llm_advisor_backend="fake")
+    # Primitive probing is on in production; this test targets win/failure revision routing.
+    config = V10Config(llm_advisor_backend="fake", enable_primitive_probing=False)
     advisor = MockLLMAdvisor()
     session = GameSession(config=config, advisor=advisor)
 

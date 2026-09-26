@@ -201,15 +201,19 @@ def test_vllm_server_launch_flags():
 
     cfg = V10Config()
     flags = build_vllm_server_flags(cfg)
-    assert "--no-enable-prefix-caching" in flags
-    assert "--enable-prefix-caching" not in flags
+    assert "--enable-prefix-caching" in flags
+    assert "--no-enable-prefix-caching" not in flags
     assert "--enable-chunked-prefill" in flags
     assert "--async-scheduling" in flags
     assert "--no-enable-log-requests" in flags
     assert "--disable-uvicorn-access-log" in flags
 
+    # Also verify toggle when disabled
+    cfg_disabled = V10Config(vllm_enable_prefix_caching=False)
+    flags_disabled = build_vllm_server_flags(cfg_disabled)
+    assert "--no-enable-prefix-caching" in flags_disabled
+    assert "--enable-prefix-caching" not in flags_disabled
+
     src = inspect.getsource(phase_a_heavy_smoke.start_vllm_server)
     assert "build_vllm_server_flags" in src
-    assert "--no-enable-prefix-caching" in src
-    assert "--enable-prefix-caching" not in src
 

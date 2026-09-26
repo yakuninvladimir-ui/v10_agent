@@ -60,20 +60,20 @@ def test_synthetic_world_1_maze_navigation():
 def test_synthetic_world_2_gravity_settling_and_soft_boundary():
     """Micro-World 2: Falling block settles on platform; downward motion into floor is OMIT, not NULL."""
     verifier = LayeredVerifier(V10Config())
-    # Before: Block (color 2) resting immediately on floor (color 5)
+    # Before: Block (color 2) resting at bottom boundary / floor
     before_grid = [
+        [0, 0, 0, 0, 0],
         [0, 0, 0, 0, 0],
         [0, 0, 0, 0, 0],
         [0, 2, 2, 0, 0],
         [5, 5, 5, 5, 5],
-        [0, 0, 0, 0, 0],
     ]
     snap = extract_arga_snapshot(before_grid)
     pset = build_planning_set(snap, available_actions=["ACTION2"])
+    block = next(o for o in pset.objects if o.color == 2)
 
     gmem = GameMemory(game_id="gravity_world")
     gmem.record_action_effect("ACTION2", "Gravity moves block DOWN")
-    gmem.record_stratified_invariant("Block stops at obstacle platform boundary", tier=1)
 
     # After: Action DOWN into floor produces zero delta (blocked)
     after_obs = {"grid": before_grid, "state": "IN_PROGRESS"}
@@ -81,7 +81,9 @@ def test_synthetic_world_2_gravity_settling_and_soft_boundary():
         step_id="s1",
         dsl_function="fall_down",
         arguments={},
-        expected_propositions=PropositionSet.from_iterable([]),
+        expected_propositions=PropositionSet.from_iterable([
+            AtomicProposition(family="metric_sign", subject_id=block.id, predicate="row_delta", value=1),
+        ]),
     )
 
     judgment = verifier.evaluate_transition(

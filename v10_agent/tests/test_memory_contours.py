@@ -187,3 +187,39 @@ def test_cross_level_memory_sanitization_and_coordinate_filtering():
 
     # 5. Tier 3: cleared
     assert len(game_mem.tier3_level_rules) == 0
+
+
+def test_brusentsov_judgment_immutability_and_sanitization():
+    """Verify that recording a judgment sanitizes syntax without violating dataclass immutability."""
+    from v10_agent.brusentsov_logic import BrusentsovJudgment, Verdict
+    from v10_agent.memory_contours import EpistemicMemory
+    from v10_agent.types import PropositionSet
+
+    ep_mem = EpistemicMemory(level_id="level_0")
+    original_expl = "Traceback (most recent call last): SyntaxError: invalid syntax in candidate"
+    judgment = BrusentsovJudgment(
+        trajectory_id="t1",
+        step_id="s1",
+        verdict=Verdict.FOLLOW,
+        expected_propositions=PropositionSet.from_iterable([]),
+        observed_propositions=PropositionSet.from_iterable([]),
+        explanation=original_expl,
+    )
+
+    ep_mem.record_judgment(judgment)
+    # Stored judgment explanation is sanitized
+    assert len(ep_mem.judgments) == 1
+    assert "[REDACTED SYNTAX]" in ep_mem.judgments[0].explanation
+    assert "Traceback" not in ep_mem.judgments[0].explanation
+
+
+def test_step_id_signatures_preserved_in_failed_trajectories():
+    """Verify that legitimate step IDs starting with 's' (e.g. 's1') are not discarded."""
+    from v10_agent.memory_contours import EpistemicMemory
+
+    ep_mem = EpistemicMemory(level_id="level_0")
+    ep_mem.sever_branch("s1")
+    assert ("s1",) in ep_mem.failed_completed_trajectories
+    ep_mem.sever_branch("step_42")
+    assert ("step_42",) in ep_mem.failed_completed_trajectories
+

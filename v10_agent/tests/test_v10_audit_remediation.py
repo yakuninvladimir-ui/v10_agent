@@ -158,7 +158,7 @@ def test_tier3_confirmed_motion_zero_delta_overrides_low_track_confidence():
         track_confidence_threshold=0.8,
     )
     verifier = LayeredVerifier(cfg)
-    grid = [[0, 2, 0], [0, 0, 0]]
+    grid = [[0, 0, 0], [0, 0, 0], [0, 2, 0], [0, 0, 0], [0, 0, 0]]
     snap = extract_arga_snapshot(grid)
     pset = build_planning_set(snap, ["ACTION1"], tracker=verifier.tracker)
 

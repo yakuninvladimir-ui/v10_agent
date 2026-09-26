@@ -157,7 +157,8 @@ def action2(api):
     advisor.set_response("coder", f"```python\n{valid_py}\n```\n```json\n{json.dumps(manifest)}\n```")
     advisor.set_response("solver", f"```json\n{json.dumps(traj_pkg)}\n```")
 
-    config = V10Config(llm_advisor_backend="fake")
+    # Primitive probing is on in production; this test targets sequential candidate execution.
+    config = V10Config(llm_advisor_backend="fake", enable_primitive_probing=False)
     session = GameSession(config, advisor)
 
     grid = [[0, 0, 0], [0, 1, 0], [0, 0, 0]]

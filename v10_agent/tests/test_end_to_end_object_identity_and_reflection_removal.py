@@ -88,7 +88,8 @@ def test_prompt_builders_object_hierarchy():
 
 def test_no_failure_reflection_during_session_replanning():
     """Verify GameSession does NOT trigger reflect_and_revise_on_failure during replan after candidate failure."""
-    config = V10Config(llm_advisor_backend="fake")
+    # Primitive probing is on in production; this test targets session replanning.
+    config = V10Config(llm_advisor_backend="fake", enable_primitive_probing=False)
     advisor = MockLLMAdvisor()
     session = GameSession(config=config, advisor=advisor)
 

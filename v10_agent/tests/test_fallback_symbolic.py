@@ -41,6 +41,8 @@ def test_coder_exhaustion_forces_symbolic_fallback():
         max_coder_retries_per_level=1,
         abort_on_dsl_exhaustion=False,
         coder_exhaustion_forces_fallback=True,
+        # Primitive probing is on in production; this test targets fallback engagement.
+        enable_primitive_probing=False,
     )
     session = GameSession(config, advisor)
 
@@ -62,6 +64,8 @@ def test_coder_exhaustion_clean_abort_in_strict_mode():
         llm_advisor_backend="fake",
         max_coder_retries_per_level=1,
         abort_on_dsl_exhaustion=True,
+        # Primitive probing is on in production; this test targets strict abort on exhaustion.
+        enable_primitive_probing=False,
     )
     session = GameSession(config, advisor)
 
