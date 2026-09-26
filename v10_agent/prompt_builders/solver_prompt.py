@@ -27,7 +27,7 @@ ENVIRONMENT & ACTION SPACE:
 - Coordinate convention: strictly Cartesian. x is horizontal (column, 0 <= x < width), y is vertical (row, 0 <= y < height).
 - Action space:
   * Discrete actions: action1, action2, action3, action4, action5.
-  * Coordinate action: action6(x=col, y=row) — coordinates are 0-indexed in the active cropped workspace (outer 1px system frame is already removed).
+  * Spatial actions: If this game supports click/spatial actions (ACTION6), call click(target=ALIAS) or action6(target=ALIAS) — automatically clicks the exact centroid of the designated object (e.g. click(target=C)). If targeting raw empty grid cells, you may specify action6(x=col, y=row). Prefer click(target=ALIAS) whenever interacting with objects. If ACTION6 is NOT available in this game's manifest, do NOT propose click() or action6() calls; use ONLY the discrete actions listed in the DSL MANIFEST.
 
 CORE PRINCIPLES:
 1. Use only the provided action names and their real parameters.
@@ -58,9 +58,12 @@ An invariant is a claim about what stays stable across levels of THIS game (phys
 EXECUTION LOOP FACTS (interface, not hints):
 - Candidates run action-by-action on the live environment.
 - After each action the judge compares observed frame change with EXPECT clauses:
-  * A physically contradicted EXPECT terminates the candidate (verdict NULL).
-  * A step with no EXPECT, or with an EXPECT neither confirmed nor contradicted, is weakly certified (verdict FOLLOW or OMIT): execution continues.
-  * Confirmed EXPECT strongly verifies step (Brusentsov follow xy -> FOLLOW).
+  * Physically contradicted EXPECT -> candidate terminated (verdict NULL).
+  * Empty EXPECT (len==0) -> verdict IRRELEVANT/OMIT, step advances neutrally (Brusentsov x'y').
+  * Non-empty EXPECT confirmed -> verdict FOLLOW, step advances (Brusentsov xy).
+  * Non-empty EXPECT unverified but not contradicted -> verdict OMIT (advancing steps yield verdict FOLLOW or OMIT depending on clause outcome).
+- CRITICAL: You MUST attach EXPECT clauses to steps where you genuinely predict observable changes.
+  Empty EXPECT provides ZERO confirmation and wastes planning signal.
 
 EXPECT GRAMMAR (the judge understands exactly these forms):
   moved(ALIAS, dy, dx)         centroid displacement in cells (e.g. moved(A, 0, 1))
@@ -77,12 +80,13 @@ Structure your response strictly using these XML tags:
 Free-form reasoning and thinking: what this level is; OBSERVED vs INFERRED vs GUESSED; visible objects, target colors, hazard colors; differential analysis of failed attempt grid diffs.
 </analysis>
 
-<subgoals>
-Decompose your plan into ordered milestones:
-- Subgoal 1: [immediate milestone, e.g. navigate around obstacle to position X]
-- Subgoal 2: [subsequent milestone, e.g. align with target]
-- Subgoal 3: [win condition milestone, e.g. reach target color]
-</subgoals>
+<waypoints>
+Decompose your plan into ordered strategic waypoints. The symbolic A* simulator will automatically expand them into exact, collision-free action sequences with precise EXPECT clauses:
+- WAYPOINT: NAVIGATE_TO(subject=ALIAS, target=ALIAS)
+- WAYPOINT: COLLECT_TARGET(subject=ALIAS, target_color=C)
+- WAYPOINT: PUSH_OBJECT(actor=ALIAS, pushed=ALIAS, destination=ALIAS)
+- WAYPOINT: ACTIVATE_TRIGGER(subject=ALIAS, trigger=ALIAS)
+</waypoints>
 
 <invariant_analysis>
 relied:    for each candidate, the accumulated invariants/exemplars it depends on
@@ -213,23 +217,54 @@ def build_solver_prompts(
             clean_eff = re.sub(r"\b[A-Z]\s*\(\[ACTOR\]\)", "[ACTOR]", clean_eff)
             tier1_lines.append(f"- {act}: {clean_eff}")
 
+        # Integrate and rank empirical invariants from CoreInvariantRegistry
+        if hasattr(game_memory, "invariant_registry") and game_memory.invariant_registry.invariants:
+            registry = game_memory.invariant_registry
+            core_laws = registry.get_core_game_laws()
+            domain_invs = [i for i in registry.invariants if i.scope == "DOMAIN_PATTERN" and i.is_active]
+            level_invs = [i for i in registry.invariants if i.scope == "LEVEL_SPECIFIC" and i.is_active]
+
+            for i in core_laws[:7]:
+                desc = f"- [CORE_LAW] {i.abstract_description} (confirmed on {len(i.confirmed_on_levels)} levels, conf={i.confidence:.2f})"
+                if not any(i.abstract_description in l for l in tier1_lines):
+                    tier1_lines.append(desc)
+
+            for i in domain_invs[:7]:
+                desc = f"- [{i.invariant_type}] {i.abstract_description} (conf={i.confidence:.2f})"
+                if not any(i.abstract_description in l for l in tier2_lines):
+                    tier2_lines.append(desc)
+
+            for i in level_invs[:5]:
+                desc = f"- [{i.invariant_type}] {i.abstract_description} (conf={i.confidence:.2f})"
+                if not any(i.abstract_description in l for l in tier3_lines):
+                    tier3_lines.append(desc)
+
+            for i in registry.invariants:
+                if i.times_falsified > 0:
+                    falsified_desc = f"- [{i.invariant_type}] {i.abstract_description} (falsified {i.times_falsified}x on levels {i.falsified_on_levels})"
+                    if not any(i.abstract_description in l for l in falsified_lines):
+                        falsified_lines.append(falsified_desc)
+
         for inv in getattr(game_memory, "structured_invariants", []):
+            conf = getattr(inv, "confidence", 0.5)
+            if conf <= 0.0:
+                continue
             status = getattr(inv, "ternary_status", None)
             desc = inv.description
-            conf = getattr(inv, "confidence", 0.5)
             lvl_count = len(getattr(inv, "confirmed_on_levels", []))
             provenance = f" (conf={conf:.1f}, confirmed_levels={lvl_count})"
             # Skip kinematic invariants containing raw local object aliases (actions are defined in DSL)
             if inv.invariant_type == "kinematics" and any(k in desc.lower() for k in ("moved", "obj_", "compound with children")):
                 continue
             if status == Ternary.FALSE:
-                falsified_lines.append(f"- [{inv.invariant_type}] {desc}")
+                if not any(desc in l for l in falsified_lines):
+                    falsified_lines.append(f"- [{inv.invariant_type}] {desc}")
             elif status == Ternary.TRUE:
                 if inv.tier == 1 and not any(desc in l for l in tier1_lines):
                     tier1_lines.append(f"- [{inv.invariant_type}] {desc}{provenance}")
-                elif inv.tier == 2:
+                elif inv.tier == 2 and not any(desc in l for l in tier2_lines):
                     tier2_lines.append(f"- [{inv.invariant_type}] {desc}{provenance}")
-                elif inv.tier >= 3:
+                elif inv.tier >= 3 and not any(desc in l for l in tier3_lines):
                     tier3_lines.append(f"- [{inv.invariant_type}] {desc}{provenance}")
 
         unconfirmed = getattr(game_memory, "unconfirmed_actions", {})
@@ -269,6 +304,26 @@ def build_solver_prompts(
         if doc:
             manifest_lines.append(f'  """[HYPOTHESIS]: {doc}"""')
     dsl_manifest_text = "\n".join(manifest_lines) if manifest_lines else "none"
+
+    has_click = False
+    if planning_set and hasattr(planning_set, "allowed_action_ids") and planning_set.allowed_action_ids:
+        has_click = "ACTION6" in planning_set.allowed_action_ids
+    elif env_spec and "available_actions" in env_spec and env_spec["available_actions"]:
+        has_click = "ACTION6" in env_spec["available_actions"]
+    if not has_click and manifest and "functions" in manifest:
+        has_click = any("action6" in fn.get("name", "").lower() or "click" in fn.get("name", "").lower() for fn in manifest["functions"])
+
+    if has_click:
+        coordinate_guidance = (
+            "All coordinate actions strictly follow Cartesian convention: action6(x=col, y=row) where x is column (0 <= x < width) and y is row (0 <= y < height). "
+            "Bounding boxes in the evidence log declare x cols and y rows (inclusive). Prefer click(target=ALIAS) or action6(target=ALIAS) to target objects directly by alias."
+        )
+    else:
+        coordinate_guidance = (
+            "ACTION SPACE NOTICE: This level supports DISCRETE BUTTON ACTIONS ONLY (as listed in DSL MANIFEST above). "
+            "Spatial click action (ACTION6/click) is NOT available in this game. "
+            "DO NOT propose click() or action6() calls — propose only the discrete button actions."
+        )
 
     # 6.5 EMPIRICAL PROBE DYNAMICS & ACTION AFFORDANCES (from Explorer Phase 2)
     explorer_lines = []
@@ -387,6 +442,45 @@ def build_solver_prompts(
     eff_level = level_index if level_index is not None else (getattr(game_memory, "completed_levels", 0) if game_memory else 0)
     eff_completed = getattr(game_memory, "completed_levels", 0) if game_memory else 0
 
+    # 7.7 CURRICULUM DELTA (Level transition deltas and persistent core laws)
+    curriculum_delta_text = ""
+    if game_memory is not None and hasattr(game_memory, "invariant_registry"):
+        registry = game_memory.invariant_registry
+        prev_registry = getattr(game_memory, "previous_level_registry", None)
+        if prev_registry is not None:
+            new_confirmed = [
+                i for i in registry.invariants
+                if len(i.confirmed_on_levels) > 0 and max(i.confirmed_on_levels) == eff_level
+            ]
+            newly_falsified = [
+                i for i in registry.invariants
+                if len(i.falsified_on_levels) > 0 and max(i.falsified_on_levels) == eff_level
+            ]
+            core_laws = registry.get_core_game_laws()
+            min_lvls = min((len(i.confirmed_on_levels) for i in core_laws), default=1)
+
+            nc_str = "\n".join(f"  - {i.abstract_description} (now {i.confidence:.2f})" for i in new_confirmed[:5]) if new_confirmed else "  (none)"
+            nf_str = "\n".join(f"  - {i.abstract_description} (falsified on levels {i.falsified_on_levels})" for i in newly_falsified[:5]) if newly_falsified else "  (none)"
+            cl_str = "\n".join(f"  - {i.abstract_description}" for i in core_laws[:5]) if core_laws else "  (none)"
+
+            prog_lines = ""
+            if hasattr(game_memory, "summarize_progression"):
+                p_sum = game_memory.summarize_progression()
+                if p_sum and p_sum != "none":
+                    prog_lines = f"\nPROGRESSION HISTORY:\n{p_sum}\n"
+
+            curriculum_delta_text = f"""<curriculum_delta>
+CURRICULUM DELTA (Level {max(0, eff_level - 1)} -> {eff_level}):
+NEWLY CONFIRMED (gained confidence this level):
+{nc_str}
+NEWLY FALSIFIED (lost confidence this level - reconsider hypotheses):
+{nf_str}
+PERSISTENT CORE LAWS (confirmed on {min_lvls}+ levels):
+{cl_str}{prog_lines}
+TASK: Prefer candidates that EXPLAIN newly confirmed laws and AVOID newly falsified ones.
+When proposing new invariants, abstract away level-specific details - formulate as domain-general laws.
+</curriculum_delta>"""
+
     image_header = (
         "solver_raw_frame.png is the exact same frame as solver_annotated_frame.png, but without object annotations. "
         "The annotated frame's labels are the aliases used in the object index below.\n\n"
@@ -425,13 +519,13 @@ NOTE: the DSL manifest docstring is the coder's paraphrase of Tier 1; on any dis
 <grounded_game_memory>
 {grounded_memory_text if grounded_memory_text else "No grounded memory yet (no victories/defeats recorded)."}
 </grounded_game_memory>
-
+{f'\n{curriculum_delta_text}\n' if curriculum_delta_text else ''}
 EMPIRICAL EVIDENCE LOG (this level, chronological; hash->hash proves whether the frame changed):
 {evidence_log_text}
 
 DSL MANIFEST (signatures = interface; docstrings = HYPOTHESIS):
 {dsl_manifest_text}
-All coordinate actions strictly follow Cartesian convention: action6(x=col, y=row) where x is column (0 <= x < width) and y is row (0 <= y < height). Bounding boxes in the evidence log declare x cols and y rows (inclusive).
+{coordinate_guidance}
 
 FAILED CANDIDATES THIS LEVEL (with death step, physical before/after grid diffs, and verdicts; do not repeat them):
 {failed_candidates_text}

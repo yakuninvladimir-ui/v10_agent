@@ -164,7 +164,7 @@ CRITICAL CONSTRAINTS:
 
 def build_coordinate_hypothesis_prompt(
     planning_set: PlanningSet,
-    num_hypotheses: int = 5,
+    num_hypotheses: int = 2,
     prior_tested_coords: Sequence[tuple[int, int]] | None = None,
     has_image: bool = True,
 ) -> tuple[str, str]:
@@ -270,14 +270,18 @@ You are an empirical kinematic analyzer for a 2D grid puzzle.
 ACTIVE PROBING IS COMPLETE. Your task is to describe strictly what physically mutated or moved and what remained static during the probes.
 
 CRITICAL CONSTRAINTS:
-1. NO HYPOTHESIS PROPOSALS: Probing is already finished. Do NOT propose click coordinates [x, y]. Do NOT output coordinate_hypotheses.
+1. EMPIRICAL FOCUS: Probing for this phase is complete. Focus on synthesizing observed probe deltas. Do NOT propose click coordinates [x, y].
 2. NO ROLES OR SPECULATION: Do NOT invent roles, labels, or game interpretations (NO 'player', 'actor', 'mirror', 'goal', 'target', 'axis'). Let the solver decide game semantics.
 3. ACTION AFFORDANCES & OBSERVATION:
-   - For each confirmed action, classify its observable effect into one of 4 invariant classes:
+   - For each action, classify its observable effect into one of the invariant classes:
      * KINEMATIC: spatial displacement (dy, dx) of rigid entities.
      * PALETTE_TRANSITION: in-place color change or tile state transition.
      * TOPOLOGY_MUTATION: entity appearance, disappearance, attachment, or detachment.
      * MODAL_SELECTION: active entity switch, focus indicator change, or mode toggle.
+     * CONDITIONAL_TRIGGER: zero visible delta on initial state or state-dependent effect requiring prerequisite setup.
+   - UNCERTAINTY & CONDITIONAL ACTIONS:
+     It is BETTER to mark an action as 'effect_class: CONDITIONAL_TRIGGER' (unconfirmed on initial frame) than to invent false effects. The two-tier action lifecycle will preserve it for contextual re-probing.
+     If probe shows zero delta with no clear cause — output 'effect_class: CONDITIONAL_TRIGGER' with empty parameters. Do NOT overgeneralize or invent unobserved effects.
    - List which object aliases remained completely static across all probes.
    - Describe purely geometric layout facts (e.g. dimensions, vertical or horizontal lines, placement of clusters).
    - STRICT EMPIRICAL EVIDENCE: Do NOT invent unobserved physical barriers, walls, locks, or containment rules. If a parent object moved together with its children in the probe log, the parent object physically MOVED (do NOT declare it static!). State ONLY what is directly evidenced in the probe log.
@@ -295,6 +299,12 @@ CRITICAL CONSTRAINTS:
       "effect_class": "MODAL_SELECTION",
       "parameters": {"active_entity_switched": true, "cycle_entities": ["axis", "shape"]},
       "coordination_notes": "toggles active entity focus"
+    },
+    {
+      "action_id": "ACTION6",
+      "effect_class": "CONDITIONAL_TRIGGER",
+      "parameters": {},
+      "coordination_notes": "unconfirmed on initial frame"
     }
   ],
   "static_objects": [
@@ -385,4 +395,102 @@ State purely which visual objects moved by what (dy, dx), whether they moved syn
 Output ONLY the JSON object.
 """
     return EXPLORER_LEVEL_SYNTHESIS_SYSTEM_PROMPT, user_text
+
+
+PRIMITIVE_RESEARCH_SYSTEM_PROMPT = """\
+You are an empirical primitive action researcher for a 2D grid puzzle.
+More than 40% of available actions produced ZERO visible difference on the pristine grid during initial probing.
+Your task is to analyze the visual layout from the raw frame image (explorer_raw_frame.png) and annotated frame (explorer_annotated_frame.png) to deduce WHY these actions are inactive and formulate targeted probe sequences to activate them.
+
+RULES:
+1. Ground your hypotheses strictly in visible entities (e.g. player token, container, walls, switches, indicators).
+2. DO NOT guess winning conditions or end-game goals. Focus strictly on action physics and prerequisite conditions.
+3. Categorize each inactive action:
+   - CONDITIONAL_CONTACT: Action moves an entity, but the entity is currently blocked against a wall/boundary in that direction until moved elsewhere.
+   - MODAL_SWITCH: Action switches internal mode, active character, or toggles control, requiring preceding movement or toggling an indicator.
+   - TOOL_OR_INTERACTION: Action requires contact with a specific interactive object (key, door, lever, block).
+4. Propose targeted probe sequences of length 2 to 3 combining confirmed active actions with inactive actions to test these prerequisites.
+5. Output format: ```json ... ``` with schema:
+{
+  "inactive_action_hypotheses": [
+    {
+      "action_id": "ACTION1",
+      "suspected_category": "CONDITIONAL_CONTACT",
+      "rationale": "Entity may be at the top boundary and blocked from moving UP until moved DOWN first",
+      "recommended_probe_chain": ["ACTION2", "ACTION1"]
+    }
+  ],
+  "targeted_probe_sequences": [
+    ["ACTION2", "ACTION1"],
+    ["ACTION2", "ACTION3"]
+  ]
+}
+"""
+
+
+def build_primitive_research_prompt(
+    planning_set: PlanningSet,
+    confirmed_actions: Any | None = None,
+    unconfirmed_actions: Any | None = None,
+    probe_history: Sequence[ProbeRecord] | None = None,
+    has_image: bool = True,
+) -> tuple[str, str]:
+    """Construct (system_prompt, user_prompt) for dedicated primitive research call."""
+    grid_h, grid_w = planning_set.grid_dims
+    grid_hash = planning_set.grid_hash if planning_set.grid_hash else "unknown"
+
+    sorted_objs = sorted(planning_set.objects, key=lambda o: o.area, reverse=True)[:20]
+    obj_lines = []
+    for obj in sorted_objs:
+        alias = planning_set.object_real_to_alias.get(obj.id, obj.id)
+        b = obj.bbox
+        shape = getattr(obj, "shape_type", "entity")
+        obj_lines.append(f"- {alias} ({obj.id}): c={obj.color}, bbox=[{b.min_row},{b.min_col},{b.max_row},{b.max_col}], area={obj.area}, {shape}")
+    object_index_text = "\n".join(obj_lines) if obj_lines else "none"
+
+    confirmed_lines = []
+    for act_id, eff in sorted((confirmed_actions or {}).items()):
+        confirmed_lines.append(f"- {act_id}: {eff}")
+    confirmed_text = "\n".join(confirmed_lines) if confirmed_lines else "none"
+
+    unconfirmed_lines = []
+    for act_id, note in sorted((unconfirmed_actions or {}).items()):
+        unconfirmed_lines.append(f"- {act_id}: inactive / {note}")
+    unconfirmed_text = "\n".join(unconfirmed_lines) if unconfirmed_lines else "none"
+
+    probe_lines = []
+    for idx, p in enumerate((probe_history or [])[-10:], 1):
+        data_str = _format_probe_data(p.action_id, p.action_data)
+        probe_lines.append(f"#{idx} {p.action_id}{data_str} -> {p.observed_effect}")
+    probe_log_text = "\n".join(probe_lines) if probe_lines else "none"
+
+    image_note = (
+        "explorer_raw_frame.png is the pristine initial frame without annotations. "
+        "explorer_annotated_frame.png shows object bounding boxes and alias letters.\n\n"
+        if has_image
+        else ""
+    )
+
+    user_text = f"""\
+{image_note}GRID DIMENSIONS: {grid_h}x{grid_w}, initial frame hash: {grid_hash}
+
+OBJECT INDEX:
+{object_index_text}
+
+CONFIRMED ACTIVE ACTIONS:
+{confirmed_text}
+
+UNCONFIRMED / ZERO-EFFECT ACTIONS:
+{unconfirmed_text}
+
+INITIAL PROBE LOG:
+{probe_log_text}
+
+Analyze the raw visual scene to identify why the unconfirmed actions showed no visible delta.
+Are any entities resting against boundaries, or is there an indicator or mode switch mechanism?
+Propose targeted probe sequences (length 2-3) to activate the unconfirmed actions.
+Output ONLY the JSON object.
+"""
+    return PRIMITIVE_RESEARCH_SYSTEM_PROMPT, user_text
+
 

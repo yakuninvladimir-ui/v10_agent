@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any, Sequence
 
-from v10_agent.memory_contours import SyntaxErrorRecord
+from v10_agent.memory_contours import FORBIDDEN_GOAL_PATTERNS_IN_CODER, SyntaxErrorRecord
 
 CODER_SYSTEM_PROMPT = """\
 You are a Python DSL (Domain Specific Language) generator.
@@ -23,7 +23,7 @@ CONSTRAINTS:
 - You MUST implement functions ONLY for the confirmed effective actions listed in the available actions / RESEARCHED ACTION MECHANICS. Do NOT generate functions for unconfirmed or zero-effect actions.
 - Do NOT omit, rename, or delete existing confirmed actions. Augment the DSL with newly discovered actions (e.g. adding action5 or action6).
 - Function names must be canonical: `action1`, `action2`, ..., `action6`.
-- Coordinate actions (e.g., ACTION6) must accept `x: int = 0, y: int = 0` where x is the column (horizontal) and y is the row (vertical).
+- Coordinate and click actions (e.g., ACTION6) must accept target: str = "", x: int | None = None, y: int | None = None where x is the column (horizontal) and y is the row (vertical). If target is provided, call api.click_object(target, x=x, y=y). Otherwise call api.declare_environment_action(action_id='ACTION6', data={'x': int(x or 0), 'y': int(y or 0)}). Also define click(api, target='', x=None, y=None) delegating to action6.
 
 OUTPUT FORMAT:
 Provide a single ```python ... ``` block containing the DSL module.
@@ -35,6 +35,11 @@ The SandboxAPI injected into your functions exposes:
   api.declare_environment_action(
       action_id: str,
       data: dict | None = None,
+  ) -> EffectDeclaration
+  api.click_object(
+      target: str,
+      x: int | None = None,
+      y: int | None = None,
   ) -> EffectDeclaration
 """
 
@@ -55,7 +60,13 @@ def build_coder_prompts(
     if "invariants" in compact_spec and isinstance(compact_spec["invariants"], list):
         compact_spec["invariants"] = [
             inv for inv in compact_spec["invariants"]
-            if isinstance(inv, str) and not any(kw in inv.lower() for kw in ("goal", "win", "target", "curriculum"))
+            if isinstance(inv, str) and not any(p.search(inv) for p in FORBIDDEN_GOAL_PATTERNS_IN_CODER)
+        ]
+
+    if "curriculum_history" in compact_spec and isinstance(compact_spec["curriculum_history"], list):
+        compact_spec["curriculum_history"] = [
+            h for h in compact_spec["curriculum_history"]
+            if not any(p.search(str(h)) for p in FORBIDDEN_GOAL_PATTERNS_IN_CODER)
         ]
 
     # Resolve confirmed effective available actions from env_spec, game_memory, or planning_set
@@ -92,6 +103,14 @@ def build_coder_prompts(
             act_up = str(act).upper()
             if act_up not in ("RESET", "ACTION7") and act_up not in available_actions:
                 available_actions.append(act_up)
+
+    # Strictly filter by planning_set.allowed_action_ids and exclude unconfirmed actions
+    if planning_set is not None and getattr(planning_set, "allowed_action_ids", None):
+        allowed_set = {str(a).upper() for a in planning_set.allowed_action_ids}
+        available_actions = [a for a in available_actions if a in allowed_set]
+    if game_memory is not None and hasattr(game_memory, "unconfirmed_actions"):
+        unconfirmed = {str(a).upper() for a in game_memory.unconfirmed_actions}
+        available_actions = [a for a in available_actions if a not in unconfirmed]
 
     image_note = (
         "coder_raw_frame.png is the exact same frame as coder_annotated_frame.png, but without object annotations.\n\n"
