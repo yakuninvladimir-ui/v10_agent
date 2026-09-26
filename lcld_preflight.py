@@ -28,6 +28,7 @@ def run_preflight() -> None:
         "v10_agent/observe.py",
         "v10_agent/game_adapter.py",
         "v10_agent/action_adapter.py",
+        "v10_agent/action_semantics.py",
         "v10_agent/arga_lite.py",
         "v10_agent/planning_set.py",
         "v10_agent/frame_media.py",
@@ -116,7 +117,7 @@ def run_preflight() -> None:
 
     # 5. Verify GAME_OVER contract (clean abandonment when resets disabled or exhausted; RESET when enabled)
     game_over_obs = {"state": "GAME_OVER", "grid": [[0]]}
-    if not cfg.get("reset_on_game_over", True) or int(cfg.get("max_game_over_resets_per_game", 5)) <= 0:
+    if not cfg.get("reset_on_game_over", True) or int(cfg.get("max_game_over_resets_per_level", 5)) <= 0:
         try:
             agent.reset_after_game_over(game_over_obs)
             raise AssertionError("Expected RuntimeError when GAME_OVER reset is disabled")

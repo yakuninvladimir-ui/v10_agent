@@ -52,9 +52,9 @@ This document provides the complete, authoritative implementation specification 
 12. **Generalized A* Search over Feature Differentials**: Fallback engine operating over centroid displacement, bounding box deltas, color match ratio, and object count deltas (`v10_agent/virtual_sandbox.py`), with perimeter coordinate clamping.
 13. **Multi-Trajectory Candidate Pool Traversal via Clean RESET**: Solver plans complete multi-step trajectory packages upfront (up to 4 candidate paths per package); execution is handled deterministically step-by-step by `SymbolicTrajectoryExecutor` with clean environmental resets (`RESET` $\to S_0$) between candidates under a hard limit of 5 attempts per level.
 14. **Pristine Frame Invariant Discovery**: Cross-level invariant re-evaluation is deferred to the pristine initial frame of the new level ($S_0$, `level_initial_grid is None`).
-15. **VisibleCycle Loop Recovery**: Fast row-level MD5 hashing detecting repeating state-action orbits (periods 1..8, $\ge 4$ repetitions, $\ge 24$ actions) with automatic candidate severance and clean reset (`v10_agent/cycle_detector.py`).
+15. **VisibleCycle Loop Recovery**: Fast row-level MD5 hashing detecting repeating state-action orbits (periods 1..8, $\ge 2$ repetitions, $\ge 8$ actions) with automatic candidate severance and clean reset (`v10_agent/cycle_detector.py`).
 16. **Time Budgeting & Deadline Safety**: Dynamic time tracking with a 15-second reserve; automatic LLM request abort upon reserve breach; socket timeout clamping; and graceful competition child exit (`v10_agent/config.py`, `v10_agent/llm_advisor.py`, `lcld_competition_child.py`).
-17. **vLLM Serving Infrastructure**: Strictly validated production flags (`--no-enable-prefix-caching`, `--enable-chunked-prefill`, `--async-scheduling`, `--no-enable-log-requests`, `--disable-uvicorn-access-log`), non-blocking watchdog (`vllm_server_watchdog.py`), and sub-millisecond socket teardown (`serving_teardown.py`).
+17. **vLLM Serving Infrastructure**: Strictly validated production flags (`--enable-prefix-caching`, `--enable-chunked-prefill`, `--async-scheduling`, `--no-enable-log-requests`, `--disable-uvicorn-access-log`), non-blocking watchdog (`vllm_server_watchdog.py`), and sub-millisecond socket teardown (`serving_teardown.py`).
 18. **AST Code Guardian & Quality Assurance Stack**:
     - `tools/ast_code_guardian.py`: Static AST visitor verifying abstract purity, prohibition of benchmark puzzle IDs, prohibition of heuristic tokens (`piece_steps`, `axis_steps`), and absence of geometric hardcoding.
     - Property-Based Testing with Hypothesis: `test_pbt_brusentsov_axioms.py`, `test_pbt_brusentsov_severance.py`, `test_pbt_scale_invariance.py`, `test_pbt_color_permutation.py`, `test_pbt_coordinate_isomorphism.py`.
@@ -190,7 +190,7 @@ All runtime options, budgets, server flags, and deadline thresholds are consolid
 @dataclass
 class V10Config:
     # LLM Backend & Model Configuration
-    llm_advisor_backend: str = "vllm"                      # "vllm" | "fake" | "dashscope" | "ollama"
+    llm_advisor_backend: str = "vllm"                      # "vllm" | "fake" | "ollama" | "llama_cli"
     model_path: str = "Qwen/Qwen3.8-27B"
     qwen_model_path: str = "Qwen/Qwen3.8-27B"
     vllm_base_url: str = "http://127.0.0.1:1234/v1"
@@ -205,10 +205,19 @@ class V10Config:
     qwen_max_output_tokens: int = 32000
     temperature: float = 1.0
     qwen_temperature: float = 1.0
+    solver_temperature: float = 0.7
+    coder_temperature: float = 0.5
+    explorer_temperature: float = 0.9
     top_p: float = 0.95
     qwen_top_p: float = 0.95
     top_k: int = 20
     qwen_top_k: int = 20
+    min_p: float = 0.0
+    qwen_min_p: float = 0.0
+    presence_penalty: float = 0.0
+    qwen_presence_penalty: float = 0.0
+    repeat_penalty: float = 1.0
+    qwen_repeat_penalty: float = 1.0
     seed: int = 42
     qwen_seed: int = 42
     timeout_seconds: int = 700
@@ -220,9 +229,20 @@ class V10Config:
     coder_multimodal_enabled: bool = True
     enable_thinking: bool = True
     qwen_enable_thinking: bool = True
-    reasoning_strength: str = "xhigh"
+    reasoning_strength: str = "xhigh"                       # "low" | "medium" | "high" | "xhigh"
     reasoning_budget_tokens: int = 32000
     qwen_reasoning_budget_tokens: int = 32000
+    solver_reasoning_budget_tokens: int = 24576
+    coder_reasoning_budget_tokens: int = 8192
+    explorer_reasoning_budget_tokens: int = 8192
+    solver_max_output_tokens: int = 8192
+    coder_max_output_tokens: int = 8192
+    explorer_max_output_tokens: int = 2048
+
+    # Trajectory & Solver Package Limits
+    max_candidates_per_solver_package: int = 4
+    max_steps_per_candidate: int = 30
+    execute_one_step_at_a_time: bool = True
 
     # Multi-Token Prediction (MTP=3) Speculative Decoding
     vllm_mtp_enabled: bool = True
@@ -233,7 +253,7 @@ class V10Config:
     vllm_speculative_cli_format: str = "auto"
 
     # vLLM Server Launch Parameters (Unified Runtime)
-    vllm_enable_prefix_caching: bool = False
+    vllm_enable_prefix_caching: bool = True
     vllm_enable_chunked_prefill: bool = True
     vllm_async_scheduling: bool = True
     vllm_no_enable_log_requests: bool = True
@@ -248,20 +268,27 @@ class V10Config:
     track_confidence_threshold: float = 0.6
     occlusion_radius: int = 3
     cumulative_window: int = 3
+    track_min_area: int = 1
     enable_undecided_verdict: bool = True
     max_undecided_streak: int = 2
-    max_evidence_probes_per_level: int = 2
+    max_evidence_probes_per_level: int = 3
+    min_remaining_actions_for_probe: int = 25
+
+    # Deterministic Sandbox
+    sandbox_enabled: bool = True
+    sandbox_allowed_modules: list[str] = ["math", "typing", "dataclasses", "enum", "collections"]
+    sandbox_max_cpu_seconds: float = 10.0
+    sandbox_max_memory_mb: int = 512
 
     # Deadline Reserve & Time Budgeting
     deadline_reserve_seconds: float = 15.0
-    notebook_reserve_seconds: float = 600.0
     _deadline_time: float | None = None
 
     # VisibleCycle Loop Recovery
     enable_cycle_detector: bool = True
-    cycle_detector_min_actions: int = 24
+    cycle_detector_min_actions: int = 8
     cycle_detector_max_period: int = 8
-    cycle_detector_min_cycles: int = 4
+    cycle_detector_min_cycles: int = 2
     cycle_detector_per_level_limit: int = 2
 
     # Memory Contours & Isolation
@@ -276,26 +303,27 @@ class V10Config:
     coder_exhaustion_forces_fallback: bool = True
     solver_exhaustion_forces_fallback: bool = True
     abort_on_dsl_exhaustion: bool = False
-    max_primitive_probes_per_level: int = 30
+    max_primitive_probes_per_level: int = 16
     enable_primitive_probing: bool = True
     probe_reset_after_discrete: bool = False
 
-    # Trajectory & Solver Package Limits
-    max_candidates_per_solver_package: int = 4
-    max_steps_per_candidate: int = 30
-    execute_one_step_at_a_time: bool = True
-
     # Competition Ceilings
-    max_actions_per_game: int = 250
-    max_actions_per_level: int = 250
-    max_game_over_resets_per_game: int = 5
+    max_actions_per_game: int = 500
+    max_actions_per_level: int = 80
     max_game_over_resets_per_level: int = 5
     max_chain_attempts_per_level: int = 5
+    max_coder_retries_per_level: int = 5
+    max_solver_retries_per_level: int = 5
+    max_explorer_attempts_per_level: int = 2
+    max_explorer_probe_steps: int = 2
+    max_invariant_verification_probes: int = 3
+    max_invariant_probe_steps: int = 2
+    max_explorer_probe_actions_per_level: int = 30
     reset_on_game_over: bool = True
     game_wall_clock_limit_seconds: float = 5000.0
     competition_wall_clock_limit_seconds: float = 30600.0
-    concurrency: int = 4
-    vllm_max_num_seqs: int = 4
+    concurrency: int = 6
+    vllm_max_num_seqs: int = 6
     vllm_startup_timeout_seconds: int = 900
 ```
 

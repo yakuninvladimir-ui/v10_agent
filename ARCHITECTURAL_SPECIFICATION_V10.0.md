@@ -545,7 +545,7 @@ To overcome object ID flicker across consecutive frames, perception is stabilize
 ### 4.1 Partitioned Action Space
 
 The action space partitions strictly into:
-1. **Discrete Actions (`ACTION1..5`)**: Directional controls (`ACTION1` UP, `ACTION2` DOWN, `ACTION3` RIGHT, `ACTION4` LEFT) and entity toggle/mode switches (`ACTION5`).
+1. **Discrete Actions (`ACTION1..5`)**: Directional controls (`ACTION1` UP, `ACTION2` DOWN, `ACTION3` LEFT, `ACTION4` RIGHT) and entity toggle/mode switches (`ACTION5`).
 2. **Spatial Coordinate Actions (`ACTION6(x, y)`)**: Spatial clicks targeting specific grid cells. Probed via deterministic component centroid heuristics and Qwen coordinate proposals.
 
 ---
@@ -672,7 +672,7 @@ To safeguard the 5000-second per-game and 30600-second competition budgets:
 
 ### 6.3 vLLM Serving Architecture, Watchdog & Sub-Second Teardown
 
-- Production server flags: `--no-enable-prefix-caching`, `--enable-chunked-prefill`, `--async-scheduling`, `--no-enable-log-requests`, `--disable-uvicorn-access-log`, `--max-model-len 131072`, `--gpu-memory-utilization 0.95`.
+- Production server flags: `--enable-prefix-caching`, `--enable-chunked-prefill`, `--async-scheduling`, `--no-enable-log-requests`, `--disable-uvicorn-access-log`, `--max-model-len 131072`, `--gpu-memory-utilization 0.95`.
 - MTP=3 speculative decoding: `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'`.
 - Background Watchdog: Non-blocking daemon probing `/health` every 15s using `threading.RLock`. Automatically restarts stalled servers (up to 2 attempts).
 - Sub-millisecond Teardown: Probes socket in $< 0.05$s; if port is closed, exits in $< 1$ ms without invoking expensive shell processes.

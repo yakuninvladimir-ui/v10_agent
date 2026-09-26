@@ -266,13 +266,18 @@ def run_direct_game(
 
 def run_concurrent_arcade_games(
     arcade: Any,
-    concurrency: int = 4,
+    concurrency: int = 6,
     config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Execute games yielded by Arcade gateway concurrently up to concurrency limit."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    concurrency = max(1, int(concurrency))
+    resolved_concurrency = int(
+        (config.get("concurrency") if config else None)
+        or os.environ.get("LCLD_GAME_CONCURRENCY")
+        or concurrency
+    )
+    concurrency = max(1, resolved_concurrency)
     print(f"[Phase B] Starting concurrent gameplay coordinator (concurrency={concurrency})", flush=True)
 
     scorecard_id = None

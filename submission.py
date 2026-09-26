@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from v10_agent.action_semantics import normalize_action_id
 from v10_agent.config import config_from_env
 
 
@@ -35,7 +36,7 @@ def default_config() -> dict[str, Any]:
         "max_coder_retries": cfg.max_coder_retries_per_level,
         "max_solver_retries": cfg.max_solver_retries_per_level,
         "max_explorer_probes": cfg.max_explorer_probe_actions_per_level,
-        "max_game_over_resets_per_game": cfg.max_game_over_resets_per_game,
+        "max_game_over_resets_per_level": cfg.max_game_over_resets_per_level,
         "reset_on_game_over": cfg.reset_on_game_over,
         "enable_symbolic_fallback": cfg.enable_symbolic_fallback,
         "coder_exhaustion_forces_fallback": cfg.coder_exhaustion_forces_fallback,
@@ -47,7 +48,6 @@ def default_config() -> dict[str, Any]:
         "vllm_speculative_model": cfg.vllm_speculative_model,
         "vllm_speculative_config": cfg.vllm_speculative_config,
         "deadline_reserve_seconds": cfg.deadline_reserve_seconds,
-        "notebook_reserve_seconds": cfg.notebook_reserve_seconds,
         "enable_cycle_detector": cfg.enable_cycle_detector,
         "cycle_detector_min_actions": cfg.cycle_detector_min_actions,
         "cycle_detector_max_period": cfg.cycle_detector_max_period,
@@ -74,15 +74,4 @@ def _state_name(state: Any) -> str:
 
 def _action_name(action: Any) -> str:
     """Extract canonical uppercase string from action enum or value."""
-    if hasattr(action, "name"):
-        return str(getattr(action, "name")).split(".")[-1].upper()
-    value = getattr(action, "value", action)
-    if isinstance(value, int):
-        if value == 0:
-            return "RESET"
-        if 1 <= value <= 7:
-            return f"ACTION{value}"
-    text = str(value).split(".")[-1].strip().upper()
-    if text.isdigit():
-        return _action_name(int(text))
-    return text or "ACTION1"
+    return normalize_action_id(action) or "ACTION1"
