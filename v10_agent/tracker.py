@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from v10_agent.arga_lite import ARGALiteSnapshot, PlanningObject
 from v10_agent.config import V10Config
@@ -46,6 +46,33 @@ def mask_jaccard(
     if union == 0:
         return 1.0
     return intersection / union
+
+
+def observed_extent(
+    objects: Sequence[Any],
+    grid_dims: Any = None,
+) -> tuple[int, int]:
+    """Return the field extent in cells, measured from the objects if unreported.
+
+    The engine is free to omit the field size. Substituting a fixed default would
+    make every normalized distance depend on a fabricated geometry, so the extent
+    is instead measured: the largest row/column any observed object occupies is a
+    lower bound on the real field, and it holds for any size the competition may
+    present. A reference frame with no objects at all degrades to a unit extent,
+    which keeps cost normalization defined without inventing a size.
+    """
+    reported = tuple(grid_dims) if isinstance(grid_dims, (tuple, list)) else ()
+    height = int(reported[0]) if len(reported) > 0 else 0
+    width = int(reported[1]) if len(reported) > 1 else 0
+    if height > 0 and width > 0:
+        return height, width
+    for obj in objects:
+        bbox = getattr(obj, "bbox", None)
+        if bbox is None:
+            continue
+        height = max(height, int(getattr(bbox, "max_row", 0)) + 1)
+        width = max(width, int(getattr(bbox, "max_col", 0)) + 1)
+    return max(height, 1), max(width, 1)
 
 
 def jaccard_similarity(
@@ -180,15 +207,15 @@ class PersistentObjectTracker:
     ) -> list[TrackedObject]:
         """Update tracker state with a new ARGALite perception snapshot or list of objects."""
         self.frame_index = frame_index
-        min_area = getattr(self.config, "track_min_area", 1)
+        min_area = self.config.resolve("track_min_area")
         if hasattr(snapshot, "objects"):
-            grid_h, grid_w = snapshot.grid_dims if snapshot.grid_dims else (30, 30)
+            grid_h, grid_w = observed_extent(snapshot.objects, getattr(snapshot, "grid_dims", None))
             bg_color = getattr(snapshot, "background_color", 0)
             components: list[PlanningObject] = [
                 obj for obj in snapshot.objects if obj.area >= min_area and obj.color != bg_color
             ]
         else:
-            grid_h, grid_w = (30, 30)
+            grid_h, grid_w = observed_extent(snapshot)
             components = [obj for obj in snapshot if getattr(obj, "area", 1) >= min_area]
 
         grid_dim = max(grid_h, grid_w, 1)

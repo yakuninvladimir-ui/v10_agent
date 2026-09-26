@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from v10_agent.action_semantics import parse_referenced_action_id
 from v10_agent.types import AtomicProposition, PropositionSet
 
 if TYPE_CHECKING:
@@ -32,7 +33,11 @@ class Ternary(Enum):
         return super().__eq__(other)
 
     def __hash__(self) -> int:
-        return super().__hash__()
+        # Must agree with __eq__: Ternary.TRUE equals Verdict.FOLLOW, so both
+        # spellings of one truth value have to hash identically. Delegating to
+        # the underlying ternary integer keeps each truth value to a single
+        # bucket and lets set()/dict()/Counter arithmetic stay correct.
+        return hash(self.value)
 
 
 class EpistemicSignal(Enum):
@@ -79,7 +84,15 @@ class Verdict(Enum):
         return super().__eq__(other)
 
     def __hash__(self) -> int:
-        return super().__hash__()
+        # __eq__ identifies FOLLOW/NULL/OMIT with TRUE/FALSE/IRRELEVANT, so those
+        # three have to hash as their ternary integer - the same integer
+        # Ternary.__hash__ produces - or equal spellings would land in different
+        # buckets. UNDECIDED has no ternary counterpart and compares equal to
+        # nothing but itself, so it hashes on its own name.
+        ternary = self.ternary
+        if ternary is None:
+            return hash(self.value)
+        return hash(ternary.value)
 
 
 @dataclass(frozen=True)
@@ -99,14 +112,24 @@ class BrusentsovJudgment:
     action_dict: dict[str, Any] = field(default_factory=dict)
     is_effective: bool = False
 
+    def __post_init__(self) -> None:
+        # Two spellings of one judgement (Verdict.FOLLOW and Ternary.TRUE)
+        # compare equal, so the stored value is normalised to the Verdict form.
+        # Otherwise to_dict() would emit "FOLLOW" or "TRUE" for the same
+        # logical result and any consumer keyed on that token would disagree
+        # with == .
+        if isinstance(self.verdict, Ternary):
+            object.__setattr__(self, "verdict", Verdict.from_ternary(self.verdict))
+
     @property
     def ternary_verdict(self) -> Verdict | Ternary:
         """Compatibility property matching Solver epistemic prompt expectations."""
         return self.verdict
 
     def to_dict(self) -> dict[str, Any]:
-        v_name = self.verdict.name if hasattr(self.verdict, "name") else str(self.verdict)
-        v_val = self.verdict.value if hasattr(self.verdict, "value") else str(self.verdict)
+        verdict = self.verdict
+        v_name = verdict.name if hasattr(verdict, "name") else str(verdict)
+        v_val = verdict.value if hasattr(verdict, "value") else str(verdict)
         d: dict[str, Any] = {
             "trajectory_id": self.trajectory_id,
             "step_id": self.step_id,
@@ -149,6 +172,11 @@ def _unpack_dy_dx(v: Any) -> tuple[int, int] | None:
     return None
 
 
+def _sign(x: int | float) -> int:
+    """Return sign of a number (-1, 0, or 1)."""
+    return (x > 0) - (x < 0)
+
+
 def contradicts(expected: AtomicProposition, observed: AtomicProposition) -> bool:
     """Check if an observed proposition physically contradicts an expected proposition (Carrollian nullity xy'_0)."""
     # 0. Subject matching: propositions regarding different distinct entities cannot directly contradict each other
@@ -185,15 +213,18 @@ def contradicts(expected: AtomicProposition, observed: AtomicProposition) -> boo
         if exp_vec is not None and obs_vec is not None:
             exp_dy, exp_dx = exp_vec
             obs_dy, obs_dx = obs_vec
-            # 1. Stagnation: expected motion on an axis, but observed stationary (0)
-            if (exp_dy != 0 and obs_dy == 0) or (exp_dx != 0 and obs_dx == 0):
-                return True
-            # 2. Unintended Mutation: expected 0 on an axis, but observed motion
-            if (exp_dy == 0 and obs_dy != 0) or (exp_dx == 0 and obs_dx != 0):
-                return True
-            # 3. Direction Inversion
-            if (exp_dy * obs_dy < 0) or (exp_dx * obs_dx < 0):
-                return True
+            # Case 1: Both zero in expected -> zero motion expected
+            if exp_dy == 0 and exp_dx == 0:
+                if obs_dy != 0 or obs_dx != 0:
+                    return True
+            else:
+                # Case 2: Active vector -> check ONLY non-zero components of expected vector!
+                # Zero components in expected mean axis unconstrained by this action.
+                if exp_dy != 0 and _sign(exp_dy) != _sign(obs_dy):
+                    return True
+                if exp_dx != 0 and _sign(exp_dx) != _sign(obs_dx):
+                    return True
+                return False
 
     # 3b. Invariant violation: expected unchanged / stationary, but observed motion
     if subj_matches and exp_p in ("unchanged", "stationary"):
@@ -217,14 +248,8 @@ def contradicts(expected: AtomicProposition, observed: AtomicProposition) -> boo
                 try:
                     exp_sign = int(expected.value)
                     obs_sign = int(observed.value)
-                    # 1. Stagnation: expected motion, observed 0
-                    if exp_sign != 0 and obs_sign == 0:
-                        return True
-                    # 2. Unintended mutation: expected 0, observed motion
-                    if exp_sign == 0 and obs_sign != 0:
-                        return True
-                    # 3. Direction inversion
-                    if exp_sign * obs_sign < 0:
+                    # Check only non-zero expected scalar; exp_sign==0 does not forbid movement
+                    if exp_sign != 0 and _sign(exp_sign) != _sign(obs_sign):
                         return True
                 except (ValueError, TypeError):
                     pass
@@ -237,14 +262,20 @@ def contradicts(expected: AtomicProposition, observed: AtomicProposition) -> boo
             if obs_p in ("row_delta", "delta_r", "dy"):
                 try:
                     obs_dy = int(observed.value)
-                    if (exp_dy != 0 and obs_dy == 0) or (exp_dy == 0 and obs_dy != 0) or (exp_dy * obs_dy < 0):
+                    if exp_dy == 0 and exp_dx == 0:
+                        if obs_dy != 0:
+                            return True
+                    elif exp_dy != 0 and _sign(exp_dy) != _sign(obs_dy):
                         return True
                 except (ValueError, TypeError):
                     pass
             elif obs_p in ("col_delta", "delta_c", "dx"):
                 try:
                     obs_dx = int(observed.value)
-                    if (exp_dx != 0 and obs_dx == 0) or (exp_dx == 0 and obs_dx != 0) or (exp_dx * obs_dx < 0):
+                    if exp_dy == 0 and exp_dx == 0:
+                        if obs_dx != 0:
+                            return True
+                    elif exp_dx != 0 and _sign(exp_dx) != _sign(obs_dx):
                         return True
                 except (ValueError, TypeError):
                     pass
@@ -257,14 +288,14 @@ def contradicts(expected: AtomicProposition, observed: AtomicProposition) -> boo
             if exp_p in ("row_delta", "delta_r", "dy"):
                 try:
                     exp_dy = int(expected.value)
-                    if (exp_dy != 0 and obs_dy == 0) or (exp_dy == 0 and obs_dy != 0) or (exp_dy * obs_dy < 0):
+                    if exp_dy != 0 and _sign(exp_dy) != _sign(obs_dy):
                         return True
                 except (ValueError, TypeError):
                     pass
             elif exp_p in ("col_delta", "delta_c", "dx"):
                 try:
                     exp_dx = int(expected.value)
-                    if (exp_dx != 0 and obs_dx == 0) or (exp_dx == 0 and obs_dx != 0) or (exp_dx * obs_dx < 0):
+                    if exp_dx != 0 and _sign(exp_dx) != _sign(obs_dx):
                         return True
                 except (ValueError, TypeError):
                     pass
@@ -344,7 +375,31 @@ def is_necessarily_contained(expected: AtomicProposition, observed_set: Proposit
         if expected.value is not None:
             if obs.value is None:
                 continue
-            if _normalize_value(obs.value) != _normalize_value(expected.value):
+            norm_obs = _normalize_value(obs.value)
+            norm_exp = _normalize_value(expected.value)
+            if norm_obs != norm_exp:
+                # Allow cumulative multi-step displacement expectations (e.g. step k expecting k * step_delta)
+                # when direction signs match on both axes and non-zero components are exact integer multiples
+                if expected.family == "metric_sign":
+                    pred_low = expected.predicate.lower()
+                    if pred_low in ("moved", "step_moved"):
+                        exp_vec = _unpack_dy_dx(norm_exp)
+                        obs_vec = _unpack_dy_dx(norm_obs)
+                        if exp_vec is not None and obs_vec is not None:
+                            e_dy, e_dx = exp_vec
+                            o_dy, o_dx = obs_vec
+                            if (
+                                (e_dy != 0 or e_dx != 0)
+                                and _sign(e_dy) == _sign(o_dy)
+                                and _sign(e_dx) == _sign(o_dx)
+                                and (e_dy == 0 or (abs(o_dy) > 0 and abs(e_dy) >= abs(o_dy) and abs(e_dy) % abs(o_dy) == 0))
+                                and (e_dx == 0 or (abs(o_dx) > 0 and abs(e_dx) >= abs(o_dx) and abs(e_dx) % abs(o_dx) == 0))
+                            ):
+                                return True
+                    elif pred_low in ("dy", "dx", "row_delta", "col_delta", "delta_r", "delta_c"):
+                        if isinstance(norm_exp, int) and isinstance(norm_obs, int) and norm_exp != 0 and norm_obs != 0:
+                            if _sign(norm_exp) == _sign(norm_obs) and abs(norm_exp) >= abs(norm_obs) and abs(norm_exp) % abs(norm_obs) == 0:
+                                return True
                 continue
 
         return True
@@ -378,6 +433,44 @@ def implies_brusentsov(expected: PropositionSet, observed: PropositionSet) -> Te
 
     # 3. Inessential missing effect without physical contradiction (OMIT check)
     return Ternary.IRRELEVANT
+
+
+#: Every `invariant_type` the evaluator can judge by name. Types outside this
+#: set are treated as unclassified and are dispatched by description keywords.
+KNOWN_INVARIANT_TYPES = frozenset({
+    "kinematics", "physics",
+    "area_conservation", "topology",
+    "spatial_position", "positional_pattern",
+    "symmetry", "axial_symmetry_vertical", "axial_symmetry_horizontal",
+    "socket_coverage", "alignment",
+    "goal", "victory", "win_condition",
+    "control", "selection", "modality",
+    "palette", "color_role",
+    "transformation", "state_flip", "rotation",
+})
+
+
+def declares_family(
+    inv_type: str,
+    type_names: tuple[str, ...],
+    desc: str,
+    desc_terms: tuple[str, ...],
+) -> bool:
+    """Decide whether an invariant belongs to a family.
+
+    A recognised ``invariant_type`` is authoritative; description keywords are
+    consulted only for types outside :data:`KNOWN_INVARIANT_TYPES`. Without that
+    precedence an invariant whose prose happens to mention a foreign concept —
+    a rotation rule that says pieces "rotate when toggled", an area rule that
+    mentions "palette" — would be judged by the wrong family's rule.
+    """
+    if inv_type in type_names:
+        return True
+    if inv_type in KNOWN_INVARIANT_TYPES:
+        return False
+    return any(term in desc for term in desc_terms)
+
+
 def evaluate_invariant_across_levels(
     invariant: "StructuredInvariant",
     current_level_observations: Any,
@@ -437,14 +530,8 @@ def evaluate_invariant_across_levels(
     meta = getattr(invariant, "metadata", {}) or {}
 
     # 1. Kinematics invariants
-    if inv_type in ("kinematics", "physics"):
-        act_id = meta.get("action_id") or ""
-        if not act_id:
-            import re
-            m = re.search(r"action\s*(action\d+|\d+)", desc, re.IGNORECASE)
-            if m:
-                raw_act = m.group(1).upper()
-                act_id = raw_act if raw_act.startswith("ACTION") else f"ACTION{raw_act}"
+    if declares_family(inv_type, ("kinematics", "physics"), desc, ()):
+        act_id = meta.get("action_id") or parse_referenced_action_id(desc)
 
         if not act_id:
             # Guard: On pristine frame S₀ (no actions taken), kinematic invariants
@@ -477,87 +564,141 @@ def evaluate_invariant_across_levels(
         elif has_blocked_zero and ("moves" in desc or "displace" in desc) and not has_motion:
             return Ternary.FALSE
 
+        # The kinematics family applies, but this level produced no decisive
+        # observation of it. That is silence, not a licence for a later family
+        # to judge the same invariant by an unrelated rule.
+        return Ternary.IRRELEVANT
+
     # 2. Area conservation invariants
-    if inv_type in ("area_conservation", "topology") or "area" in desc:
+    if declares_family(inv_type, ("area_conservation", "topology"), desc, ()) or (
+        inv_type not in KNOWN_INVARIANT_TYPES and "area" in desc
+    ):
         area_props = [
             p for p in props
             if p.predicate == "area" or p.family == "area_conservation"
         ]
-        if area_props:
-            has_destroyed = any(
-                p.family == "object_identity" and p.predicate in ("destroyed", "vanished")
-                for p in props
-            )
-            if has_destroyed and "conserv" in desc:
-                return Ternary.FALSE
-            return Ternary.TRUE
+        if not area_props:
+            return Ternary.IRRELEVANT
+        # An area prop exists on essentially every frame, so its mere presence is
+        # silence about conservation. Only an invariant that actually asserts
+        # conservation may be judged by the absence of destruction, and only a
+        # non-zero observed mass can count as surviving matter.
+        asserts_conservation = (
+            inv_type in ("area_conservation", "topology")
+            or "conserv" in desc
+            or "preserv" in desc
+        )
+        if not asserts_conservation:
+            return Ternary.IRRELEVANT
+        has_destroyed = any(
+            p.family == "object_identity" and p.predicate in ("destroyed", "vanished")
+            for p in props
+        )
+        if has_destroyed:
+            return Ternary.FALSE
+        has_surviving_mass = any(
+            isinstance(_normalize_value(p.value), int) and _normalize_value(p.value) > 0
+            for p in area_props
+            if p.value is not None
+        )
+        return Ternary.TRUE if has_surviving_mass else Ternary.IRRELEVANT
 
     # 3. Spatial position invariants
     p_pos = meta.get("target_position")
-    if inv_type in ("spatial_position", "positional_pattern") or p_pos:
+    if declares_family(inv_type, ("spatial_position", "positional_pattern"), desc, ()) or p_pos:
+        if not p_pos:
+            # The family applies but names no position to check against, so no
+            # observation of it can be decisive.
+            return Ternary.IRRELEVANT
         pos_props = [
             p for p in props
             if p.family == "spatial_position"
         ]
-        if pos_props:
-            for p in pos_props:
-                if p_pos and p.value == p_pos:
-                    return Ternary.TRUE
-                elif p_pos and p.value != p_pos and p.subject_id == meta.get("subject_id"):
-                    return Ternary.FALSE
+        for p in pos_props:
+            if p.value == p_pos:
+                return Ternary.TRUE
+            if p.subject_id == meta.get("subject_id"):
+                return Ternary.FALSE
+        return Ternary.IRRELEVANT
 
     # 4. Symmetry and relational invariants
-    if inv_type in ("symmetry", "axial_symmetry_vertical", "axial_symmetry_horizontal", "socket_coverage", "alignment"):
+    if declares_family(
+        inv_type,
+        ("symmetry", "axial_symmetry_vertical", "axial_symmetry_horizontal", "socket_coverage", "alignment"),
+        desc,
+        (),
+    ):
         rel_props = [
             p for p in props
             if p.family == "relation_existence"
         ]
-        if rel_props:
-            matching = any(
-                inv_type in str(p.predicate).lower() or str(p.predicate).lower() in inv_type
-                for p in rel_props if p.value
-            )
-            if matching:
-                return Ternary.TRUE
+        matching = any(
+            inv_type in str(p.predicate).lower() or str(p.predicate).lower() in inv_type
+            for p in rel_props if p.value
+        )
+        return Ternary.TRUE if matching else Ternary.IRRELEVANT
 
     # 5. Goal & Victory Invariants
-    if inv_type in ("goal", "victory", "win_condition") or "win" in desc or "goal" in desc:
+    if declares_family(inv_type, ("goal", "victory", "win_condition"), desc, ("win", "goal")):
         term_props = [
             p for p in props
-            if p.family == "terminal_outcome" or p.predicate in ("won", "lost", "in_progress")
+            if p.family == "terminal_metadata"
         ]
-        if term_props:
-            for p in term_props:
-                if p.predicate == "won" and ("win" in desc or "goal" in desc):
-                    return Ternary.TRUE
-                elif p.predicate == "lost" and ("win" in desc or "goal" in desc):
-                    return Ternary.FALSE
+        for p in term_props:
+            if p.predicate == "win" and _normalize_value(p.value) is True:
+                return Ternary.TRUE
+            if p.predicate == "game_over" and _normalize_value(p.value) is True:
+                return Ternary.FALSE
+        return Ternary.IRRELEVANT
 
     # 6. Control & Selection Invariants
-    if inv_type in ("control", "selection", "modality") or "toggle" in desc or "switch" in desc:
+    if declares_family(inv_type, ("control", "selection", "modality"), desc, ("toggle", "switch")):
+        # Control is expressed through the action surface and affordance flags,
+        # not through a dedicated proposition family.
         ctrl_props = [
             p for p in props
-            if p.family in ("control_scheme", "selection_mechanics") or "toggle" in str(p.predicate)
+            if p.family in ("action_surface", "affordance_flag")
+            or "toggle" in str(p.predicate)
         ]
-        if ctrl_props:
-            return Ternary.TRUE
+        # Only an observation that positively asserts a control effect counts.
+        # The existence of an action-surface snapshot says nothing about who is
+        # controllable, so an unflagged entry is silence.
+        decisive = [
+            p for p in ctrl_props
+            if _normalize_value(p.value) not in (None, False, 0, "")
+        ]
+        return Ternary.TRUE if decisive else Ternary.IRRELEVANT
 
     # 7. Palette & Color/Role Invariants
-    if inv_type in ("palette", "color_role") or "color" in desc or "palette" in desc:
+    if declares_family(inv_type, ("palette", "color_role"), desc, ("color", "palette")):
+        declared_color = meta.get("target_color", meta.get("color"))
+        if declared_color is None:
+            # Every frame carries a color prop per object; without a declared
+            # palette member there is nothing a color observation can confirm.
+            return Ternary.IRRELEVANT
         color_props = [
             p for p in props
             if p.family == "attribute_delta" and p.predicate == "color"
         ]
-        if color_props:
-            return Ternary.TRUE
+        observed_colors = {
+            _normalize_value(p.value) for p in color_props if p.value is not None
+        }
+        if not observed_colors:
+            return Ternary.IRRELEVANT
+        return Ternary.TRUE if _normalize_value(declared_color) in observed_colors else Ternary.IRRELEVANT
 
     # 8. Transformation & State Change Invariants
-    if inv_type in ("transformation", "state_flip", "rotation") or "rotate" in desc or "flip" in desc:
+    if declares_family(inv_type, ("transformation", "state_flip", "rotation"), desc, ("rotate", "flip")):
+        # A static identity/attribute snapshot is not evidence of a state flip.
+        # Only an event-shaped proposition may confirm this family.
+        event_predicates = (
+            "transformed", "rotated", "flipped", "created", "destroyed",
+            "vanished", "merged", "changed",
+        )
         tf_props = [
             p for p in props
-            if p.family in ("transformation", "attribute_delta", "object_identity")
+            if p.family == "object_identity" and p.predicate in event_predicates
         ]
-        if tf_props:
-            return Ternary.TRUE
+        return Ternary.TRUE if tf_props else Ternary.IRRELEVANT
 
     return Ternary.IRRELEVANT

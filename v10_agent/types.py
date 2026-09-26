@@ -123,6 +123,24 @@ class EffectDeclaration:
             "confidence": self.confidence,
         }
 
+    @classmethod
+    def circuit_break(cls, reason: str) -> "EffectDeclaration":
+        """Build an inert declaration that aborts a step without side effects.
+
+        Used when an in-flight DSL module is invalidated: no action may be
+        emitted on the strength of a module that no longer exists, so the
+        declaration carries a reset instead of a step effect.
+        """
+        return cls(
+            declared_action=ActionDeclaration(
+                action_id="RESET",
+                reasoning={"source": "circuit_break", "reason": reason},
+            ),
+            expected_metric_deltas={},
+            target_object_ids=[],
+            confidence=0.0,
+        )
+
 
 REGISTERED_PROPOSITION_FAMILIES = frozenset({
     "object_identity",

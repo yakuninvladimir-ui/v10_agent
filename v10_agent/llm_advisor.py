@@ -212,7 +212,7 @@ class VLLMAdvisor(BaseLLMAdvisor):
         url = f"{self.base_url}/chat/completions"
 
         # Use explicitly configured model, or cached model, or discover from /models
-        model_id = getattr(config, "model_path", None) or config.qwen_model_path or getattr(self, "_cached_model_id", None)
+        model_id = config.resolve("model_path") or config.qwen_model_path or getattr(self, "_cached_model_id", None)
         if not model_id:
             try:
                 models_url = f"{self.base_url}/models"
@@ -235,13 +235,33 @@ class VLLMAdvisor(BaseLLMAdvisor):
         if is_dashscope and max_tokens > 8192:
             max_tokens = 8192
 
+        # Role-differentiated token budgeting with healthy safety reserves
+        role_reasoning_budget = getattr(config, "reasoning_budget_tokens", 32000)
+        if agent_role == "coder":
+            role_reasoning_budget = getattr(config, "coder_reasoning_budget_tokens", 8192)
+            max_tokens = min(max_tokens, role_reasoning_budget + 2048)
+        elif agent_role == "explorer":
+            role_reasoning_budget = getattr(config, "explorer_reasoning_budget_tokens", 8192)
+            max_tokens = min(max_tokens, role_reasoning_budget + 2048)
+        elif agent_role in ("solver", "solver_reflection"):
+            role_reasoning_budget = getattr(config, "solver_reasoning_budget_tokens", 24576)
+            max_tokens = min(max_tokens, role_reasoning_budget + 4096)
+
         temp = getattr(config, "temperature", config.qwen_temperature)
+        if agent_role == "solver":
+            temp = getattr(config, "solver_temperature", 0.7)
+        elif agent_role == "coder":
+            temp = getattr(config, "coder_temperature", 0.5)
+        elif agent_role == "explorer":
+            temp = getattr(config, "explorer_temperature", 0.9)
         top_p = getattr(config, "top_p", config.qwen_top_p)
         top_k = getattr(config, "top_k", config.qwen_top_k)
         pres_penalty = getattr(config, "presence_penalty", config.qwen_presence_penalty)
         rep_penalty = getattr(config, "repeat_penalty", config.qwen_repeat_penalty)
         seed_val = getattr(config, "seed", config.qwen_seed)
         strength = getattr(config, "reasoning_strength", "xhigh")
+        if agent_role in ("coder", "explorer") and strength == "xhigh":
+            strength = "medium"
 
         payload: dict[str, Any] = {
             "model": model_id,
@@ -258,13 +278,24 @@ class VLLMAdvisor(BaseLLMAdvisor):
         if rep_penalty > 0:
             payload["repetition_penalty"] = rep_penalty
 
+        role_needs_thinking = agent_role in ("solver", "solver_reflection")
+        enable_thinking = (getattr(config, "enable_thinking", True) or getattr(config, "qwen_enable_thinking", True)) and role_needs_thinking
         chat_kwargs: dict[str, Any] = {
             "reasoning_effort": strength,
             "reasoning_strength": strength,
         }
-        if getattr(config, "enable_thinking", True) or getattr(config, "qwen_enable_thinking", True):
+        if enable_thinking:
             chat_kwargs["enable_thinking"] = True
             payload["enable_thinking"] = True
+            chat_kwargs["reasoning_budget"] = role_reasoning_budget
+            payload["reasoning_budget"] = role_reasoning_budget
+        else:
+            chat_kwargs["enable_thinking"] = False
+            payload["enable_thinking"] = False
+            if agent_role == "coder":
+                payload["max_tokens"] = 2048
+            elif agent_role == "explorer":
+                payload["max_tokens"] = 512
         payload["chat_template_kwargs"] = chat_kwargs
         payload["reasoning_effort"] = strength
 
@@ -451,12 +482,21 @@ class MockLLMAdvisor(BaseLLMAdvisor):
                             last_user_text = part.get("text", "")
                             break
 
+        temp = getattr(config, "temperature", config.qwen_temperature)
+        if agent_role == "solver":
+            temp = getattr(config, "solver_temperature", 0.7)
+        elif agent_role == "coder":
+            temp = getattr(config, "coder_temperature", 0.5)
+        elif agent_role == "explorer":
+            temp = getattr(config, "explorer_temperature", 0.9)
+
         self.call_history.append({
             "role": agent_role,
             "system_prompt": sys_text,
             "user_prompt": last_user_text,
             "messages": [dict(m) for m in messages],
             "has_image": False,
+            "temperature": temp,
         })
         queue = self.responses_by_role.get(agent_role, [])
         if queue:
@@ -520,11 +560,20 @@ class MockLLMAdvisor(BaseLLMAdvisor):
     ) -> str:
         role_vision_enabled = is_role_vision_enabled(config, agent_role)
         has_image = _has_image_payload(image_bytes) and role_vision_enabled
+        temp = getattr(config, "temperature", config.qwen_temperature)
+        if agent_role == "solver":
+            temp = getattr(config, "solver_temperature", 0.7)
+        elif agent_role == "coder":
+            temp = getattr(config, "coder_temperature", 0.5)
+        elif agent_role == "explorer":
+            temp = getattr(config, "explorer_temperature", 0.9)
+
         self.call_history.append({
             "role": agent_role,
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "has_image": has_image,
+            "temperature": temp,
         })
         queue = self.responses_by_role.get(agent_role, [])
         if queue:
@@ -598,7 +647,7 @@ class DashScopeResponsesAdvisor(BaseLLMAdvisor):
         raw_model = (
             getattr(self, "_cached_model_id", None)
             or config.qwen_model_path
-            or getattr(config, "model_path", None)
+            or config.resolve("model_path")
             or "qwen3.8-27b"
         )
         if "/" in raw_model:
@@ -612,11 +661,22 @@ class DashScopeResponsesAdvisor(BaseLLMAdvisor):
         else:
             model_id = raw_model
 
-        extra_body: dict[str, Any] = {}
-        if config.qwen_enable_thinking:
+        temp = getattr(config, "temperature", config.qwen_temperature)
+        if agent_role == "solver":
+            temp = getattr(config, "solver_temperature", 0.7)
+        elif agent_role == "coder":
+            temp = getattr(config, "coder_temperature", 0.5)
+        elif agent_role == "explorer":
+            temp = getattr(config, "explorer_temperature", 0.9)
+
+        role_needs_thinking = agent_role in ("solver", "solver_reflection")
+        extra_body: dict[str, Any] = {"temperature": temp}
+        if config.qwen_enable_thinking and role_needs_thinking:
             extra_body["enable_thinking"] = True
+            extra_body["chat_template_kwargs"] = {"enable_thinking": True}
         else:
             extra_body["enable_thinking"] = False
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
 
         instructions = ""
         user_input: list[dict[str, Any]] = []
@@ -702,7 +762,11 @@ class DashScopeStreamingChatAdvisor(BaseLLMAdvisor):
     def _get_client(self) -> Any:
         if self._client is None:
             from openai import OpenAI
-            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            self._client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=float(getattr(self, "_timeout", 75.0)),
+            )
         return self._client
 
     def generate_chat(
@@ -712,27 +776,49 @@ class DashScopeStreamingChatAdvisor(BaseLLMAdvisor):
         agent_role: str = "generic",
     ) -> str:
         client = self._get_client()
-        raw_model = getattr(self, "_cached_model_id", None) or config.qwen_model_path or getattr(config, "model_path", None) or "qwen3.8-27b"
-        if "/" in raw_model:
-            tail = raw_model.split("/")[-1].lower()
-            if "27b" in tail:
-                model_id = "qwen3.8-27b"
-            elif "flash" in tail or "3.7" in tail:
-                model_id = "qwen3.7-flash"
-            else:
-                model_id = tail
+        raw_model = (
+            getattr(self, "_cached_model_id", None)
+            or config.qwen_model_path
+            or config.resolve("model_path")
+            or "qwen3.8-27b"
+        )
+        if "/" in str(raw_model):
+            model_id = str(raw_model).split("/")[-1]
         else:
-            model_id = raw_model
+            model_id = str(raw_model)
 
+        role_needs_thinking = agent_role in ("solver", "solver_reflection")
         extra_body: dict[str, Any] = {}
-        if config.qwen_enable_thinking:
+        if config.qwen_enable_thinking and role_needs_thinking:
             extra_body["enable_thinking"] = True
+            extra_body["chat_template_kwargs"] = {"enable_thinking": True}
+        else:
+            extra_body["enable_thinking"] = False
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+
+        temp = config.temperature
+        role_reasoning_budget = config.reasoning_budget_tokens
+        if agent_role in ("solver", "solver_reflection"):
+            temp = config.solver_temperature
+            role_reasoning_budget = config.solver_reasoning_budget_tokens
+            role_output_budget = config.solver_max_output_tokens
+            max_tokens = min(config.max_output_tokens, role_reasoning_budget + role_output_budget)
+        elif agent_role == "coder":
+            temp = config.coder_temperature
+            max_tokens = min(config.max_output_tokens, config.coder_max_output_tokens)
+        elif agent_role == "explorer":
+            temp = config.explorer_temperature
+            max_tokens = min(config.max_output_tokens, config.explorer_max_output_tokens)
+        else:
+            max_tokens = config.max_output_tokens
 
         for attempt in range(3):
             try:
                 kwargs: dict[str, Any] = {
                     "model": model_id,
                     "messages": messages,
+                    "temperature": temp,
+                    "max_tokens": max_tokens,
                     "stream": True,
                 }
                 if extra_body:
@@ -742,7 +828,7 @@ class DashScopeStreamingChatAdvisor(BaseLLMAdvisor):
                 content_chunks: list[str] = []
 
                 is_answering = False
-                print(f"\n{'=' * 20}Thinking process [{agent_role.upper()}]{'=' * 20}", flush=True)
+                print(f"\n{'=' * 20}Thinking process [{agent_role.upper()} | {model_id}]{'=' * 20}", flush=True)
                 for chunk in completion:
                     if not chunk.choices:
                         continue
@@ -757,7 +843,7 @@ class DashScopeStreamingChatAdvisor(BaseLLMAdvisor):
                     if hasattr(delta, "content") and delta.content:
                         content_chunks.append(delta.content)
                         if not is_answering:
-                            print(f"\n{'=' * 20}Full response [{agent_role.upper()}]{'=' * 20}", flush=True)
+                            print(f"\n{'=' * 20}Full response [{agent_role.upper()} | {model_id}]{'=' * 20}", flush=True)
                             is_answering = True
                         try:
                             print(delta.content, end="", flush=True)
@@ -776,14 +862,19 @@ class DashScopeStreamingChatAdvisor(BaseLLMAdvisor):
                     logger.info(
                         f"[{agent_role.upper()}] Answer preview ({len(answer_text)} chars): {answer_text[:200].strip()}..."
                     )
-                    return answer_text
+                    return sanitize_model_response(answer_text)
                 if reasoning_text:
                     logger.warning(
                         f"[{agent_role.upper()}] Content stream was empty; falling back to reasoning stream ({len(reasoning_text)} chars)"
                     )
-                    return reasoning_text
+                    return sanitize_model_response(reasoning_text)
                 return "{}"
             except Exception as exc:
+                exc_str = str(exc).lower()
+                if "thinking" in exc_str or "thinking_budget" in exc_str:
+                    logger.info(f"Model {model_id} does not support thinking mode. Disabling enable_thinking and retrying.")
+                    extra_body["enable_thinking"] = False
+                    extra_body["chat_template_kwargs"] = {"enable_thinking": False}
                 if attempt < 2:
                     logger.warning(
                         f"DashScopeStreamingChatAdvisor attempt {attempt+1} failed for {agent_role!r}: {exc}. Retrying in 2s..."
@@ -808,10 +899,12 @@ def build_llm_advisor(config: V10Config) -> BaseLLMAdvisor:
         )
     if (
         config.llm_advisor_backend in ("dashscope_streaming", "dashscope_chat")
-        or "dashscope-intl.aliyuncs.com/compatible-mode/v1" in (config.qwen_vllm_base_url or "")
+        or "dashscope" in (config.qwen_vllm_base_url or "").lower()
+        or "qwencloudapi" in (config.qwen_vllm_base_url or "").lower()
     ):
+        target_base = config.qwen_vllm_base_url or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
         return DashScopeStreamingChatAdvisor(
-            base_url=config.qwen_vllm_base_url,
+            base_url=target_base,
             api_key=config.qwen_vllm_api_key,
         )
     return VLLMAdvisor(

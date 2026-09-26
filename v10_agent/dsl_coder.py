@@ -6,12 +6,14 @@ writing exclusively to SyntaxErrorMemory.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
 import re
 from typing import Any
 
+from v10_agent.action_semantics import is_observable_move
 from v10_agent.config import V10Config
 from v10_agent.llm_advisor import BaseLLMAdvisor, sanitize_model_response
 from v10_agent.memory_contours import SyntaxErrorMemory, SyntaxErrorRecord
@@ -57,11 +59,14 @@ def derive_manifest_from_python_source(source: str) -> dict[str, Any]:
                 if i >= default_start:
                     def_node = node.args.defaults[i - default_start]
                     if isinstance(def_node, ast.Constant):
-                        p_dict["default"] = def_node.value
+                        if def_node.value is None:
+                            p_dict["default"] = 0 if p_type == "int" else ""
+                        else:
+                            p_dict["default"] = def_node.value
                     elif isinstance(def_node, ast.UnaryOp) and isinstance(def_node.op, ast.USub) and isinstance(def_node.operand, ast.Constant):
                         p_dict["default"] = -def_node.operand.value
                     else:
-                        p_dict["default"] = 0
+                        p_dict["default"] = 0 if p_type == "int" else ""
                 else:
                     if p_name in ("x", "y", "count"):
                         p_dict["default"] = 0
@@ -171,11 +176,17 @@ class DSLCoder:
             )
             prompt_hash = hashlib.sha256((sys_prompt + user_prompt).encode("utf-8")).hexdigest()[:12]
 
+            call_config = self.config
+            if attempt > 1:
+                call_config = copy.copy(self.config)
+                base_temp = getattr(self.config, "coder_temperature", 0.5)
+                call_config.coder_temperature = max(0.1, round(base_temp - 0.15 * (attempt - 1), 2))
+
             try:
                 response = self.advisor.generate(
                     system_prompt=sys_prompt,
                     user_prompt=user_prompt,
-                    config=self.config,
+                    config=call_config,
                     image_bytes=effective_image,
                     agent_role="coder",
                 )
@@ -223,27 +234,43 @@ class DSLCoder:
                 continue
 
             # Ensure persistent confirmed actions from game_memory and action_affordances are preserved and augmented
+            allowed_set = None
+            if planning_set is not None and getattr(planning_set, "allowed_action_ids", None):
+                allowed_set = {str(a).upper() for a in planning_set.allowed_action_ids}
+
             confirmed_acts = set()
             if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
-                confirmed_acts.update(str(a).upper() for a in game_memory.confirmed_action_effects if str(a).upper() not in ("RESET", "ACTION7"))
+                confirmed_acts.update(str(a).upper() for a in game_memory.confirmed_action_effects if is_observable_move(a))
             if game_memory is not None and hasattr(game_memory, "action_affordances"):
                 for aff in getattr(game_memory, "action_affordances", []):
                     if isinstance(aff, dict) and aff.get("action_id"):
                         act_id = str(aff["action_id"]).upper()
-                        if act_id not in ("RESET", "ACTION7"):
+                        if is_observable_move(act_id):
                             confirmed_acts.add(act_id)
             if env_spec:
                 if "action_affordances" in env_spec and isinstance(env_spec["action_affordances"], list):
                     for aff in env_spec["action_affordances"]:
                         if isinstance(aff, dict) and aff.get("action_id"):
                             act_id = str(aff["action_id"]).upper()
-                            if act_id not in ("RESET", "ACTION7"):
+                            if is_observable_move(act_id):
                                 confirmed_acts.add(act_id)
                 if "available_actions" in env_spec and isinstance(env_spec["available_actions"], list):
                     for act in env_spec["available_actions"]:
                         act_id = str(act).upper()
-                        if act_id not in ("RESET", "ACTION7"):
+                        if is_observable_move(act_id):
                             confirmed_acts.add(act_id)
+
+            unconfirmed: set[str] = set()
+            if game_memory is not None and hasattr(game_memory, "unconfirmed_actions"):
+                unconfirmed = {str(a).upper() for a in game_memory.unconfirmed_actions}
+
+            if allowed_set is not None:
+                for act in allowed_set:
+                    act_up = str(act).upper()
+                    if is_observable_move(act_up) and act_up not in unconfirmed:
+                        confirmed_acts.add(act_up)
+                confirmed_acts = {a for a in confirmed_acts if a in allowed_set}
+            confirmed_acts = {a for a in confirmed_acts if a not in unconfirmed}
 
             existing_fn_names = set()
             for fn in manifest.get("functions", []):
@@ -252,26 +279,47 @@ class DSLCoder:
                         existing_fn_names.add(str(fn["name"]).lower())
                     if fn.get("action_id"):
                         existing_fn_names.add(str(fn["action_id"]).lower())
-            missing_acts = [act for act in confirmed_acts if act.lower() not in existing_fn_names]
+            missing_acts = [act for act in confirmed_acts if act.lower() not in existing_fn_names and (allowed_set is None or act in allowed_set)]
             if missing_acts:
                 missing_code = []
                 for act in sorted(missing_acts):
                     fn_name = act.lower()
                     if act == "ACTION6":
                         missing_code.append(
-                            f"\ndef {fn_name}(api, x=0, y=0):\n"
-                            f"    \"\"\"Preserved confirmed coordinate action.\"\"\"\n"
-                            f"    return api.declare_environment_action(action_id='ACTION6', data={{'x': int(x), 'y': int(y)}})\n"
+                            f"\ndef {fn_name}(api, target='', x=None, y=None):\n"
+                            f"    \"\"\"Preserved confirmed coordinate/click action on target object or (x, y).\"\"\"\n"
+                            f"    if target:\n"
+                            f"        return api.click_object(target=target, x=x, y=y)\n"
+                            f"    cur_x = int(x) if x is not None else 0\n"
+                            f"    cur_y = int(y) if y is not None else 0\n"
+                            f"    return api.declare_environment_action(action_id='ACTION6', data={{'x': cur_x, 'y': cur_y}})\n\n"
+                            f"def click(api, target='', x=None, y=None):\n"
+                            f"    \"\"\"Click on the designated object alias or coordinates.\"\"\"\n"
+                            f"    return {fn_name}(api, target=target, x=x, y=y)\n"
                         )
                         manifest.get("functions", []).append({
                             "name": fn_name,
                             "action_id": "ACTION6",
                             "parameters": [
+                                {"name": "target", "type": "str", "default": ""},
                                 {"name": "x", "type": "int", "default": 0},
                                 {"name": "y", "type": "int", "default": 0},
                             ],
                             "returns": "effect_declaration",
-                            "docstring": "Preserved confirmed coordinate action.",
+                            "docstring": "Preserved confirmed coordinate/click action on target object or (x, y).",
+                            "purity": "pure_declaration",
+                            "expected_effect_template": {},
+                        })
+                        manifest.get("functions", []).append({
+                            "name": "click",
+                            "action_id": "ACTION6",
+                            "parameters": [
+                                {"name": "target", "type": "str", "default": ""},
+                                {"name": "x", "type": "int", "default": 0},
+                                {"name": "y", "type": "int", "default": 0},
+                            ],
+                            "returns": "effect_declaration",
+                            "docstring": "Click on the designated object alias or coordinates.",
                             "purity": "pure_declaration",
                             "expected_effect_template": {},
                         })

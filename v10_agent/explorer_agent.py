@@ -14,6 +14,12 @@ from typing import Any
 from dataclasses import dataclass, field
 from enum import Enum
 
+from v10_agent.action_semantics import (
+    NON_VECTOR_ACTION_IDS,
+    is_observable_move,
+    parse_axis_components,
+    token_after_keyword,
+)
 from v10_agent.config import V10Config
 from v10_agent.llm_advisor import BaseLLMAdvisor, sanitize_model_response
 from v10_agent.memory_contours import EnvironmentSpecMemory, ProbeRecord
@@ -22,6 +28,7 @@ from v10_agent.prompt_builders.explorer_prompt import (
     build_coordinate_hypothesis_prompt,
     build_explorer_prompts,
     build_explorer_synthesis_prompt,
+    build_primitive_research_prompt,
 )
 from v10_agent.types import ActionDeclaration
 
@@ -94,6 +101,28 @@ def clean_and_parse_json(text: str) -> dict:
                 return json.loads(fixed)
             except (json.JSONDecodeError, ValueError):
                 pass
+
+    # 5. Truncated JSON repair (e.g. LLM output cut off before closing braces/brackets)
+    if start != -1:
+        truncated_cand = text[start:]
+        # Remove trailing incomplete string/key if any (e.g. cut off mid-token)
+        repair = re.sub(r',\s*[^,:{}\[\]]*$', '', truncated_cand)
+        # Close strings if unclosed odd number of unescaped quotes
+        quotes = [m.start() for m in re.finditer(r'(?<!\\)"', repair)]
+        if len(quotes) % 2 == 1:
+            repair += '"'
+        # Balance open brackets/braces
+        rem_cur = max(0, repair.count("{") - repair.count("}"))
+        rem_sq = max(0, repair.count("[") - repair.count("]"))
+        repair = repair.rstrip(', ') + (']' * rem_sq) + ('}' * rem_cur)
+        repair = re.sub(r',\s*([}\]])', r'\1', repair)
+        try:
+            res = json.loads(repair)
+            if isinstance(res, dict):
+                return res
+        except (json.JSONDecodeError, ValueError):
+            pass
+
     raise ValueError(f"Could not parse JSON from text: {text[:200]}")
 
 
@@ -106,11 +135,12 @@ def extract_json_block(text: str) -> dict[str, Any] | None:
         if parsed is not None:
             return parsed
 
-    # 2. Try raw JSON substring finding first { to last }
+    # 2. Try raw JSON substring finding first { to last } (or to end of string if truncated)
     first_brace = clean_text.find("{")
     last_brace = clean_text.rfind("}")
-    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-        parsed = clean_and_parse_json(clean_text[first_brace : last_brace + 1])
+    if first_brace != -1:
+        cand_str = clean_text[first_brace : last_brace + 1] if last_brace > first_brace else clean_text[first_brace:]
+        parsed = clean_and_parse_json(cand_str)
         if parsed is not None:
             return parsed
 
@@ -158,7 +188,7 @@ def generate_symbolic_environment_spec(
     affordance_list: list[dict[str, Any]] = []
     displacement_list: list[dict[str, Any]] = []
     for act_id in sorted(confirmed_actions.keys()):
-        if act_id in ("RESET", "ACTION7"):
+        if not is_observable_move(act_id):
             continue
         eff = confirmed_actions[act_id]
         evidence_ids = []
@@ -200,7 +230,7 @@ def generate_symbolic_environment_spec(
         if (
             act_up in cond_candidates
             and act_up not in confirmed_actions
-            and act_up not in ("RESET", "ACTION7")
+            and is_observable_move(act_up)
         ):
             researched.append({
                 "action_id": act_up,
@@ -230,7 +260,7 @@ def generate_symbolic_environment_spec(
 
         for act in planning_set.allowed_action_ids:
             act_str = str(act).upper()
-            if act_str in ("RESET", "ACTION7") or act_str in unconfirmed:
+            if not is_observable_move(act_str) or act_str in unconfirmed:
                 continue
             researched.append({
                 "action_id": act_str,
@@ -280,7 +310,11 @@ class ExplorerAgent:
     def __init__(self, config: V10Config, advisor: BaseLLMAdvisor):
         self.config = config
         self.advisor = advisor
-        self.probe_manager = PrimitiveProbeManager(max_probes=config.max_primitive_probes_per_level)
+        self.probe_manager = PrimitiveProbeManager(
+            max_probes=config.max_primitive_probes_per_level,
+            max_invariant_probes=getattr(config, "max_invariant_verification_probes", 3),
+            max_steps_per_probe=getattr(config, "max_invariant_probe_steps", 2),
+        )
 
     def generate_symbolic_environment_spec(
         self,
@@ -318,6 +352,11 @@ class ExplorerAgent:
             game_memory=game_memory,
         )
 
+        # Immediately seed game_memory with verified empirical affordances before LLM invocation
+        if game_memory is not None and hasattr(game_memory, "update_action_affordances"):
+            if "action_affordances" in base_spec and base_spec["action_affordances"]:
+                game_memory.update_action_affordances(base_spec["action_affordances"])
+
         explorer_mm = getattr(
             self.config, "explorer_multimodal_enabled",
             getattr(self.config, "multimodal_enabled", getattr(self.config, "qwen_multimodal_enabled", True))
@@ -329,7 +368,7 @@ class ExplorerAgent:
         ) and explorer_mm
         effective_image = image_png if explorer_mm else None
 
-        if self.advisor is None or getattr(self.config, "llm_advisor_backend", "") == "fake":
+        if self.advisor is None or self.config.llm_advisor_backend == "fake":
             return base_spec
 
         # Gather confirmed and unconfirmed actions from probe manager / game memory
@@ -416,7 +455,7 @@ class ExplorerAgent:
                 known_aff_acts = {a["action_id"] for a in clean_affs if isinstance(a, dict)}
                 for act_id in sorted(confirmed_actions.keys()):
                     act_up = str(act_id).upper()
-                    if act_up in ("RESET", "ACTION7") or act_up in known_aff_acts:
+                    if not is_observable_move(act_up) or act_up in known_aff_acts:
                         continue
                     eff_summary = confirmed_actions[act_id]
                     synth_aff = None
@@ -437,7 +476,7 @@ class ExplorerAgent:
 
                 for act_id in sorted(cond_candidates):
                     act_up = str(act_id).upper()
-                    if act_up not in ("RESET", "ACTION7") and act_up not in known_aff_acts and act_up not in confirmed_actions:
+                    if is_observable_move(act_up) and act_up not in known_aff_acts and act_up not in confirmed_actions:
                         clean_affs.append({
                             "action_id": act_up,
                             "effect_class": "CONDITIONAL_TRIGGER",
@@ -474,7 +513,7 @@ class ExplorerAgent:
                 current_available = set(base_spec.get("available_actions", []))
                 for aff in clean_affs:
                     act_up = aff["action_id"]
-                    if act_up not in ("RESET", "ACTION7") and act_up not in current_available:
+                    if is_observable_move(act_up) and act_up not in current_available:
                         base_spec["available_actions"].append(act_up)
                         current_available.add(act_up)
 
@@ -545,6 +584,89 @@ class ExplorerAgent:
             logger.warning(f"Explorer Level Synthesis failed: {exc}; retaining baseline symbolic spec")
 
         return base_spec
+
+    def research_unconfirmed_primitives(
+        self,
+        planning_set: PlanningSet,
+        memory: EnvironmentSpecMemory,
+        image_png: bytes | list[bytes] | tuple[bytes, ...] | dict[str, bytes] | None = None,
+        game_memory: Any | None = None,
+        unconfirmed_actions: list[str] | dict[str, str] | None = None,
+    ) -> list[ActionDeclaration]:
+        """Dedicated Explorer vision call when >= 40% of available actions remain unconfirmed."""
+        if getattr(self.probe_manager, "_primitive_research_done", False):
+            return []
+        self.probe_manager._primitive_research_done = True
+
+        explorer_mm = getattr(
+            self.config, "explorer_multimodal_enabled",
+            getattr(self.config, "multimodal_enabled", getattr(self.config, "qwen_multimodal_enabled", True))
+        )
+        has_image = (
+            any(bool(x) for x in image_png)
+            if isinstance(image_png, (list, tuple))
+            else (any(bool(x) for x in image_png.values()) if isinstance(image_png, dict) else bool(image_png))
+        ) and explorer_mm
+        effective_image = image_png if explorer_mm else None
+
+        if self.advisor is None or self.config.llm_advisor_backend == "fake":
+            return []
+
+        confirmed_actions = dict(self.probe_manager.confirmed_effective_actions)
+        if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
+            confirmed_actions.update(game_memory.confirmed_action_effects)
+
+        unconf_dict: dict[str, str] = {}
+        if isinstance(unconfirmed_actions, dict):
+            unconf_dict.update(unconfirmed_actions)
+        elif isinstance(unconfirmed_actions, (list, tuple, set)):
+            for act in unconfirmed_actions:
+                unconf_dict[str(act).upper()] = "no visible effect (0 cells changed)"
+        for act in self.probe_manager.inactive_actions | self.probe_manager.zero_effect_actions:
+            unconf_dict.setdefault(act, "no visible effect (0 cells changed)")
+        if game_memory is not None and hasattr(game_memory, "unconfirmed_actions"):
+            unconf_dict.update(game_memory.unconfirmed_actions)
+
+        sys_prompt, user_prompt = build_primitive_research_prompt(
+            planning_set=planning_set,
+            confirmed_actions=confirmed_actions,
+            unconfirmed_actions=unconf_dict,
+            probe_history=getattr(memory, "probe_history", []),
+            has_image=has_image,
+        )
+
+        try:
+            response_text = self.advisor.generate(
+                system_prompt=sys_prompt,
+                user_prompt=user_prompt,
+                config=self.config,
+                image_bytes=effective_image,
+                agent_role="explorer",
+            )
+            parsed = extract_json_block(response_text)
+            if parsed and isinstance(parsed, dict):
+                seqs = parsed.get("targeted_probe_sequences", [])
+                probes: list[ActionDeclaration] = []
+                for seq in seqs:
+                    if isinstance(seq, list):
+                        for item in seq:
+                            act_u = str(item).upper().strip()
+                            if act_u in self.probe_manager.DISCRETE_PROBE_ALLOWED:
+                                probes.append(
+                                    ActionDeclaration(
+                                        action_id=act_u,
+                                        data={},
+                                        reasoning={
+                                            "source": "primitive_research_sequence",
+                                            "rationale": "test_unconfirmed_action_precondition",
+                                        },
+                                    )
+                                )
+                rem = max(0, self.probe_manager.max_probes - self.probe_manager.total_probes_executed)
+                return probes[:rem]
+        except Exception as exc:
+            logger.warning(f"Explorer primitive research failed: {exc}")
+        return []
 
     def generate_environment_spec(
         self,
@@ -642,7 +764,7 @@ class ExplorerAgent:
         }
         for act in planning_set.allowed_action_ids:
             act_str = str(act).upper()
-            if act_str in ("RESET", "ACTION7"):
+            if not is_observable_move(act_str):
                 continue
             if act_str not in researched_map:
                 effect = "available atomic action"
@@ -691,7 +813,7 @@ class ExplorerAgent:
         spec["researched_actions"] = researched
         spec["available_actions"] = [
             str(a).upper() for a in planning_set.allowed_action_ids
-            if str(a).upper() not in ("RESET", "ACTION7")
+            if is_observable_move(a)
         ]
 
         # Write to memory (enforces ISO-3)
@@ -715,7 +837,7 @@ class ExplorerAgent:
         self,
         planning_set: PlanningSet,
         memory: EnvironmentSpecMemory | None = None,
-        max_coords: int = 4,
+        max_coords: int = 2,
         image_png: bytes | list[bytes] | tuple[bytes, ...] | dict[str, bytes] | None = None,
         crop_offset: int | None = None,
     ) -> list[ActionDeclaration]:
@@ -820,21 +942,23 @@ class ExplorerAgent:
             for coord in planning_set.coordinate_candidates:
                 if (coord.x, coord.y) not in tested_coords and 0 <= coord.x < width and 0 <= coord.y < height:
                     tested_coords.add((coord.x, coord.y))
+                    target_label = str(getattr(coord, "label", "") or getattr(coord, "object_id", ""))
                     probes.append(
                         ActionDeclaration(
                             action_id="ACTION6",
-                            data={"x": coord.x, "y": coord.y},
+                            data={"x": coord.x, "y": coord.y, "target": target_label},
                             reasoning={
                                 "source": "coordinate_candidate_fallback",
                                 "label": coord.label,
                                 "type": coord.source_type,
+                                "target": target_label,
                             },
                         )
                     )
                     if len(probes) >= max_coords:
                         break
 
-        return probes
+        return probes[:min(2, max_coords)]
 
 
 def filter_displacement_jitter(dr: int, dc: int) -> tuple[int, int]:
@@ -928,7 +1052,9 @@ def compute_probe_effect(
                 matched_moves.append((b, best_a, dr, dc, best_dist))
                 parent_deltas[b.id] = (dr, dc, best_a)
 
-    # 2. Match children using parent displacement as spatial reference
+    # 2. Match children using parent displacement as spatial reference if parent moved,
+    # or match independently if child moved inside a stationary parent container
+    children_b.sort(key=lambda o: -getattr(o, "area", 0))
     for c in children_b:
         p_id = c.parent_id
         if p_id in parent_deltas:
@@ -951,6 +1077,34 @@ def compute_probe_effect(
                 dc = int(round(best_a.centroid.col - c.centroid.col))
                 dr, dc = filter_displacement_jitter(dr, dc)
                 matched_moves.append((c, best_a, dr, dc, best_dist))
+                parent_deltas[c.id] = (dr, dc, best_a)
+        else:
+            # Parent container remained static: child may move independently inside container
+            p_obj = next((p for p in b_objs if p.id == p_id), None)
+            best_a = None
+            best_dist = float("inf")
+            area_tol = 4 if c.area >= 2 else 1
+            for a in a_objs:
+                if a.id in used_after:
+                    continue
+                # If child moves inside static parent container, candidate must still be inside that same container
+                if p_obj is not None:
+                    if not (p_obj.bbox.min_row <= a.centroid.row <= p_obj.bbox.max_row and p_obj.bbox.min_col <= a.centroid.col <= p_obj.bbox.max_col):
+                        continue
+                if a.color == c.color and abs(a.area - c.area) <= area_tol:
+                    dist = math.hypot(a.centroid.row - c.centroid.row, a.centroid.col - c.centroid.col)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_a = a
+            max_dist = max(24.0, c.bbox.height * 2.5, c.bbox.width * 2.5) if c.area >= 2 else 24.0
+            if best_a is not None and best_dist <= max_dist:
+                dr = int(round(best_a.centroid.row - c.centroid.row))
+                dc = int(round(best_a.centroid.col - c.centroid.col))
+                dr, dc = filter_displacement_jitter(dr, dc)
+                used_after.add(best_a.id)
+                if abs(dr) >= 1 or abs(dc) >= 1:
+                    matched_moves.append((c, best_a, dr, dc, best_dist))
+                    parent_deltas[c.id] = (dr, dc, best_a)
 
     # 3. Match remaining standalone components
     for s in standalone_b:
@@ -1149,11 +1303,10 @@ def classify_effect_summary_to_affordance(action_id: str, effect_summary: str) -
         }
 
     # 4. KINEMATIC (default for movements / generic confirmed actions)
-    m_dy = re.search(r"dy=([+-]?\d+)", effect_summary)
-    m_dx = re.search(r"dx=([+-]?\d+)", effect_summary)
-    dy = int(m_dy.group(1)) if m_dy else 0
-    dx = int(m_dx.group(1)) if m_dx else 0
-    if not m_dy and not m_dx:
+    obs_dy, obs_dx = parse_axis_components(effect_summary)
+    dy = obs_dy if obs_dy is not None else 0
+    dx = obs_dx if obs_dx is not None else 0
+    if obs_dy is None and obs_dx is None:
         if "up" in eff_lower:
             dy = -1
         elif "down" in eff_lower:
@@ -1162,8 +1315,7 @@ def classify_effect_summary_to_affordance(action_id: str, effect_summary: str) -
             dx = -1
         elif "right" in eff_lower:
             dx = 1
-    m_alias = re.search(r"moved\s+([A-Z0-9_]+)", effect_summary)
-    alias = m_alias.group(1) if m_alias else "actor"
+    alias = token_after_keyword(effect_summary, "moved") or "actor"
     return {
         "action_id": act_up,
         "effect_class": EffectClass.KINEMATIC.value,
@@ -1292,16 +1444,18 @@ def classify_probe_affordance(
         for b, a, dr, dc, _ in matched_moves:
             vector_groups.setdefault((dr, dc), []).append((b, a))
 
-        (top_dr, top_dc), top_pairs = sorted(vector_groups.items(), key=lambda item: -sum(b.area for b, _ in item[1]))[0]
+        sorted_groups = sorted(vector_groups.items(), key=lambda item: -sum(b.area for b, _ in item[1]))
+        (top_dr, top_dc), top_pairs = sorted_groups[0]
         top_level = [b for b, _ in top_pairs if getattr(b, "parent_id", None) is None or b.parent_id not in {b.id for b, _ in top_pairs}]
         top_level.sort(key=lambda o: -getattr(o, "area", 0))
         primary_b = top_level[0] if top_level else top_pairs[0][0]
         primary_alias = alias_map.get(primary_b.id, primary_b.id)
 
-        all_disps = [
-            {"alias": alias_map.get(b.id, b.id), "dy": top_dr, "dx": top_dc}
-            for b, _ in top_pairs
-        ]
+        all_disps = []
+        for (v_dr, v_dc), v_pairs in sorted_groups:
+            for b, _ in v_pairs:
+                all_disps.append({"alias": alias_map.get(b.id, b.id), "dy": v_dr, "dx": v_dc})
+
         params: dict[str, Any] = {
             "affected_alias": primary_alias,
             "dy": top_dr,
@@ -1312,7 +1466,13 @@ def classify_probe_affordance(
 
         dir_label = describe_vector(top_dr, top_dc)
         notes = f"moved {primary_alias} by dy={top_dr:+d}, dx={top_dc:+d} ({dir_label})"
-        if len(top_pairs) > 1:
+        if len(sorted_groups) > 1:
+            secondary_parts = []
+            for (s_dr, s_dc), s_pairs in sorted_groups[1:]:
+                s_aliases = [alias_map.get(b.id, b.id) for b, _ in s_pairs[:2]]
+                secondary_parts.append(f"moved [{', '.join(s_aliases)}] by dy={s_dr:+d}, dx={s_dc:+d}")
+            notes += f"; secondary shifts: {'; '.join(secondary_parts)}"
+        elif len(top_pairs) > 1:
             notes += f" [synchronous movement of {len(top_pairs)} objects]"
 
         return ActionAffordance(
@@ -1391,28 +1551,43 @@ class PrimitiveProbeManager:
 
     DISCRETE_PROBE_ALLOWED = {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"}
 
-    def __init__(self, max_probes: int = 16):
+    def __init__(
+        self,
+        max_probes: int = 16,
+        max_invariant_probes: int = 3,
+        max_steps_per_probe: int = 2,
+    ):
         self.max_probes = max_probes
+        self.max_invariant_probes = max_invariant_probes
+        self.max_steps_per_probe = max_steps_per_probe
+        self.invariant_probes_count: int = 0
         self.probed_actions: dict[str, str] = {}
         self.confirmed_effective_actions: dict[str, str] = {}
         self.inactive_actions: set[str] = set()
         self.zero_effect_actions: set[str] = set()
         self.conditional_candidate_actions: set[str] = set()
         self.retested_actions: set[str] = set()
+        self.available_discrete_actions: set[str] = set()
         self.total_probes_executed: int = 0
         self._initial_sweep_planned: bool = False
-        self._chains_attempted: set[tuple[str, tuple[str, ...]]] = set()
+        self._initial_sweep_done: bool = False
+        self._primitive_research_done: bool = False
+        self._chains_attempted: set[tuple[Any, ...]] = set()
 
     def handle_level_transition(self, confirmed_action_effects: dict[str, str] | None = None) -> None:
         """Reset per-level probe state while preserving confirmed cross-level kinematics."""
         self.total_probes_executed = 0
+        self.invariant_probes_count = 0
         self._initial_sweep_planned = False
+        self._initial_sweep_done = False
+        self._primitive_research_done = False
         self._chains_attempted.clear()
         self.retested_actions.clear()
         self.confirmed_effective_actions.clear()
         self.inactive_actions.clear()
         self.zero_effect_actions.clear()
         self.conditional_candidate_actions.clear()
+        self.available_discrete_actions.clear()
 
         if isinstance(confirmed_action_effects, dict):
             for act, eff in confirmed_action_effects.items():
@@ -1422,7 +1597,8 @@ class PrimitiveProbeManager:
                     any(k in eff_str for k in ("moved", "moves", "dy=", "dx=", "displacement", "shift"))
                     and any(d in eff_str for d in ("up", "down", "left", "right"))
                     and not any(m in eff_str for m in ("selection indicator", "toggle", "active entity toggled", "selection"))
-                    and act_name not in ("ACTION5", "ACTION6", "RESET", "ACTION7")
+                    and act_name not in NON_VECTOR_ACTION_IDS
+                    and is_observable_move(act_name)
                 )
                 if is_pure_motion:
                     self.confirmed_effective_actions[act_name] = "confirmed_reusable_action"
@@ -1458,12 +1634,33 @@ class PrimitiveProbeManager:
         triggering_action_id: str,
         effect_summary: str,
         max_steps: int | None = None,
+        allowed_actions: Sequence[str] | None = None,
+        planning_set: Any | None = None,
     ) -> list[ActionDeclaration]:
-        """Dynamic re-probing invariant: re-probe inactive actions, explore modal affordances, or switch modes after zero response."""
+        if self._initial_sweep_planned and not self._initial_sweep_done:
+            return []
+
+        if allowed_actions is not None:
+            allowed_set = {str(a).upper() for a in allowed_actions}
+            allowed_discrete = {a for a in self.DISCRETE_PROBE_ALLOWED if a in allowed_set}
+        elif self._initial_sweep_planned:
+            allowed_discrete = set(self.available_discrete_actions)
+            allowed_set = set(self.available_discrete_actions)
+        else:
+            allowed_discrete = set(self.available_discrete_actions) if self.available_discrete_actions else set(self.DISCRETE_PROBE_ALLOWED)
+            allowed_set = allowed_discrete | {"ACTION6"}
+
+        if self.total_probes_executed >= self.max_probes or self.invariant_probes_count >= self.max_invariant_probes:
+            # Invariant verification budget exhausted (3 attempts): yield invariants without further probing
+            for act in list(self.inactive_actions):
+                if act in allowed_discrete and act not in self.confirmed_effective_actions:
+                    self.confirmed_effective_actions[act] = "unverified_invariant"
+            return []
+
         reprobes: list[ActionDeclaration] = []
-        if self.total_probes_executed >= self.max_probes:
-            return reprobes
         rem = self.max_probes - self.total_probes_executed
+        if max_steps is not None:
+            rem = min(max_steps, rem)
 
         is_modal_toggle = (
             "selection indicator" in effect_summary
@@ -1474,7 +1671,7 @@ class PrimitiveProbeManager:
         # Case 1: Inactive discrete actions to retest in new context
         if self.inactive_actions:
             for act in list(self.inactive_actions):
-                if act != triggering_action_id and act not in self.retested_actions and len(reprobes) < rem:
+                if act in allowed_discrete and act != triggering_action_id and act not in self.retested_actions and len(reprobes) < rem:
                     self.retested_actions.add(act)
                     reprobes.append(
                         ActionDeclaration(
@@ -1491,7 +1688,7 @@ class PrimitiveProbeManager:
         # Case 2: Modal toggle occurred (selection switch):
         # Re-probe primitive motion actions (ACTION1..ACTION4) to observe affordances under the new active entity
         if is_modal_toggle:
-            motion_candidates = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
+            motion_candidates = [a for a in ("ACTION1", "ACTION2", "ACTION3", "ACTION4") if a in allowed_discrete]
             for act in motion_candidates:
                 if act != triggering_action_id and not any(p.action_id == act for p in reprobes) and len(reprobes) < rem:
                     reprobes.append(
@@ -1515,14 +1712,27 @@ class PrimitiveProbeManager:
             or "0 cells changed" in effect_summary
             or "zero" in effect_summary
         )
-        is_vector_action = triggering_action_id in ("ACTION1", "ACTION2", "ACTION3", "ACTION4")
+        is_vector_action = triggering_action_id in ("ACTION1", "ACTION2", "ACTION3", "ACTION4") and triggering_action_id in allowed_discrete
         if is_vector_action and is_zero_effect:
+            # This is an invariant-verification probe: a vector action had no effect,
+            # so we try modal switches. Count it toward invariant budget.
+            self.invariant_probes_count += 1
             for modal_act in ("ACTION5", "ACTION6"):
+                if modal_act not in allowed_set:
+                    continue
                 if modal_act != triggering_action_id and len(reprobes) < rem:
+                    modal_data: dict[str, Any] = {}
+                    if modal_act == "ACTION6" and planning_set is not None:
+                        if getattr(planning_set, "coordinate_candidates", None):
+                            c0 = planning_set.coordinate_candidates[0]
+                            modal_data = {"x": int(c0.x), "y": int(c0.y)}
+                        elif getattr(planning_set, "objects", None):
+                            o0 = planning_set.objects[0]
+                            modal_data = {"x": int(round(o0.centroid.col)), "y": int(round(o0.centroid.row))}
                     reprobes.append(
                         ActionDeclaration(
                             action_id=modal_act,
-                            data={},
+                            data=modal_data,
                             reasoning={
                                 "source": "dynamic_modal_switch_probe",
                                 "trigger": f"zero_effect_from_{triggering_action_id}",
@@ -1543,9 +1753,35 @@ class PrimitiveProbeManager:
                             )
                         )
 
-        if max_steps is not None:
-            return reprobes[:max_steps]
-        return reprobes
+        # Case 4: Post-Click Verification Probe
+        # When an object-targeted click or ACTION6 mutated the grid, but the semantic effect is ambiguous
+        # (e.g. non-kinematic change, palette/indicator mutation, or unrecognized state change),
+        # immediately probe with available primitive motion/action (ACTION1..ACTION4) to test
+        # if clicking this object unlocked movement, opened a passage, or activated an entity.
+        is_click_action = triggering_action_id in ("ACTION6", "CLICK")
+        is_effective = self.is_action_effective(effect_summary)
+        is_pure_motion = ("moved" in effect_summary and any(d in effect_summary for d in ("UP", "DOWN", "LEFT", "RIGHT")))
+        if is_click_action and is_effective and not is_pure_motion and not is_modal_toggle and len(reprobes) < rem:
+            motion_candidates = [act for act in ("ACTION1", "ACTION2", "ACTION3", "ACTION4") if act in allowed_discrete]
+            for act in motion_candidates[:2]:
+                if not any(p.action_id == act for p in reprobes) and len(reprobes) < rem:
+                    reprobes.append(
+                        ActionDeclaration(
+                            action_id=act,
+                            data={},
+                            reasoning={
+                                "source": "post_click_verification_probe",
+                                "trigger": f"click_mutated_grid_by_{triggering_action_id}",
+                                "rationale": "verify_if_click_unlocked_movement_or_mechanic",
+                            },
+                        )
+                    )
+
+        if reprobes:
+            if max_steps is not None:
+                return reprobes[:max_steps]
+            return reprobes
+        return []
 
     def schedule_falsification_reprobe(
         self,
@@ -1564,10 +1800,15 @@ class PrimitiveProbeManager:
         self.total_probes_executed = 0
 
         modals = list(modal_switch_actions) if modal_switch_actions is not None else ["ACTION5", "ACTION6"]
+        if self.available_discrete_actions:
+            modals = [m for m in modals if m in self.available_discrete_actions]
 
         probes: list[ActionDeclaration] = []
         # 1. Baseline discrete motion actions
-        vector_candidates = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
+        vector_candidates = [
+            a for a in ("ACTION1", "ACTION2", "ACTION3", "ACTION4")
+            if not self.available_discrete_actions or a in self.available_discrete_actions
+        ]
         for act in vector_candidates:
             probes.append(
                 ActionDeclaration(
@@ -1641,18 +1882,29 @@ class PrimitiveProbeManager:
         else:
             acts = []
 
+        for act in acts:
+            act_u = str(act).upper()
+            if act_u in self.DISCRETE_PROBE_ALLOWED:
+                self.available_discrete_actions.add(act_u)
+
+        # Prune any inactive_actions not actually in the level's allowed discrete actions
+        self.inactive_actions = {a for a in self.inactive_actions if a in self.available_discrete_actions}
+
         probes: list[ActionDeclaration] = []
 
-        # 1. Unconfirmed discrete actions (actions that have not yet yielded confirmed semantics)
+        # Sort unconfirmed discrete actions deterministically: ACTION1, ACTION2, ACTION3, ACTION4, ACTION5...
         unconfirmed = [
             str(act).upper() for act in acts
             if str(act).upper() in self.DISCRETE_PROBE_ALLOWED
             and str(act).upper() not in confirmed
             and str(act).upper() not in tested_in_this_level
         ]
+        unconfirmed_sorted = sorted(
+            unconfirmed,
+            key=lambda a: (int(a.replace("ACTION", "")) if a.startswith("ACTION") and a.replace("ACTION", "").isdigit() else 999, a)
+        )
 
-        # First, queue individual unconfirmed actions (e.g. ACTION5 on Level 1, or ACTION1..5 on Level 0)
-        for act_str in unconfirmed:
+        for act_str in unconfirmed_sorted:
             if len(probes) < limit:
                 probes.append(
                     ActionDeclaration(
@@ -1662,25 +1914,8 @@ class PrimitiveProbeManager:
                     )
                 )
 
-        # If on level 0 (no actions confirmed yet), queue all discrete actions
-        if not confirmed:
-            for act in acts:
-                act_str = str(act).upper()
-                if (
-                    act_str in self.DISCRETE_PROBE_ALLOWED
-                    and act_str not in tested_in_this_level
-                    and not any(p.action_id == act_str for p in probes)
-                    and len(probes) < limit
-                ):
-                    probes.append(
-                        ActionDeclaration(
-                            action_id=act_str,
-                            data={},
-                            reasoning={"source": "primitive_probe", "type": "initial_sweep"},
-                        )
-                    )
-
         self._initial_sweep_planned = True
+        self._initial_sweep_done = (len(probes) == 0)
         return probes
 
     def plan_targeted_coordinate_probes(
@@ -1725,7 +1960,7 @@ class PrimitiveProbeManager:
             for aff in affordances:
                 x = int(aff.get("x", -1))
                 y = int(aff.get("y", -1))
-                if x >= 0 and y >= 0 and (x, y) not in tested_coords and len(probes) < 4:
+                if x >= 0 and y >= 0 and (x, y) not in tested_coords and len(probes) < 2:
                     tested_coords.add((x, y))
                     probes.append(
                         ActionDeclaration(
@@ -1740,7 +1975,7 @@ class PrimitiveProbeManager:
                     )
         if not probes:
             for coord in planning_set.coordinate_candidates:
-                if coord.source_type == "object_centroid" and (coord.x, coord.y) not in tested_coords and len(probes) < 3:
+                if coord.source_type == "object_centroid" and (coord.x, coord.y) not in tested_coords and len(probes) < 2:
                     tested_coords.add((coord.x, coord.y))
                     probes.append(
                         ActionDeclaration(
@@ -1753,7 +1988,7 @@ class PrimitiveProbeManager:
                             },
                         )
                     )
-        return probes
+        return probes[:2]
 
     def record_probe_result(
         self,
@@ -1771,7 +2006,14 @@ class PrimitiveProbeManager:
         affordance = classify_probe_affordance(before_snapshot, after_obs, action_id=action_id, planning_set=planning_set)
 
         if self.is_action_effective(effect_str):
-            self.confirmed_effective_actions[action_id] = effect_str
+            existing_eff = self.confirmed_effective_actions.get(action_id)
+            if existing_eff and existing_eff != "confirmed_reusable_action":
+                existing_parts = [p.strip() for p in existing_eff.split(" | ") if p.strip()]
+                if effect_str.strip() not in existing_parts:
+                    existing_parts.append(effect_str.strip())
+                self.confirmed_effective_actions[action_id] = " | ".join(existing_parts)
+            else:
+                self.confirmed_effective_actions[action_id] = effect_str
             self.inactive_actions.discard(action_id)
             self.zero_effect_actions.discard(action_id)
             self.conditional_candidate_actions.discard(action_id)
@@ -1782,13 +2024,25 @@ class PrimitiveProbeManager:
                 if action_id in self.DISCRETE_PROBE_ALLOWED:
                     self.conditional_candidate_actions.add(action_id)
 
+        # Check if initial sweep has completed across all available discrete actions
+        if self._initial_sweep_planned and not self._initial_sweep_done:
+            if self.available_discrete_actions:
+                all_tested = all(
+                    (a in self.probed_actions or a in self.confirmed_effective_actions)
+                    for a in self.available_discrete_actions
+                )
+                if all_tested or self.total_probes_executed >= self.max_probes:
+                    self._initial_sweep_done = True
+            else:
+                self._initial_sweep_done = True
+
         probe_id = f"probe_{len(memory.probe_history)}" if memory else f"probe_{self.total_probes_executed}"
         record = ProbeRecord(
             probe_id=probe_id,
             action_id=action_id,
             action_data=action_data,
             observed_effect=effect_str,
-            confidence=0.95 if self.is_action_effective(effect_str) else 0.5,
+            confidence=0.9 if self.is_action_effective(effect_str) else 0.5,
             affordance=affordance,
         )
         if memory:
@@ -1796,8 +2050,11 @@ class PrimitiveProbeManager:
         return record
 
     def get_next_combinatorial_chain(self) -> list[ActionDeclaration]:
-        """Generate next chain of actions to test remaining inactive discrete actions in modified states."""
-        inactive_discrete = [a for a in sorted(list(self.inactive_actions)) if a in self.DISCRETE_PROBE_ALLOWED]
+        """Generate next chain of actions to test remaining conditional/inactive discrete actions in modified states."""
+        inactive_discrete = [
+            a for a in sorted(list(self.inactive_actions | self.conditional_candidate_actions))
+            if a in self.DISCRETE_PROBE_ALLOWED and a not in self.confirmed_effective_actions
+        ]
         if not inactive_discrete:
             return []
         if self.total_probes_executed >= self.max_probes:
@@ -1806,6 +2063,13 @@ class PrimitiveProbeManager:
         motion_actions = [a for a in self.confirmed_effective_actions if self.is_motion_action(a)]
         if not motion_actions:
             motion_actions = [a for a in self.confirmed_effective_actions if a in self.DISCRETE_PROBE_ALLOWED]
+        if not motion_actions:
+            motion_actions = [
+                a for a in sorted(self.available_discrete_actions)
+                if a not in inactive_discrete
+            ]
+        if not motion_actions and self.available_discrete_actions:
+            motion_actions = sorted(list(self.available_discrete_actions))
 
         rem = self.max_probes - self.total_probes_executed
         if rem <= 0:
@@ -1815,7 +2079,7 @@ class PrimitiveProbeManager:
             chain_key = (m_act, tuple(inactive_discrete))
             if chain_key not in self._chains_attempted:
                 self._chains_attempted.add(chain_key)
-                chain_acts = [m_act] + inactive_discrete
+                chain_acts = [m_act] + [a for a in inactive_discrete if a != m_act]
                 return [
                     ActionDeclaration(
                         action_id=act_id,
@@ -1832,6 +2096,8 @@ class PrimitiveProbeManager:
 
         for inact in inactive_discrete:
             for m_act in motion_actions:
+                if m_act == inact:
+                    continue
                 chain_key_rev = ("rev", inact, m_act)
                 if chain_key_rev not in self._chains_attempted:
                     self._chains_attempted.add(chain_key_rev)

@@ -10,9 +10,20 @@ Guarantees zero cross-contamination between:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
 
+from v10_agent.action_semantics import (
+    mentions_action_call,
+    parse_action_ids,
+    parse_displacement,
+    parse_object_ids,
+    parse_object_ids_after,
+    parse_object_ids_after_keywords,
+    replace_object_tokens,
+    strip_annotated_segments,
+    tokenize_note,
+)
 from v10_agent.brusentsov_logic import BrusentsovJudgment, Ternary
 
 
@@ -35,6 +46,26 @@ class EntityRole(str, Enum):
     COLLECTIBLE = "collectible"
     PORTAL = "portal"
     UNKNOWN = "unknown"
+
+
+ROLE_ALIASES: dict[str, EntityRole] = {
+    "background": EntityRole.BACKGROUND,
+    "actor": EntityRole.ACTOR,
+    "player": EntityRole.ACTOR,
+    "agent": EntityRole.ACTOR,
+    "obstacle": EntityRole.OBSTACLE,
+    "wall": EntityRole.OBSTACLE,
+    "barrier": EntityRole.OBSTACLE,
+    "hazard": EntityRole.HAZARD,
+    "danger": EntityRole.HAZARD,
+    "target": EntityRole.TARGET,
+    "goal": EntityRole.TARGET,
+    "collectible": EntityRole.COLLECTIBLE,
+    "key": EntityRole.COLLECTIBLE,
+    "coin": EntityRole.COLLECTIBLE,
+    "portal": EntityRole.PORTAL,
+    "door": EntityRole.PORTAL,
+}
 
 
 @dataclass
@@ -90,8 +121,9 @@ class PaletteRoleMap:
     def get_role_label(self, color_id: int) -> str:
         if 0 <= color_id < len(self.colors):
             aff = self.colors[color_id]
-            return f"Color {color_id} ({aff.role.value.upper()})"
-        return f"Color {color_id} (UNKNOWN)"
+            if aff.role != EntityRole.UNKNOWN:
+                return f"Color {color_id} ({aff.role.value.upper()})"
+        return f"Color {color_id}"
 
     def generalize_color_reference(self, text: str) -> str:
         """Replace color IDs with role-aware labels instead of destructive [COLOR] erasure."""
@@ -107,6 +139,18 @@ class PaletteRoleMap:
         text = re.sub(r"\(color\s+(\d+)\)", lambda m: f"({_replace_color(m)})", text, flags=re.IGNORECASE)
         return text
 
+    def update_pixel_counts(self, grid: list[list[int]]) -> None:
+        """Update pixel counts and dynamic status for all colors in the grid."""
+        if not grid or not grid[0]:
+            return
+        from collections import Counter
+        counts = Counter(c for row in grid for c in row)
+        for aff in self.colors:
+            cnt = counts.get(aff.color_id, 0)
+            if aff.pixel_count > 0 and cnt != aff.pixel_count:
+                aff.is_dynamic = True
+            aff.pixel_count = cnt
+
     def format_for_prompt(self) -> str:
         lines = ["PALETTE MAPPING (16 Colors, 0..15):"]
         for aff in self.colors:
@@ -116,6 +160,8 @@ class PaletteRoleMap:
                     f"  Color {aff.color_id}: {aff.role.value.upper()} ({status}, "
                     f"pixels={aff.pixel_count}, confidence={aff.confidence:.1f})"
                 )
+        if len(lines) <= 1:
+            return ""
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
@@ -157,12 +203,24 @@ FORBIDDEN_GOAL_KEYWORDS_IN_CODER = {
     "brusentsov",
     "live_omit",
     "severed_null",
+    "goal invariant",
+    "goal_rule",
+    "winning_invariant",
+    "positive_canon",
+    "victory",
+    "defeat",
 }
 
 FORBIDDEN_GOAL_PATTERNS_IN_CODER = [
-    re.compile(r"\blevel_goal\b", re.IGNORECASE),
-    re.compile(r"\bwin_condition\b", re.IGNORECASE),
-    re.compile(r"\btarget_score\b", re.IGNORECASE),
+    re.compile(r"\b(?:level_goal|win_condition|target_score)\b", re.IGNORECASE),
+    re.compile(r"\bgoal\s+invariant\b", re.IGNORECASE),
+    re.compile(r"\bgoal_rule\b", re.IGNORECASE),
+    re.compile(r"\bwinning_invariant\b", re.IGNORECASE),
+    re.compile(r"\bPOSITIVE_CANON\b", re.IGNORECASE),
+    re.compile(r"\bTARGET\s*=\s*\d+", re.IGNORECASE),
+    re.compile(r"\bHAZARD\s*=\s*\d+", re.IGNORECASE),
+    re.compile(r"\bVICTORY\b", re.IGNORECASE),
+    re.compile(r"\bDEFEAT\b", re.IGNORECASE),
     re.compile(r"\bhypothesis_family\b", re.IGNORECASE),
     re.compile(r"\bepistemic_verdict\b", re.IGNORECASE),
     re.compile(r"\bbrusentsov\b", re.IGNORECASE),
@@ -370,13 +428,15 @@ class EpistemicMemory:
     def record_judgment(self, judgment: BrusentsovJudgment) -> None:
         """Record a Brusentsov transition judgment, strictly asserting ISO-1 and ISO-9."""
         expl = judgment.explanation or ""
+        sanitized_expl = expl
         for pat in FORBIDDEN_SYNTAX_PATTERNS_IN_SOLVER:
-            if pat.search(expl):
+            if pat.search(sanitized_expl):
                 logger.warning(
                     f"ISO-1 Violation (softened): Python syntax error / traceback pattern {pat.pattern!r} appeared in EpistemicMemory. Sanitizing."
                 )
-                expl = pat.sub("[REDACTED SYNTAX]", expl)
-                object.__setattr__(judgment, "explanation", expl)
+                sanitized_expl = pat.sub("[REDACTED SYNTAX]", sanitized_expl)
+        if sanitized_expl != judgment.explanation:
+            judgment = replace(judgment, explanation=sanitized_expl)
 
         # ISO-9: UNDECIDED epistemic signals are kept in epistemic_signals, not committed judgments
         from v10_agent.brusentsov_logic import Verdict
@@ -452,7 +512,7 @@ class EpistemicMemory:
             parts = tuple(s.strip() for s in signature_id.split(" -> ") if s.strip())
             if parts and parts not in self.failed_completed_trajectories:
                 self.failed_completed_trajectories.append(parts)
-        elif signature_id.strip() and not signature_id.startswith("sig_") and not signature_id.startswith("s"):
+        elif signature_id.strip() and not signature_id.startswith("sig_") and signature_id != "":
             parts = (signature_id.strip(),)
             if parts not in self.failed_completed_trajectories:
                 self.failed_completed_trajectories.append(parts)
@@ -537,7 +597,7 @@ def _classify_tier(rule: str) -> tuple[int, str]:
 
 @dataclass
 class StructuredInvariant:
-    """A typed domain-general invariant evaluated using Brusentsov ternary logic."""
+    """[DEPRECATED: Use EmpiricalInvariant] A typed domain-general invariant evaluated using Brusentsov ternary logic."""
     invariant_id: str                      # Unique ID
     invariant_type: str                    # 'kinematics' | 'symmetry' | 'palette' | 'goal' | 'topology' | 'control' | 'interaction' | 'general'
     tier: int                              # 1, 2, 3
@@ -669,7 +729,7 @@ class VictoryExemplar:
 
 @dataclass
 class GroundedInvariant:
-    """Symbolic invariant grounded in concrete exemplars via Brusentsov logic of entailment."""
+    """[DEPRECATED: Use EmpiricalInvariant] Symbolic invariant grounded in concrete exemplars via Brusentsov logic of entailment."""
     invariant_id: str
     antecedent: str               # e.g., 'Contact(ACTOR, Color_2)'
     consequent: str               # e.g., 'DefeatReset()'
@@ -707,6 +767,116 @@ class GroundedInvariant:
 
 
 @dataclass
+class EmpiricalInvariant:
+    invariant_id: str
+    invariant_type: str  # "area_conservation", "contact_trigger", "kinematic_law", etc.
+    abstract_description: str  # Обобщенная формулировка ("Objects conserve area")
+    subject_pattern: str  # Паттерн субъекта ("color==ACTOR", "area>4")
+    expected_value: Any  # Ожидаемое значение/паттерн
+    scope: str  # "CORE_GAME_LAW" | "DOMAIN_PATTERN" | "LEVEL_SPECIFIC"
+    confirmed_on_levels: list[int] = field(default_factory=list)
+    falsified_on_levels: list[int] = field(default_factory=list)
+    times_confirmed: int = 0
+    times_falsified: int = 0
+    confidence: float = 0.0  # НАЧИНАЕТСЯ С 0!
+    last_observed_value: Any = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.times_falsified == 0 and self.confidence >= 0.3
+
+    @property
+    def net_support(self) -> int:
+        return self.times_confirmed - 2 * self.times_falsified  # Штраф за опровержение
+
+    def confirm(self, level_index: int, observed_value: Any = None) -> None:
+        if level_index not in self.confirmed_on_levels:
+            self.confirmed_on_levels.append(level_index)
+        self.times_confirmed += 1
+        self.confidence = min(1.0, round(self.confidence + 0.1, 2))
+        self.last_observed_value = observed_value
+
+    def falsify(self, level_index: int, observed_value: Any = None) -> None:
+        if level_index not in self.falsified_on_levels:
+            self.falsified_on_levels.append(level_index)
+        self.times_falsified += 1
+        self.confidence = max(0.0, round(self.confidence - 0.2, 2))
+        self.last_observed_value = observed_value
+        # Если опровергнуто 2+ раза на разных уровнях — понижаем scope
+        if len(self.falsified_on_levels) >= 2 and self.scope == "CORE_GAME_LAW":
+            self.scope = "LEVEL_SPECIFIC"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "invariant_id": self.invariant_id,
+            "invariant_type": self.invariant_type,
+            "abstract_description": self.abstract_description,
+            "subject_pattern": self.subject_pattern,
+            "expected_value": self.expected_value,
+            "scope": self.scope,
+            "confirmed_on_levels": list(self.confirmed_on_levels),
+            "falsified_on_levels": list(self.falsified_on_levels),
+            "times_confirmed": self.times_confirmed,
+            "times_falsified": self.times_falsified,
+            "confidence": round(self.confidence, 2),
+            "last_observed_value": self.last_observed_value,
+            "is_active": self.is_active,
+            "net_support": self.net_support,
+        }
+
+
+@dataclass
+class CoreInvariantRegistry:
+    invariants: list[EmpiricalInvariant] = field(default_factory=list)
+    max_active: int = 20
+
+    def register_candidate(self, inv: EmpiricalInvariant) -> None:
+        # Дедупликация по invariant_id
+        existing = next((i for i in self.invariants if i.invariant_id == inv.invariant_id), None)
+        if existing is None:
+            self.invariants.append(inv)
+            self._prune()
+
+    def confirm_by_type(self, invariant_type: str, subject_pattern: str, 
+                        level_index: int, observed_value: Any) -> None:
+        for inv in self.invariants:
+            if inv.invariant_type == invariant_type and inv.subject_pattern == subject_pattern:
+                inv.confirm(level_index, observed_value)
+
+    def falsify_by_type(self, invariant_type: str, subject_pattern: str,
+                        level_index: int, observed_value: Any) -> None:
+        for inv in self.invariants:
+            if inv.invariant_type == invariant_type and inv.subject_pattern == subject_pattern:
+                inv.falsify(level_index, observed_value)
+
+    def get_core_game_laws(self) -> list[EmpiricalInvariant]:
+        return sorted(
+            [i for i in self.invariants if i.scope == "CORE_GAME_LAW" and i.is_active],
+            key=lambda x: x.net_support, reverse=True
+        )
+
+    def format_for_prompt(self) -> str:
+        # Таблица: Инвариант | Тип | Уровни ✓ | Уровни ✗ | Confidence | Scope
+        lines = ["INVARIANT REGISTRY:"]
+        lines.append(f"{'INVARIANT':<40} {'TYPE':<20} {'✓':<5} {'✗':<5} {'CONF':<6} {'SCOPE':<15}")
+        lines.append("-" * 95)
+        for inv in sorted(self.invariants, key=lambda x: x.net_support, reverse=True)[:15]:
+            lines.append(
+                f"{inv.abstract_description[:40]:<40} "
+                f"{inv.invariant_type[:20]:<20} "
+                f"{len(inv.confirmed_on_levels):<5} "
+                f"{len(inv.falsified_on_levels):<5} "
+                f"{inv.confidence:<6.2f} "
+                f"{inv.scope:<15}"
+            )
+        return "\n".join(lines)
+
+    def _prune(self) -> None:
+        # Удаляем инварианты с сильным отрицательным net_support
+        self.invariants = [i for i in self.invariants if i.net_support > -3]
+
+
+@dataclass
 class GameMemory:
     """Cross-level memory summary surviving level transitions within the same game.
     
@@ -733,34 +903,150 @@ class GameMemory:
     confirmed_actor_ids: set[str] = field(default_factory=set)
     # --- New memory blocks ---
     palette: PaletteRoleMap = field(default_factory=PaletteRoleMap)
+    defeat_exemplars: list[DefeatExemplar] = field(default_factory=list)
+    victory_exemplars: list[VictoryExemplar] = field(default_factory=list)
     last_defeat_exemplar: DefeatExemplar | None = None
     last_victory_exemplar_v2: VictoryExemplar | None = None
     grounded_invariants: list[GroundedInvariant] = field(default_factory=list)
     curriculum_history: list[dict[str, Any]] = field(default_factory=list)
     working_hypotheses: list[dict[str, Any]] = field(default_factory=list)
     action_affordances: list[dict[str, Any]] = field(default_factory=list)
+    invariant_registry: CoreInvariantRegistry = field(default_factory=CoreInvariantRegistry)
+    previous_level_registry: CoreInvariantRegistry | None = None
+
+    def add_defeat(self, ex: DefeatExemplar) -> None:
+        """Store defeat exemplar maintaining last 5 exemplars buffer."""
+        self.defeat_exemplars.append(ex)
+        if len(self.defeat_exemplars) > 5:
+            self.defeat_exemplars.pop(0)
+        self.last_defeat_exemplar = ex
+
+    def add_victory(self, ex: VictoryExemplar) -> None:
+        """Store victory exemplar maintaining last 5 exemplars buffer."""
+        self.victory_exemplars.append(ex)
+        if len(self.victory_exemplars) > 5:
+            self.victory_exemplars.pop(0)
+        self.last_victory_exemplar_v2 = ex
+
+    def analyze_defeat_patterns(self) -> list[str]:
+        """Detect recurring failure patterns from recent defeat exemplars."""
+        if len(self.defeat_exemplars) < 2:
+            return []
+        from collections import Counter
+        patterns = Counter(
+            (e.hazard_color, e.fatal_action_id) for e in self.defeat_exemplars
+        )
+        return [f"Hazard color {c}, action ACTION{a}: {n} times" 
+                for (c, a), n in patterns.most_common(3) if n >= 2]
+
+    def summarize_progression(self) -> str:
+        """Summarize progression history across completed levels for curriculum grounding."""
+        if not self.curriculum_history:
+            return "none"
+        lines = []
+        for entry in self.curriculum_history[-5:]:
+            lvl = entry.get("level", entry.get("from_level", entry.get("to_level", "?")))
+            steps = entry.get("steps_to_win", entry.get("steps", "?"))
+            invs = entry.get("invariants_confirmed", [])
+            carried = entry.get("core_invariants_carried", len(invs) if isinstance(invs, list) else 0)
+            inv_count = len(invs) if isinstance(invs, list) and invs else carried
+            summary = entry.get("summary", "")
+            line = f"Level {lvl}: completed in {steps} steps (invariants: {inv_count})"
+            if summary:
+                line += f" | {summary}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def record_hypothesis(self, hypothesis: str, source_step_id: str = "") -> None:
+        """Record an active working hypothesis from evidence probes or planner."""
+        if not hypothesis:
+            return
+        self.working_hypotheses.append({
+            "hypothesis": hypothesis,
+            "source_step": source_step_id,
+            "status": "pending",
+            "created_at": time.time(),
+        })
+        if len(self.working_hypotheses) > 10:
+            self.working_hypotheses.pop(0)
+
+    def migrate_legacy_invariants(self, level_index: int = 0) -> None:
+        """Migrate legacy StructuredInvariant and GroundedInvariant into EmpiricalInvariant with confidence=0.3."""
+        for s_inv in self.structured_invariants:
+            emp_inv = EmpiricalInvariant(
+                invariant_id=s_inv.invariant_id,
+                invariant_type=s_inv.invariant_type,
+                abstract_description=s_inv.description,
+                subject_pattern="legacy",
+                expected_value=None,
+                scope="DOMAIN_PATTERN" if s_inv.tier < 3 else "LEVEL_SPECIFIC",
+                confidence=0.3,
+                times_confirmed=1,
+                confirmed_on_levels=[level_index],
+            )
+            self.invariant_registry.register_candidate(emp_inv)
+
+        for g_inv in self.grounded_invariants:
+            emp_inv = EmpiricalInvariant(
+                invariant_id=g_inv.invariant_id,
+                invariant_type="grounded_exemplar",
+                abstract_description=f"{g_inv.antecedent} => {g_inv.consequent}",
+                subject_pattern="exemplar",
+                expected_value=g_inv.consequent,
+                scope=g_inv.scope,
+                confidence=0.3,
+                times_confirmed=g_inv.times_confirmed or 1,
+                confirmed_on_levels=[level_index],
+            )
+            self.invariant_registry.register_candidate(emp_inv)
 
     def update_action_affordances(self, affordances: list[dict[str, Any]]) -> None:
-        """Record or update confirmed action affordances."""
+        """Record or accumulate confirmed action affordances (preserving composite effects)."""
         for aff in affordances:
             if isinstance(aff, dict) and aff.get("action_id"):
                 act_id = str(aff["action_id"]).upper()
-                self.action_affordances = [
-                    a for a in self.action_affordances
-                    if not (isinstance(a, dict) and str(a.get("action_id", "")).upper() == act_id)
-                ]
-                self.action_affordances.append(dict(aff))
+                existing_aff = next(
+                    (a for a in self.action_affordances if isinstance(a, dict) and str(a.get("action_id", "")).upper() == act_id),
+                    None,
+                )
+                if existing_aff is not None:
+                    merged = dict(existing_aff)
+                    old_notes = str(existing_aff.get("coordination_notes", "")).strip()
+                    new_notes = str(aff.get("coordination_notes", "")).strip()
+                    if new_notes and new_notes not in [p.strip() for p in old_notes.split(" | ") if p.strip()]:
+                        merged["coordination_notes"] = f"{old_notes} | {new_notes}" if old_notes else new_notes
+                    # Preserve kinematic class if either is kinematic, and record composite effects in parameters
+                    old_cls = str(existing_aff.get("effect_class", ""))
+                    new_cls = str(aff.get("effect_class", ""))
+                    if new_cls == "KINEMATIC" and old_cls != "KINEMATIC":
+                        merged["effect_class"] = "KINEMATIC"
+                        merged_params = dict(aff.get("parameters", {}) or {})
+                        merged_params.setdefault("secondary_effects", []).append(existing_aff.get("parameters", {}))
+                        merged["parameters"] = merged_params
+                    elif new_notes and new_notes != old_notes:
+                        merged_params = dict(existing_aff.get("parameters", {}) or {})
+                        sec_list = list(merged_params.get("secondary_effects", []))
+                        new_p = aff.get("parameters", {})
+                        if new_p and new_p not in sec_list and new_p != existing_aff.get("parameters"):
+                            sec_list.append(new_p)
+                            merged_params["secondary_effects"] = sec_list
+                        merged["parameters"] = merged_params
+                    self.action_affordances = [
+                        a for a in self.action_affordances
+                        if not (isinstance(a, dict) and str(a.get("action_id", "")).upper() == act_id)
+                    ]
+                    self.action_affordances.append(merged)
+                else:
+                    self.action_affordances.append(dict(aff))
 
     @property
     def confirmed_actors(self) -> set[str]:
         """Return set of object IDs empirically observed to move or receive selection indicators."""
         actors: set[str] = set(self.confirmed_actor_ids)
         for note in self.selection_mechanics:
-            for oid in re.findall(r"obj_[a-zA-Z0-9_]+", note):
-                actors.add(oid)
+            actors.update(parse_object_ids(note))
         for eff in self.confirmed_action_effects.values():
-            for oid in re.findall(r"obj_[a-zA-Z0-9_]+", eff):
-                actors.add(oid)
+            actors.update(parse_object_ids(eff))
         return actors
 
     def _build_role_map(self) -> dict[str, str]:
@@ -777,16 +1063,16 @@ class GameMemory:
         for actor_id in self.confirmed_actors:
             role_map[actor_id] = "ACTOR"
 
-        # Step 2: Identify TARGETs — objects mentioned as destinations in action effects
+        # Step 2: Identify TARGETs — objects named as destinations in action effects
         for eff in self.confirmed_action_effects.values():
-            for m in re.finditer(r"toward\s+(obj_[a-zA-Z0-9_]+)", eff):
-                tid = m.group(1)
+            for tid in parse_object_ids_after(eff, "toward"):
                 role_map[tid] = "TARGET"
 
         # Step 3: Identify OBSTACLEs — objects associated with collision/blocked events
+        obstacle_lexicon = {"blocked", "wall", "collision", "obstacle", "barrier"}
         for rule in self.invariant_rules:
-            if re.search(r"\b(?:blocked|wall|collision|obstacle|barrier)\b", rule, re.IGNORECASE):
-                for oid in re.findall(r"obj_[a-zA-Z0-9_]+", rule):
+            if obstacle_lexicon.intersection(tokenize_note(rule)):
+                for oid in parse_object_ids(rule):
                     role_map[oid] = "OBSTACLE"
 
         return role_map
@@ -798,10 +1084,11 @@ class GameMemory:
         collision objects → [OBSTACLE], unknown → [ENTITY].
         Colors are generalized using PaletteRoleMap semantic roles instead of destructive [COLOR] erasure.
         """
-        for obj_id, role in self._build_role_map().items():
-            text = text.replace(obj_id, f"[{role}]")
-        # Any remaining unknown obj_... replaced by [ENTITY]
-        text = re.sub(r"obj_[a-zA-Z0-9_]+", "[ENTITY]", text)
+        role_map = self._build_role_map()
+        lower_role_map = {key.lower(): role for key, role in role_map.items()}
+        # Every obj_... token is rewritten in a single scan: known entities become
+        # their functional role, unknown entities collapse to [ENTITY].
+        text = replace_object_tokens(text, lambda tok: f"[{lower_role_map.get(tok.lower(), 'ENTITY')}]")
         # Use PaletteRoleMap for semantic color generalization instead of [COLOR] erasure
         if hasattr(self, 'palette') and self.palette is not None:
             text = self.palette.generalize_color_reference(text)
@@ -820,7 +1107,15 @@ class GameMemory:
         ))
 
     def record_action_effect(self, action_id: str, summary: str) -> None:
-        self.confirmed_action_effects[action_id] = summary
+        existing = self.confirmed_action_effects.get(action_id)
+        if existing and existing != "confirmed_reusable_action":
+            existing_parts = [p.strip() for p in existing.split(" | ") if p.strip()]
+            for np in [p.strip() for p in summary.split(" | ") if p.strip()]:
+                if np not in existing_parts:
+                    existing_parts.append(np)
+            self.confirmed_action_effects[action_id] = " | ".join(existing_parts)
+        else:
+            self.confirmed_action_effects[action_id] = summary
         self.unconfirmed_actions.pop(action_id, None)
         rule = f"Action {action_id} kinematic effect: {summary}"
         self.record_stratified_invariant(
@@ -878,21 +1173,20 @@ class GameMemory:
             self.selection_mechanics.append(note)
         
         metadata = {}
-        # Extract general actor/source entity from selection mechanic note
-        m_src = re.search(r"(?:moved|controlled|active|source)\s+(?:from\s+)?(obj_[a-zA-Z0-9_]+)", note, re.IGNORECASE)
-        if m_src:
-            metadata["init_source_entity"] = m_src.group(1)
+        # Extract general actor/source entity from selection mechanic note.
+        # The earliest relational keyword in the note wins, as an alternation scan did.
+        source_pairs = parse_object_ids_after_keywords(note, ("moved", "controlled", "active", "source"))
+        if source_pairs:
+            metadata["init_source_entity"] = source_pairs[0][1]
 
-        m_act = re.search(r"(ACTION\d+)", note, re.IGNORECASE)
-        if m_act:
-            metadata["action_id"] = m_act.group(1).upper()
+        for action_id in parse_action_ids(note):
+            metadata["action_id"] = action_id.upper()
+            break
 
-        # Extract displacement if present
-        m_dy = re.search(r"dy=([+-]?\d+)", note)
-        m_dx = re.search(r"dx=([+-]?\d+)", note)
-        if m_dy and m_dx:
-            metadata["dy"] = int(m_dy.group(1))
-            metadata["dx"] = int(m_dx.group(1))
+        # Extract displacement if present (both axes required)
+        displacement = parse_displacement(note)
+        if displacement is not None:
+            metadata["dy"], metadata["dx"] = displacement
 
         inv_type = "kinematics"
         self.record_stratified_invariant(note, tier=2, invariant_type=inv_type, confidence=0.8, source="selection_probe", metadata=metadata)
@@ -979,7 +1273,7 @@ class GameMemory:
                 "invariant": invariant_rule,
                 "winning_macro": winning_macro,
             })
-            if winning_macro and not re.search(r"action\d+\(\)", winning_macro, re.IGNORECASE):
+            if winning_macro and not mentions_action_call(winning_macro):
                 self.record_stratified_invariant(
                     f"Goal invariant ({level_id}): {invariant_rule} (macro: {winning_macro})",
                     tier=3,
@@ -1152,6 +1446,19 @@ class GameMemory:
         if not revised_invariants:
             return
 
+        level_idx = 0
+        if level_id:
+            num_m = re.search(r"\d+", level_id)
+            if num_m:
+                try:
+                    level_idx = int(num_m.group(0))
+                except ValueError:
+                    level_idx = self.completed_levels
+            else:
+                level_idx = self.completed_levels
+        else:
+            level_idx = self.completed_levels
+
         for line in revised_invariants:
             rule_clean = line.strip().lstrip("-*•0123456789. ")
             if not rule_clean:
@@ -1166,23 +1473,246 @@ class GameMemory:
 
             # Route based on explicit category tag or classifier
             r_lower = rule_clean.lower()
-            if r_lower.startswith("[physics]") or any(kw in r_lower for kw in ("displacement", "velocity", "kinematic effect", "collision", "wall")):
+            if r_lower.startswith("[negative_barrier]") or "negative_barrier" in r_lower:
+                tier = 1
+                inv_type = "hazard_barrier"
+                cid_match = re.search(r"Color[_\s]+(\d+)", rule_clean, re.IGNORECASE)
+                if cid_match:
+                    cid = int(cid_match.group(1))
+                    self.palette.assign_role(cid, EntityRole.HAZARD, confidence=0.85, evidence=f"LLM invariant revision: {rule_clean}")
+                    inv_id = f"gi_hazard_color_{cid}"
+                    existing_g = next((g for g in self.grounded_invariants if g.invariant_id == inv_id), None)
+                    if existing_g:
+                        existing_g.times_confirmed += 1
+                        existing_g.confidence = min(1.0, existing_g.confidence + 0.15)
+                    else:
+                        self.grounded_invariants.append(GroundedInvariant(
+                            invariant_id=inv_id,
+                            antecedent=f"Contact(ACTOR, Color_{cid})",
+                            consequent="DefeatReset()",
+                            brusentsov_type="NEGATIVE_BARRIER",
+                            scope="CORE_GAME_LAW",
+                            times_confirmed=1,
+                            confidence=0.85,
+                            created_on_level=level_idx,
+                        ))
+                    emp_id = f"emp_hazard_color_{cid}"
+                    emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+                    if emp_inv:
+                        emp_inv.confirm(level_idx, rule_clean)
+                    else:
+                        self.invariant_registry.register_candidate(EmpiricalInvariant(
+                            invariant_id=emp_id,
+                            invariant_type="hazard_barrier",
+                            abstract_description=rule_clean,
+                            subject_pattern=f"color=={cid}",
+                            expected_value="DefeatReset()",
+                            scope="CORE_GAME_LAW",
+                            confirmed_on_levels=[level_idx],
+                            times_confirmed=1,
+                            confidence=0.85,
+                        ))
+                else:
+                    emp_id = f"emp_nb_{abs(hash(rule_clean)) % 100000}"
+                    emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+                    if emp_inv:
+                        emp_inv.confirm(level_idx, rule_clean)
+                    else:
+                        self.invariant_registry.register_candidate(EmpiricalInvariant(
+                            invariant_id=emp_id,
+                            invariant_type="hazard_barrier",
+                            abstract_description=rule_clean,
+                            subject_pattern="hazard",
+                            expected_value="DefeatReset()",
+                            scope="CORE_GAME_LAW",
+                            confirmed_on_levels=[level_idx],
+                            times_confirmed=1,
+                            confidence=0.85,
+                        ))
+
+            elif r_lower.startswith("[positive_canon]") or "positive_canon" in r_lower:
+                tier = 3
+                inv_type = "goal_canon"
+                cid_match = re.search(r"Color[_\s]+(\d+)", rule_clean, re.IGNORECASE)
+                if cid_match:
+                    cid = int(cid_match.group(1))
+                    self.palette.assign_role(cid, EntityRole.TARGET, confidence=0.85, evidence=f"LLM invariant revision: {rule_clean}")
+                    inv_id = f"gi_target_color_{cid}"
+                    existing_g = next((g for g in self.grounded_invariants if g.invariant_id == inv_id), None)
+                    if existing_g:
+                        existing_g.times_confirmed += 1
+                        existing_g.confidence = min(1.0, existing_g.confidence + 0.15)
+                    else:
+                        self.grounded_invariants.append(GroundedInvariant(
+                            invariant_id=inv_id,
+                            antecedent=f"Contact(ACTOR, Color_{cid})",
+                            consequent="LevelVictory()",
+                            brusentsov_type="POSITIVE_CANON",
+                            scope="CORE_GAME_LAW",
+                            times_confirmed=1,
+                            confidence=0.85,
+                            created_on_level=level_idx,
+                        ))
+                    emp_id = f"emp_target_color_{cid}"
+                    emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+                    if emp_inv:
+                        emp_inv.confirm(level_idx, rule_clean)
+                    else:
+                        self.invariant_registry.register_candidate(EmpiricalInvariant(
+                            invariant_id=emp_id,
+                            invariant_type="goal_canon",
+                            abstract_description=rule_clean,
+                            subject_pattern=f"color=={cid}",
+                            expected_value="LevelVictory()",
+                            scope="CORE_GAME_LAW",
+                            confirmed_on_levels=[level_idx],
+                            times_confirmed=1,
+                            confidence=0.85,
+                        ))
+                else:
+                    emp_id = f"emp_pc_{abs(hash(rule_clean)) % 100000}"
+                    emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+                    if emp_inv:
+                        emp_inv.confirm(level_idx, rule_clean)
+                    else:
+                        self.invariant_registry.register_candidate(EmpiricalInvariant(
+                            invariant_id=emp_id,
+                            invariant_type="goal_canon",
+                            abstract_description=rule_clean,
+                            subject_pattern="goal",
+                            expected_value="LevelVictory()",
+                            scope="CORE_GAME_LAW",
+                            confirmed_on_levels=[level_idx],
+                            times_confirmed=1,
+                            confidence=0.85,
+                        ))
+
+            elif r_lower.startswith("[palette & roles]") or r_lower.startswith("[palette]") or r_lower.startswith("[roles]"):
+                tier = 2
+                inv_type = "palette_role"
+                role_matches = list(re.finditer(r"Color[_\s]+(\d+)\s+(?:is|as|=|:|indicates|represents)\s+([A-Za-z_]+)", rule_clean, re.IGNORECASE))
+                matched_any = False
+                for rm in role_matches:
+                    cid = int(rm.group(1))
+                    role_str = rm.group(2).lower()
+                    role_enum = ROLE_ALIASES.get(role_str)
+                    if role_enum:
+                        matched_any = True
+                        self.palette.assign_role(cid, role_enum, confidence=0.85, evidence=f"LLM palette revision: {rule_clean}")
+                        emp_id = f"emp_palette_{cid}_{role_enum.value}"
+                        emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+                        if emp_inv:
+                            emp_inv.confirm(level_idx, role_enum.value)
+                        else:
+                            self.invariant_registry.register_candidate(EmpiricalInvariant(
+                                invariant_id=emp_id,
+                                invariant_type="palette_role",
+                                abstract_description=f"Color {cid} is {role_enum.value.upper()}",
+                                subject_pattern=f"color=={cid}",
+                                expected_value=role_enum.value.upper(),
+                                scope="CORE_GAME_LAW",
+                                confirmed_on_levels=[level_idx],
+                                times_confirmed=1,
+                                confidence=0.85,
+                            ))
+                if not matched_any:
+                    emp_id = f"emp_palette_{abs(hash(rule_clean)) % 100000}"
+                    self.invariant_registry.register_candidate(EmpiricalInvariant(
+                        invariant_id=emp_id,
+                        invariant_type="palette_role",
+                        abstract_description=rule_clean,
+                        subject_pattern="palette",
+                        expected_value="ROLES",
+                        scope="CORE_GAME_LAW",
+                        confirmed_on_levels=[level_idx],
+                        times_confirmed=1,
+                        confidence=0.85,
+                    ))
+
+            elif r_lower.startswith("[physics]") or any(kw in r_lower for kw in ("displacement", "velocity", "kinematic effect", "collision", "wall")):
                 tier = 1
                 inv_type = "kinematics"
+                emp_id = f"emp_phys_{abs(hash(rule_clean)) % 100000}"
+                emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+                if emp_inv:
+                    emp_inv.confirm(level_idx, rule_clean)
+                else:
+                    self.invariant_registry.register_candidate(EmpiricalInvariant(
+                        invariant_id=emp_id,
+                        invariant_type="kinematic_law",
+                        abstract_description=rule_clean,
+                        subject_pattern="physics",
+                        expected_value="VALID",
+                        scope="CORE_GAME_LAW" if outcome == "WIN" else "DOMAIN_PATTERN",
+                        confirmed_on_levels=[level_idx],
+                        times_confirmed=1,
+                        confidence=0.85 if outcome == "WIN" else 0.5,
+                    ))
+
             elif r_lower.startswith("[control]") or r_lower.startswith("[entities]") or r_lower.startswith("[structure]"):
                 tier = 2
                 inv_type = "control" if "control" in r_lower else "topology"
+                emp_id = f"emp_{inv_type}_{abs(hash(rule_clean)) % 100000}"
+                emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+                if emp_inv:
+                    emp_inv.confirm(level_idx, rule_clean)
+                else:
+                    self.invariant_registry.register_candidate(EmpiricalInvariant(
+                        invariant_id=emp_id,
+                        invariant_type=inv_type,
+                        abstract_description=rule_clean,
+                        subject_pattern=inv_type,
+                        expected_value="VALID",
+                        scope="CORE_GAME_LAW" if outcome == "WIN" else "DOMAIN_PATTERN",
+                        confirmed_on_levels=[level_idx],
+                        times_confirmed=1,
+                        confidence=0.85 if outcome == "WIN" else 0.5,
+                    ))
+
             elif r_lower.startswith("[goal]"):
                 tier = 3
                 inv_type = "goal"
+                emp_id = f"emp_goal_{abs(hash(rule_clean)) % 100000}"
+                emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+                if emp_inv:
+                    emp_inv.confirm(level_idx, rule_clean)
+                else:
+                    self.invariant_registry.register_candidate(EmpiricalInvariant(
+                        invariant_id=emp_id,
+                        invariant_type="goal",
+                        abstract_description=rule_clean,
+                        subject_pattern="goal",
+                        expected_value="VALID",
+                        scope="CORE_GAME_LAW" if outcome == "WIN" else "DOMAIN_PATTERN",
+                        confirmed_on_levels=[level_idx],
+                        times_confirmed=1,
+                        confidence=0.85 if outcome == "WIN" else 0.5,
+                    ))
+
             else:
                 tier, inv_type = _classify_tier(rule_clean)
+                emp_id = f"emp_{inv_type}_{abs(hash(rule_clean)) % 100000}"
+                emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+                if emp_inv:
+                    emp_inv.confirm(level_idx, rule_clean)
+                else:
+                    self.invariant_registry.register_candidate(EmpiricalInvariant(
+                        invariant_id=emp_id,
+                        invariant_type=inv_type,
+                        abstract_description=rule_clean,
+                        subject_pattern=inv_type,
+                        expected_value="VALID",
+                        scope="CORE_GAME_LAW" if outcome == "WIN" else "DOMAIN_PATTERN",
+                        confirmed_on_levels=[level_idx],
+                        times_confirmed=1,
+                        confidence=0.8 if outcome == "WIN" else 0.4,
+                    ))
 
             self.record_stratified_invariant(
                 rule=rule_clean,
                 tier=tier,
                 invariant_type=inv_type,
-                confidence=0.85 if outcome == "WIN" else 0.75,
+                confidence=0.8 if outcome == "WIN" else 0.4,
                 source=f"solver_revision_{outcome.lower()}",
             )
 
@@ -1243,7 +1773,7 @@ class GameMemory:
         lines = ["CURRICULUM INVARIANTS & WINNING PATTERNS (CONFIRMED ACROSS PREVIOUS LEVELS):"]
         for p in self.level_solution_patterns:
             macro = p.get("winning_macro", "")
-            if macro and not re.search(r"action\d+\(\)", macro, re.IGNORECASE):
+            if macro and not mentions_action_call(macro):
                 lines.append(
                     f"- {p.get('level_id', 'Level')}: Setup: {p.get('setup')} | Invariant: {p.get('invariant')} | Strategy: {macro}"
                 )
@@ -1295,7 +1825,7 @@ class GameMemory:
 
     def update_last_defeat(self, exemplar: DefeatExemplar) -> None:
         """Record the most recent defeat exemplar and auto-create a grounded hazard invariant."""
-        self.last_defeat_exemplar = exemplar
+        self.add_defeat(exemplar)
         if exemplar.hazard_color >= 0:
             self.palette.assign_role(
                 exemplar.hazard_color, EntityRole.HAZARD, confidence=0.9,
@@ -1318,10 +1848,26 @@ class GameMemory:
                     times_confirmed=1, confidence=0.9,
                     created_on_level=exemplar.level_index,
                 ))
+            emp_id = f"emp_hazard_color_{exemplar.hazard_color}"
+            emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+            if emp_inv:
+                emp_inv.confirm(exemplar.level_index, f"Defeat on step {exemplar.fatal_step}")
+            else:
+                self.invariant_registry.register_candidate(EmpiricalInvariant(
+                    invariant_id=emp_id,
+                    invariant_type="hazard_barrier",
+                    abstract_description=f"Contact with Color {exemplar.hazard_color} causes defeat",
+                    subject_pattern=f"color=={exemplar.hazard_color}",
+                    expected_value="DefeatReset()",
+                    scope="CORE_GAME_LAW",
+                    confirmed_on_levels=[exemplar.level_index],
+                    times_confirmed=1,
+                    confidence=0.9,
+                ))
 
     def update_last_victory(self, exemplar: VictoryExemplar) -> None:
         """Record the most recent victory exemplar and auto-create a grounded target invariant."""
-        self.last_victory_exemplar_v2 = exemplar
+        self.add_victory(exemplar)
         if exemplar.target_color >= 0:
             self.palette.assign_role(
                 exemplar.target_color, EntityRole.TARGET, confidence=0.9,
@@ -1344,13 +1890,43 @@ class GameMemory:
                     times_confirmed=1, confidence=0.9,
                     created_on_level=exemplar.level_index,
                 ))
+            emp_id = f"emp_target_color_{exemplar.target_color}"
+            emp_inv = next((i for i in self.invariant_registry.invariants if i.invariant_id == emp_id), None)
+            if emp_inv:
+                emp_inv.confirm(exemplar.level_index, f"Victory in {exemplar.total_steps} steps")
+            else:
+                self.invariant_registry.register_candidate(EmpiricalInvariant(
+                    invariant_id=emp_id,
+                    invariant_type="goal_canon",
+                    abstract_description=f"Reaching Color {exemplar.target_color} completes level",
+                    subject_pattern=f"color=={exemplar.target_color}",
+                    expected_value="LevelVictory()",
+                    scope="CORE_GAME_LAW",
+                    confirmed_on_levels=[exemplar.level_index],
+                    times_confirmed=1,
+                    confidence=0.9,
+                ))
 
-    def record_curriculum_transition(self, level_from: int, level_to: int, delta_summary: str) -> None:
+    def record_curriculum_transition(
+        self,
+        level_from: int,
+        level_to: int,
+        delta_summary: str,
+        steps_to_win: int | None = None,
+        invariants_confirmed: list[str] | None = None,
+    ) -> None:
         """Record what changed between levels for curriculum learning."""
+        inv_list = invariants_confirmed if invariants_confirmed is not None else []
+        active_core_count = len([g for g in self.grounded_invariants if g.is_active() and g.scope == "CORE_GAME_LAW"])
         self.curriculum_history.append({
-            "from_level": level_from, "to_level": level_to,
+            "level": level_from,
+            "from_level": level_from,
+            "to_level": level_to,
             "summary": delta_summary,
-            "core_invariants_carried": len([g for g in self.grounded_invariants if g.is_active() and g.scope == "CORE_GAME_LAW"]),
+            "steps_to_win": steps_to_win,
+            "steps": steps_to_win,
+            "invariants_confirmed": inv_list,
+            "core_invariants_carried": active_core_count,
             "timestamp": time.time(),
         })
 
@@ -1362,6 +1938,9 @@ class GameMemory:
             sections.append(palette_str)
         if self.last_defeat_exemplar:
             sections.append(self.last_defeat_exemplar.format_for_prompt())
+        patterns = self.analyze_defeat_patterns()
+        if patterns:
+            sections.append("RECURRING DEFEAT PATTERNS (avoid these combinations):\n" + "\n".join(f"  - {p}" for p in patterns))
         if self.last_victory_exemplar_v2:
             sections.append(self.last_victory_exemplar_v2.format_for_prompt())
         active_core = [g for g in self.grounded_invariants if g.is_active() and g.scope == "CORE_GAME_LAW"]
@@ -1369,6 +1948,8 @@ class GameMemory:
             sections.append("CORE GAME LAWS (verified across levels):")
             for g in active_core:
                 sections.append(f"  {g.format_for_prompt()}")
+        if self.invariant_registry and self.invariant_registry.invariants:
+            sections.append(self.invariant_registry.format_for_prompt())
         return "\n\n".join(sections)
 
     def clear(self) -> None:
@@ -1389,8 +1970,7 @@ class GameMemory:
         clean_sm = []
         for s in self.selection_mechanics:
             s_clean = self._generalize_text(s)
-            s_clean = re.sub(r"\s*\((?:axis_steps|piece_steps)=[^)]+\)", "", s_clean)
-            s_clean = re.sub(r"\s*\(axis_steps=[^,)]+,\s*piece_steps=[^)]+\)", "", s_clean)
+            s_clean = strip_annotated_segments(s_clean, ("axis_steps", "piece_steps"))
             if s_clean not in clean_sm:
                 clean_sm.append(s_clean)
         self.selection_mechanics = clean_sm

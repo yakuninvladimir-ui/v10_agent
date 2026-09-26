@@ -4,9 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any, Mapping
 
+from v10_agent.action_semantics import (
+    FORBIDDEN_ACTION_IDS,
+    LEGAL_ACTION_IDS,
+    RESET_ACTION_ID,
+    filter_legal_actions,
+    normalize_action_id,
+)
 from v10_agent.types import Grid2D
+
+logger = logging.getLogger(__name__)
 
 
 def collapse_frame_axes(grid: Any) -> Grid2D:
@@ -92,28 +102,25 @@ def normalize_state_name(state: Any) -> str:
 
 
 def normalize_action_name(action: Any) -> str:
-    """Normalize action enum or string to canonical uppercase string."""
-    if hasattr(action, "name"):
-        return str(getattr(action, "name")).split(".")[-1].upper()
-    value = getattr(action, "value", action)
-    if isinstance(value, int):
-        if value == 0:
-            return "RESET"
-        if 1 <= value <= 7:
-            return f"ACTION{value}"
-    text = str(value).split(".")[-1].strip().upper()
-    if text.isdigit():
-        return normalize_action_name(int(text))
-    return text or "ACTION1"
+    """Normalize action enum, integer or string to the canonical label.
+
+    Delegates to the single competition vocabulary; the forbidden Undo label is
+    preserved rather than rewritten so callers can detect and drop it.
+    """
+    name = normalize_action_id(action)
+    return name or "ACTION1"
 
 
-def crop_grid_border(grid: Grid2D, border: int = 1, min_dim: int = 10) -> tuple[Grid2D, int]:
-    """Optionally crop border pixels from large grids (e.g. 64x64) to eliminate UI frame/counter noise."""
+def crop_grid_border(grid: Grid2D, border: int = 1) -> tuple[Grid2D, int]:
+    """Unconditionally crop 1px border pixels to eliminate outer system frame per §4.3."""
     if border <= 0 or not grid or not grid[0]:
         return grid, 0
-    if len(grid) < min_dim or len(grid[0]) < min_dim:
+    h = len(grid)
+    w = len(grid[0])
+    if h <= 2 * border + 1 or w <= 2 * border + 1:
+        logger.warning(f"Grid {h}x{w} too small for {border}px crop (would leave < 2x2 workspace), skipping")
         return grid, 0
-    return [row[border:-border] for row in grid[border:-border]], border
+    return [row[border:w - border] for row in grid[border:h - border]], border
 
 
 def normalize_observation(
@@ -128,11 +135,22 @@ def normalize_observation(
     grid = collapse_frame_axes(raw_grid)
     grid, crop_offset = crop_grid_border(grid, border=crop_border)
 
-    available_actions_raw = obs_dict.get("available_actions", ()) or ()
-    available_actions = [normalize_action_name(a) for a in available_actions_raw]
-    if not available_actions:
+    available_actions_raw = obs_dict.get("available_actions", obs_dict.get("allowed_action_ids", ())) or ()
+    raw_allowed = [normalize_action_id(a) for a in available_actions_raw]
+    if not raw_allowed:
         # Default full action space if unspecified
-        available_actions = ["RESET", "ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "ACTION7"]
+        raw_allowed = list(LEGAL_ACTION_IDS)
+    offered_forbidden = sorted({a for a in raw_allowed if a in FORBIDDEN_ACTION_IDS})
+    if offered_forbidden:
+        logger.warning(
+            "Environment advertised forbidden actions %s; excluded from the action surface.",
+            ",".join(offered_forbidden),
+        )
+    available_actions = [
+        action
+        for action in filter_legal_actions(raw_allowed)
+        if action != RESET_ACTION_ID
+    ]
 
     state_raw = obs_dict.get("state")
     if state_raw is None:
@@ -162,6 +180,7 @@ def normalize_observation(
         "grid": grid,
         "grid_hash": compute_grid_hash(grid),
         "available_actions": available_actions,
+        "allowed_action_ids": available_actions,
         "game_id": gid,
         "guid": guid,
         "state": state,
@@ -171,3 +190,4 @@ def normalize_observation(
         "frame_index": frame_index,
         "crop_offset": crop_offset,
     }
+

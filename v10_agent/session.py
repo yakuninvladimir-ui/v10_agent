@@ -5,9 +5,17 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections import Counter
 from typing import Any, Mapping
 
 from v10_agent.action_adapter import to_native_action
+from v10_agent.action_semantics import (
+    COORDINATE_ACTION_ID,
+    LEGAL_ACTION_IDS,
+    NON_VECTOR_ACTION_IDS,
+    is_observable_move,
+    normalize_action_id,
+)
 from v10_agent.arga_lite import ARGALiteSnapshot, extract_arga_snapshot
 from v10_agent.brusentsov_logic import Ternary, Verdict
 from v10_agent.config import V10Config, config_from_mapping
@@ -21,7 +29,10 @@ from v10_agent.llm_advisor import BaseLLMAdvisor, build_llm_advisor
 from v10_agent.logging import StructuredAuditLogger
 from v10_agent.memory_contours import (
     BranchSignature,
+    CoreInvariantRegistry,
     DefeatExemplar,
+    EmpiricalInvariant,
+    EntityRole,
     MemoryContourManager,
     SyntaxErrorRecord,
     VictoryExemplar,
@@ -89,6 +100,7 @@ class GameSession:
 
         # Contours & Services
         self.memory_manager = MemoryContourManager()
+        game_mem = self.memory_manager.get_game_memory("session")
         self.sandbox_executor = SandboxExecutor(
             allowed_modules=self.config.sandbox_allowed_modules,
             timeout_seconds=self.config.sandbox_max_cpu_seconds,
@@ -112,6 +124,7 @@ class GameSession:
         # Active Session State
         self.active_module: SandboxedModule | None = None
         self.active_manifest: dict[str, Any] | None = None
+        self.active_module_version: int = 0
         self.active_pool: TrajectoryPool | None = None
 
         self.last_snapshot: ARGALiteSnapshot | None = None
@@ -156,7 +169,7 @@ class GameSession:
 
         # V10.1 Evidence-seeking loop fields
         self.evidence_seeking_active: bool = False
-        self.evidence_probes_remaining: int = getattr(self.config, "max_evidence_probes_per_level", 2)
+        self.evidence_probes_remaining: int = self.config.max_evidence_probes_per_level
         self.undecided_streak: int = 0
         self.pending_step_snapshot: GroundedStep | None = None
         self.tracker: PersistentObjectTracker | None = getattr(self.verifier, "tracker", None)
@@ -170,10 +183,14 @@ class GameSession:
         self.evidence_probes_executed: int = 0
 
         # Flash-Next Loop Recovery (VisibleCycle detector)
-        min_act = getattr(self.config, "cycle_detector_min_actions", 24)
-        max_per = getattr(self.config, "cycle_detector_max_period", 8)
-        min_cyc = getattr(self.config, "cycle_detector_min_cycles", 4)
-        self.cycle_detector = VisibleCycle(min_actions=min_act, max_period=max_per, min_cycles=min_cyc)
+        if self.config.enable_cycle_detector:
+            self.cycle_detector = VisibleCycle(
+                min_actions=self.config.cycle_detector_min_actions,
+                max_period=self.config.cycle_detector_max_period,
+                min_cycles=self.config.cycle_detector_min_cycles,
+            )
+        else:
+            self.cycle_detector = None
         self.cycle_interventions_this_level: int = 0
 
     def transition_to(self, new_phase: SessionPhase, reason: str = "") -> None:
@@ -185,6 +202,16 @@ class GameSession:
         else:
             logger.debug(f"State Machine: {self.current_phase.value} -> {new_phase.value} ({reason})")
         self.current_phase = new_phase
+
+    @property
+    def invariant_registry(self) -> CoreInvariantRegistry:
+        """Live invariant registry owned by the current GameMemory contour.
+
+        GameMemory is rebuilt from scratch on every game transition, so the
+        registry must be resolved on access instead of cached: a cached alias
+        would keep receiving registrations that no prompt ever reads.
+        """
+        return self.memory_manager.get_game_memory("session").invariant_registry
 
     @property
     def probing_phase(self) -> bool:
@@ -199,9 +226,332 @@ class GameSession:
                 target = SessionPhase.CODING if self.active_module is None else SessionPhase.SOLVING
                 self.transition_to(target, "probing_phase set False")
 
+    def _authorize_evidence_probe(self, streak: int) -> tuple[bool, str]:
+        """Decide whether another evidence probe may be spent.
+
+        Returns ``(allowed, reason)``. The level budget is the resource that
+        actually runs out: when few actions remain, a speculative probe would
+        consume the moves a real attempt still needs, so the streak limit is
+        enforced against the actions left rather than against a fixed count.
+        """
+        if streak > self.config.max_undecided_streak:
+            return False, "undecided_streak_limit"
+        remaining = self.config.max_actions_per_level - len(self.level_executed_actions)
+        if self.evidence_probes_remaining <= 0:
+            return False, "probe_quota_exhausted"
+        if remaining < self.config.min_remaining_actions_for_probe:
+            return False, "action_budget_low"
+        return True, "probe_authorized"
+
+    def _build_evidence_probe_action(self, hint: str | None) -> dict[str, Any]:
+        """Build the action that probes an unresolved observation.
+
+        The evaluator names the action to try in its evidence hint; the default
+        is a plain vertical step. A hint naming an action outside the legal
+        vocabulary is ignored rather than emitted, so a malformed hint can never
+        turn into an illegal move.
+        """
+        default = {
+            "id": "ACTION1",
+            "action_id": "ACTION1",
+            "data": {},
+            "reasoning": {"source": "evidence_seeking"},
+        }
+        if not hint:
+            return default
+        raw = str(hint)
+        marker = "probe_"
+        if not raw.startswith(marker):
+            return default
+        candidate = normalize_action_id(raw[len(marker):])
+        if candidate not in LEGAL_ACTION_IDS:
+            return default
+        data = {"x": 0, "y": 0} if candidate == COORDINATE_ACTION_ID else {}
+        return {
+            "id": candidate,
+            "action_id": candidate,
+            "data": data,
+            "reasoning": {"source": "evidence_seeking"},
+        }
+
     def update_runtime_config(self, updates: Mapping[str, Any]) -> None:
         """Dynamically update runtime configuration without destroying session memory."""
         self.config.update_runtime(updates)
+
+    def _invalidate_active_module(self) -> None:
+        """Atomically invalidate active DSL module and bump version counter to cancel in-flight executions."""
+        self.active_module = None
+        self.active_manifest = None
+        self.active_module_version += 1
+        self.replan_requested = True
+
+    def _identify_actor_object(self) -> tuple[tuple[int, int], Any | None]:
+        """Identify the controllable actor entity and its pre-transition centroid.
+
+        Uses step arguments, object roles, recent displacement history, and foreground saliency.
+        Invariant to grid dimensions and palettes.
+        """
+        if not self.last_planning_set or not self.last_planning_set.objects:
+            return (0, 0), None
+
+        planning_set = self.last_planning_set
+        bg_color = getattr(self.last_snapshot, "background_color", 0) if self.last_snapshot else 0
+        grid_dims = getattr(planning_set, "grid_dims", (64, 64))
+        grid_h = grid_dims[0] if len(grid_dims) > 0 and grid_dims[0] > 0 else 64
+        grid_w = grid_dims[1] if len(grid_dims) > 1 and grid_dims[1] > 0 else 64
+        canvas_max_area = max(16, int(grid_h * grid_w * 0.85))
+
+        # 1. Grounding via active pending_step: if step arguments refer to a specific object
+        if self.pending_step is not None:
+            args = getattr(self.pending_step, "arguments", {}) or {}
+            for val in args.values():
+                if isinstance(val, str):
+                    obj = planning_set.get_object(val)
+                    if obj is not None and getattr(obj, "color", bg_color) != bg_color and getattr(obj, "area", 0) < canvas_max_area:
+                        c_row = getattr(obj.centroid, "row", 0.0) if hasattr(obj, "centroid") else 0.0
+                        c_col = getattr(obj.centroid, "col", 0.0) if hasattr(obj, "centroid") else 0.0
+                        return (int(round(c_row)), int(round(c_col))), obj
+
+        # 2. Check objects with explicit dynamic/actor roles in PlanningSet
+        for o in planning_set.objects:
+            role_str = str(getattr(o, "role", "")).upper()
+            if role_str in ("ACTOR", "PRIMARY", "DYNAMIC", "PLAYER") and o.color != bg_color:
+                c_row = getattr(o.centroid, "row", 0.0) if hasattr(o, "centroid") else 0.0
+                c_col = getattr(o.centroid, "col", 0.0) if hasattr(o, "centroid") else 0.0
+                return (int(round(c_row)), int(round(c_col))), o
+
+        # 3. Check objects that demonstrated motion in recent effective steps
+        try:
+            ep_mem = self.memory_manager.get_epistemic_memory("session")
+            if ep_mem and getattr(ep_mem, "judgments", None):
+                for j in reversed(ep_mem.judgments[-8:]):
+                    if getattr(j, "is_effective", False):
+                        props = getattr(j, "observed_propositions", None) or getattr(j, "expected_propositions", None)
+                        if props:
+                            p_list = getattr(props, "propositions", [])
+                            for prop in p_list:
+                                sub_id = getattr(prop, "subject_id", None)
+                                if sub_id:
+                                    obj = planning_set.get_object(sub_id)
+                                    if obj and getattr(obj, "color", bg_color) != bg_color and getattr(obj, "area", 0) < canvas_max_area:
+                                        c_row = getattr(obj.centroid, "row", 0.0) if hasattr(obj, "centroid") else 0.0
+                                        c_col = getattr(obj.centroid, "col", 0.0) if hasattr(obj, "centroid") else 0.0
+                                        return (int(round(c_row)), int(round(c_col))), obj
+        except Exception:
+            pass
+
+        # 4. Foreground saliency: filter out background/canvas objects and pick the most salient entity
+        fg_objects = [
+            o for o in planning_set.objects
+            if getattr(o, "color", bg_color) != bg_color and getattr(o, "area", 0) < canvas_max_area and getattr(o, "area", 0) > 0
+        ]
+        if fg_objects:
+            fg_sorted = sorted(fg_objects, key=lambda o: (o.area, -getattr(o, "track_confidence", 1.0)))
+            chosen = fg_sorted[0]
+            c_row = getattr(chosen.centroid, "row", 0.0) if hasattr(chosen, "centroid") else 0.0
+            c_col = getattr(chosen.centroid, "col", 0.0) if hasattr(chosen, "centroid") else 0.0
+            return (int(round(c_row)), int(round(c_col))), chosen
+
+        first = planning_set.objects[0]
+        c_row = getattr(first.centroid, "row", 0.0) if hasattr(first, "centroid") else 0.0
+        c_col = getattr(first.centroid, "col", 0.0) if hasattr(first, "centroid") else 0.0
+        return (int(round(c_row)), int(round(c_col))), first
+
+    def _extract_hazard_color(
+        self,
+        actor_obj: Any | None,
+        fatal_act_id: int,
+        fatal_coords: tuple[int, int] | None,
+        before_grid: list[list[int]] | None,
+        after_grid: list[list[int]] | None,
+    ) -> int:
+        """Determine the color of the hazard that triggered GAME_OVER on contact or click."""
+        if not before_grid or not before_grid[0]:
+            return -1
+
+        bg_color = getattr(self.last_snapshot, "background_color", 0) if self.last_snapshot else 0
+        h = len(before_grid)
+        w = len(before_grid[0])
+
+        # Case 1: Coordinate action (e.g. ACTION6 click)
+        if fatal_coords is not None:
+            cx, cy = fatal_coords  # x is col, y is row
+            if 0 <= cy < h and 0 <= cx < w:
+                clicked_color = before_grid[cy][cx]
+                if clicked_color != bg_color:
+                    return clicked_color
+
+        # Case 2: Directional action (ACTION1=UP, ACTION2=DOWN, ACTION3=LEFT, ACTION4=RIGHT)
+        action_vectors = {
+            1: (-1, 0),  # UP
+            2: (1, 0),   # DOWN
+            3: (0, -1),  # LEFT
+            4: (0, 1),   # RIGHT
+        }
+        vec = action_vectors.get(fatal_act_id)
+
+        if vec:
+            dy, dx = vec
+            candidate_objs = [actor_obj] if actor_obj else []
+            if self.last_planning_set:
+                for o in self.last_planning_set.objects:
+                    if o.color != bg_color and o not in candidate_objs:
+                        candidate_objs.append(o)
+
+            for cand in candidate_objs:
+                cand_pixel_set = set()
+                if hasattr(cand, "pixels") and cand.pixels:
+                    cand_pixel_set = {
+                        (p.row if hasattr(p, "row") else p[0], p.col if hasattr(p, "col") else p[1])
+                        for p in cand.pixels
+                    }
+                elif hasattr(cand, "bbox") and cand.bbox:
+                    for r in range(cand.bbox.min_row, cand.bbox.max_row + 1):
+                        for c in range(cand.bbox.min_col, cand.bbox.max_col + 1):
+                            cand_pixel_set.add((r, c))
+
+                contact_colors: list[int] = []
+                for r, c in cand_pixel_set:
+                    nr = r + dy
+                    nc = c + dx
+                    if (nr, nc) not in cand_pixel_set and 0 <= nr < h and 0 <= nc < w:
+                        cell_col = before_grid[nr][nc]
+                        if cell_col != bg_color:
+                            contact_colors.append(cell_col)
+
+                if contact_colors:
+                    return Counter(contact_colors).most_common(1)[0][0]
+
+                # Check adjacent objects in the direction of motion
+                if self.last_planning_set and hasattr(cand, "bbox") and cand.bbox:
+                    bbox = cand.bbox
+                    for other in self.last_planning_set.objects:
+                        if other.id != cand.id and getattr(other, "color", bg_color) != bg_color and hasattr(other, "bbox") and other.bbox:
+                            o_bbox = other.bbox
+                            touches = False
+                            if dy < 0 and o_bbox.max_row == bbox.min_row - 1:
+                                touches = not (o_bbox.max_col < bbox.min_col or o_bbox.min_col > bbox.max_col)
+                            elif dy > 0 and o_bbox.min_row == bbox.max_row + 1:
+                                touches = not (o_bbox.max_col < bbox.min_col or o_bbox.min_col > bbox.max_col)
+                            elif dx < 0 and o_bbox.max_col == bbox.min_col - 1:
+                                touches = not (o_bbox.max_row < bbox.min_row or o_bbox.min_row > bbox.max_row)
+                            elif dx > 0 and o_bbox.min_col == bbox.max_col + 1:
+                                touches = not (o_bbox.max_row < bbox.min_row or o_bbox.min_row > bbox.max_row)
+                            if touches:
+                                return other.color
+
+        # Case 3: Differences between before_grid and after_grid
+        if after_grid and len(after_grid) == h and len(after_grid[0]) == w and after_grid != before_grid:
+            mutated_colors: list[int] = []
+            for r in range(h):
+                for c in range(w):
+                    if before_grid[r][c] != after_grid[r][c]:
+                        b_col = before_grid[r][c]
+                        a_col = after_grid[r][c]
+                        if b_col != bg_color:
+                            mutated_colors.append(b_col)
+                        if a_col != bg_color:
+                            mutated_colors.append(a_col)
+            if mutated_colors:
+                return Counter(mutated_colors).most_common(1)[0][0]
+
+        return -1
+
+    def _extract_victory_target_color(
+        self,
+        primary_inv: str,
+        object_diffs: list[dict[str, Any]],
+        executed_steps: list[Any],
+    ) -> int:
+        """Determine the target/goal color that triggered level victory via physical inspection."""
+        bg_color = getattr(self.last_snapshot, "background_color", 0) if self.last_snapshot else 0
+
+        # 1. Physical inspection from object_diffs:
+        # 1a. Color transformations: an object changed its color to the winning color
+        for od in object_diffs:
+            cc = od.get("color_change", "")
+            if "->" in cc:
+                try:
+                    new_col = int(cc.split("->")[1])
+                    if new_col != bg_color:
+                        return new_col
+                except (ValueError, IndexError):
+                    pass
+
+        # 1b. Collectible / Gone objects: an entity was touched and removed
+        gone_objs = [od for od in object_diffs if od.get("status") in ("gone/merged", "vanished", "destroyed")]
+        if gone_objs and self.level_initial_grid:
+            try:
+                init_snap = extract_arga_snapshot(self.level_initial_grid)
+                init_pset = build_planning_set(init_snap, available_actions=[])
+                gone_colors: list[int] = []
+                for go in gone_objs:
+                    alias = go.get("alias")
+                    orig_id = go.get("id")
+                    target_o = init_pset.get_object(alias) or init_pset.get_object(orig_id)
+                    if target_o and getattr(target_o, "color", bg_color) != bg_color:
+                        gone_colors.append(target_o.color)
+                if not gone_colors and init_pset.objects:
+                    actor_pos, actor_obj = self._identify_actor_object()
+                    actor_col = getattr(actor_obj, "color", -1) if actor_obj else -1
+                    for io in init_pset.objects:
+                        if io.color != bg_color and io.color != actor_col:
+                            gone_colors.append(io.color)
+                if gone_colors:
+                    return Counter(gone_colors).most_common(1)[0][0]
+            except Exception:
+                pass
+
+        # 1c. Destination overlap: an actor moved and now occupies or touches an initial target object
+        if self.level_initial_grid and self.last_planning_set and object_diffs:
+            try:
+                init_snap = extract_arga_snapshot(self.level_initial_grid)
+                init_pset = build_planning_set(init_snap, available_actions=[])
+                moved_aliases = {od.get("alias") for od in object_diffs if od.get("dy", 0) != 0 or od.get("dx", 0) != 0}
+                for alias in moved_aliases:
+                    win_o = self.last_planning_set.get_object(alias)
+                    if win_o and hasattr(win_o, "bbox"):
+                        for init_o in init_pset.objects:
+                            if init_o.id != win_o.id and getattr(init_o, "color", bg_color) != bg_color and hasattr(init_o, "bbox"):
+                                if not (
+                                    init_o.bbox.max_row < win_o.bbox.min_row or
+                                    init_o.bbox.min_row > win_o.bbox.max_row or
+                                    init_o.bbox.max_col < win_o.bbox.min_col or
+                                    init_o.bbox.min_col > win_o.bbox.max_col
+                                ):
+                                    return init_o.color
+            except Exception:
+                pass
+
+        # 1d. Final snapshot comparison: non-background color that changed or appeared at mutated cells
+        if self.level_initial_grid and self.last_snapshot and self.last_snapshot.grid:
+            init_grid = self.level_initial_grid
+            win_grid = self.last_snapshot.grid
+            if len(init_grid) == len(win_grid) and len(init_grid[0]) == len(win_grid[0]):
+                new_colors: list[int] = []
+                for r in range(len(init_grid)):
+                    for c in range(len(init_grid[0])):
+                        if init_grid[r][c] != win_grid[r][c] and win_grid[r][c] != bg_color:
+                            new_colors.append(win_grid[r][c])
+                if new_colors:
+                    return Counter(new_colors).most_common(1)[0][0]
+
+        # 2. Textual Fallback: Regex extraction from Solver's primary invariant
+        if primary_inv:
+            # Prioritize explicit positive canon, victory, or goal clauses
+            m_pos = re.search(r"(?:\[POSITIVE_CANON\]|target|victory|goal)[^|;\n]*?color[_\s]+(\d+)", primary_inv, re.IGNORECASE)
+            if m_pos:
+                return int(m_pos.group(1))
+            # Avoid picking colors explicitly identified with negative barriers or hazards
+            candidates = re.findall(r"color[_\s]+(\d+)", primary_inv, re.IGNORECASE)
+            nb_matches = set(re.findall(r"(?:\[NEGATIVE_BARRIER\]|hazard|defeat)[^|;\n]*?color[_\s]+(\d+)", primary_inv, re.IGNORECASE))
+            for cand in candidates:
+                if cand not in nb_matches:
+                    return int(cand)
+            if candidates and not nb_matches:
+                return int(candidates[0])
+
+        return -1
 
     def handle_level_transition(self, new_level_id: str) -> None:
         """Clean level-local state, preserve GameMemory cross-level invariants."""
@@ -212,16 +562,13 @@ class GameSession:
 
             winning_cand: dict[str, Any] | None = None
             if self.active_pool and self.active_pool.candidates:
-                active_c = self.active_pool.active_candidate() or self.active_pool.candidates[0]
+                active_c = self.active_pool.peek_active_candidate() or self.active_pool.candidates[0]
                 winning_cand = {
                     "trajectory_id": active_c.trajectory_id,
                     "steps": active_c.steps,
                 }
 
-            executed_steps = [
-                a for a in self.level_executed_actions
-                if a and a.upper() not in ("RESET", "ACTION7")
-            ]
+            executed_steps = [a for a in self.level_executed_actions if is_observable_move(a)]
             exec_summary = (
                 f"Level solved successfully with {len(executed_steps)} coordinated actions."
                 if executed_steps
@@ -319,11 +666,20 @@ class GameSession:
                 elif str(a).isdigit():
                     win_action_ints.append(int(a))
             final_act = win_action_ints[-1] if win_action_ints else 0
-            target_col = -1
-            if primary_inv:
-                m_col = re.search(r"color\s+(\d+)", primary_inv, re.IGNORECASE)
-                if m_col:
-                    target_col = int(m_col.group(1))
+            target_col = self._extract_victory_target_color(
+                primary_inv=primary_inv,
+                object_diffs=object_diffs,
+                executed_steps=executed_steps,
+            )
+
+            # Ground actor & background roles in palette
+            bg_color = getattr(self.last_snapshot, "background_color", 0) if self.last_snapshot else 0
+            game_mem.palette.assign_role(bg_color, EntityRole.BACKGROUND, confidence=1.0, evidence="Canvas background")
+            actor_pos, actor_obj = self._identify_actor_object()
+            if actor_obj and getattr(actor_obj, "color", bg_color) != bg_color:
+                game_mem.palette.assign_role(actor_obj.color, EntityRole.ACTOR, confidence=0.8, evidence="Controllable dynamic entity")
+            if self.last_snapshot and self.last_snapshot.grid and hasattr(game_mem.palette, "update_pixel_counts"):
+                game_mem.palette.update_pixel_counts(self.last_snapshot.grid)
 
             vic_exemplar = VictoryExemplar(
                 level_index=max(0, self.levels_completed_observed - 1),
@@ -337,11 +693,23 @@ class GameSession:
                 winning_invariants_used=[primary_inv] if primary_inv else [],
             )
             game_mem.update_last_victory(vic_exemplar)
+            confirmed_invs = distilled_invariants or ([primary_inv] if primary_inv else [])
             game_mem.record_curriculum_transition(
                 level_from=max(0, self.levels_completed_observed - 1),
                 level_to=self.levels_completed_observed,
                 delta_summary=f"Completed {self.current_level_id} -> {new_level_id}",
+                steps_to_win=len(executed_steps),
+                invariants_confirmed=confirmed_invs,
             )
+
+            # Preserve empirical invariants across levels
+            import copy
+            game_mem.previous_level_registry = copy.deepcopy(self.invariant_registry)
+            carried_invariants = [
+                inv for inv in self.invariant_registry.invariants
+                if inv.scope == "CORE_GAME_LAW" or (inv.is_active and inv.net_support > 0)
+            ]
+            self.invariant_registry.invariants = carried_invariants
 
             # Mark cross-level invariant discovery & re-evaluation to execute on the pristine initial frame of the new level
             self.pending_cross_level_re_evaluation = True
@@ -354,8 +722,7 @@ class GameSession:
         self.level_initial_grid_hash = None
 
         self.current_level_id = new_level_id
-        self.active_module = None
-        self.active_manifest = None
+        self._invalidate_active_module()
         self.active_pool = None
         self.pending_step = None
         self.pending_action = None
@@ -379,7 +746,8 @@ class GameSession:
                     any(k in eff_str for k in ("moved", "moves", "dy=", "dx=", "displacement", "shift"))
                     and any(d in eff_str for d in ("up", "down", "left", "right"))
                     and not any(m in eff_str for m in ("selection", "toggle", "indicator", "active entity"))
-                    and act_name not in ("ACTION5", "ACTION6", "RESET", "ACTION7")
+                    and act_name not in NON_VECTOR_ACTION_IDS
+                    and is_observable_move(act_name)
                 )
                 if is_pure_motion:
                     confirmed_kinematics[act_name] = str(eff)
@@ -395,7 +763,7 @@ class GameSession:
         self._level_win_handled = False
         self._last_trajectory_id = None
         self.evidence_seeking_active = False
-        self.evidence_probes_remaining = getattr(self.config, "max_evidence_probes_per_level", 2)
+        self.evidence_probes_remaining = self.config.max_evidence_probes_per_level
         self.undecided_streak = 0
         self.pending_step_snapshot = None
         if self.tracker is not None:
@@ -405,13 +773,35 @@ class GameSession:
         self._last_failure_summary = ""
         self.level_initial_grid = None
         self.level_initial_grid_hash = None
-        if hasattr(self, "cycle_detector"):
+        if self.cycle_detector is not None:
             self.cycle_detector.clear()
         self.cycle_interventions_this_level = 0
         self.memory_manager.handle_level_transition(new_level_id)
         if hasattr(self.explorer, "probe_manager") and hasattr(self.explorer.probe_manager, "handle_level_transition"):
             self.explorer.probe_manager.handle_level_transition(confirmed_kinematics)
         logger.info(f"Transitioned to new level {new_level_id}; GameMemory preserved ({len(confirmed_kinematics)} confirmed kinematics carried forward).")
+
+    def _reset_game_scoped_state(self) -> None:
+        """Clear every counter whose meaning is confined to a single game.
+
+        A new game reports its own level count starting from zero and grants a
+        fresh evidence budget. Counters that are deliberately cumulative (the
+        accepted-action total used for frame indexing is per game) are reset
+        here too, otherwise a later game inherits the earlier game's scale and
+        its very first level transition is never observed.
+        """
+        self.levels_completed_observed = 0
+        self.observed_transition_ingestions = 0
+        self.observed_transition_duplicate_skips = 0
+        self.accepted_action_count = 0
+        self.evidence_seeking_active = False
+        self.evidence_probes_remaining = self.config.max_evidence_probes_per_level
+        self.undecided_streak = 0
+        self.undecided_count = 0
+        self.undecided_resolved_by_probe = 0
+        self.undecided_fallback_to_null = 0
+        self.evidence_probes_executed = 0
+        self.pending_step_snapshot = None
 
     def handle_game_transition(self, new_game_id: str) -> None:
         """Reset all contours when switching games."""
@@ -422,8 +812,7 @@ class GameSession:
         self.explorer_reprobe_pending = False
         self.level_executed_actions.clear()
         self.current_level_id = "level_0"
-        self.active_module = None
-        self.active_manifest = None
+        self._invalidate_active_module()
         self.active_pool = None
         self.pending_step = None
         self.pending_action = None
@@ -438,7 +827,7 @@ class GameSession:
         self.pending_cross_level_re_evaluation = False
         self.last_engine_action = ""
         self.last_engine_action_source = ""
-        if hasattr(self, "cycle_detector") and self.cycle_detector:
+        if self.cycle_detector is not None:
             self.cycle_detector.clear()
         self.cycle_interventions_this_level = 0
         if self.tracker is not None:
@@ -456,6 +845,7 @@ class GameSession:
         self._last_attempt_failed = False
         self._last_failure_reason = ""
         self._last_failure_summary = ""
+        self._reset_game_scoped_state()
         self.memory_manager.handle_game_transition(new_game_id, self.current_level_id)
         logger.info(f"Reset session for new game {new_game_id}.")
 
@@ -481,8 +871,8 @@ class GameSession:
                 logger.error("GAME_OVER persisted after single RESET. Forcing loop break.")
                 raise RuntimeError("GAME_OVER persisted after single RESET")
 
-            max_resets = getattr(self.config, "max_game_over_resets_per_level", 5)
-            max_attempts = getattr(self.config, "max_chain_attempts_per_level", 5)
+            max_resets = self.config.max_game_over_resets_per_level
+            max_attempts = self.config.max_chain_attempts_per_level
             resets_exhausted = self.game_over_reset_count >= max_resets
             attempts_exhausted = (not self.in_persistent_fallback) and (self.level_chain_attempts >= max_attempts)
 
@@ -500,7 +890,7 @@ class GameSession:
             self.game_over_reset_count += 1
             self._last_attempt_failed = True
             self._last_failure_reason = "GAME_OVER encountered during candidate execution."
-            executed_steps = [a for a in self.level_executed_actions if a and a.upper() not in ("RESET", "ACTION7")]
+            executed_steps = [a for a in self.level_executed_actions if is_observable_move(a)]
             self._last_failure_summary = (
                 f"{len(executed_steps)} actions executed before GAME_OVER: {', '.join(executed_steps[:12])}"
                 if executed_steps
@@ -520,10 +910,24 @@ class GameSession:
                         if isinstance(data, dict) and "x" in data and "y" in data:
                             fatal_coords = (int(data["x"]), int(data["y"]))
 
-                    actor_pos = (0, 0)
-                    if self.last_planning_set and self.last_planning_set.objects:
-                        first_obj = self.last_planning_set.objects[0]
-                        actor_pos = (int(first_obj.centroid.row), int(first_obj.centroid.col))
+                    actor_pos, actor_obj = self._identify_actor_object()
+                    before_grid = self.last_snapshot.grid if self.last_snapshot else []
+                    after_grid = obs.get("grid")
+
+                    hazard_col = self._extract_hazard_color(
+                        actor_obj=actor_obj,
+                        fatal_act_id=fatal_act_id,
+                        fatal_coords=fatal_coords,
+                        before_grid=before_grid,
+                        after_grid=after_grid,
+                    )
+
+                    bg_color = getattr(self.last_snapshot, "background_color", 0) if self.last_snapshot else 0
+                    game_mem.palette.assign_role(bg_color, EntityRole.BACKGROUND, confidence=1.0, evidence="Canvas background")
+                    if actor_obj and getattr(actor_obj, "color", bg_color) != bg_color:
+                        game_mem.palette.assign_role(actor_obj.color, EntityRole.ACTOR, confidence=0.8, evidence="Controllable dynamic entity")
+                    if before_grid and hasattr(game_mem.palette, "update_pixel_counts"):
+                        game_mem.palette.update_pixel_counts(before_grid)
 
                     defeat_ex = DefeatExemplar(
                         level_index=self.levels_completed_observed,
@@ -531,8 +935,8 @@ class GameSession:
                         fatal_action_id=fatal_act_id,
                         fatal_coords=fatal_coords,
                         actor_position_before=actor_pos,
-                        hazard_color=-1,
-                        pre_defeat_subgrid=self.last_snapshot.grid if self.last_snapshot else [],
+                        hazard_color=hazard_col,
+                        pre_defeat_subgrid=before_grid,
                         environment_signal="GAME_OVER",
                         explanation=self._last_failure_summary,
                     )
@@ -543,15 +947,16 @@ class GameSession:
             self.level_executed_actions.clear()
 
             # Sever current active candidate
-            if self.active_pool and self.active_pool.has_active_candidate():
-                active_c = self.active_pool.active_candidate()
-                if active_c:
-                    self.active_pool.sever(active_c.trajectory_id, "GAME_OVER during execution")
+            if self.active_pool is not None:
+                active_c = self.active_pool.peek_active_candidate()
+                if active_c is not None:
+                    active_c.sever()
 
-            if self.active_pool and self.active_pool.has_active_candidate():
+            next_c = self.active_pool.peek_active_candidate() if self.active_pool is not None else None
+            if next_c is not None:
                 logger.info(
                     f"GAME_OVER severed candidate. Retaining active_pool with remaining candidate: "
-                    f"{self.active_pool.active_candidate().trajectory_id}"
+                    f"{next_c.trajectory_id}"
                 )
                 self.replan_requested = False
             else:
@@ -616,6 +1021,20 @@ class GameSession:
             self.level_initial_grid = [list(row) for row in grid]
             self.level_initial_grid_hash = planning_set.grid_hash
             logger.info(f"Recorded pristine level initial frame for {self.current_level_id} (hash={planning_set.grid_hash[:8]}).")
+            game_mem = self.memory_manager.get_game_memory("session")
+            if game_mem is not None and hasattr(game_mem, "palette"):
+                bg_c = getattr(snapshot, "background_color", 0)
+                game_mem.palette.assign_role(bg_c, EntityRole.BACKGROUND, confidence=1.0, evidence="Canvas background")
+                if hasattr(game_mem.palette, "update_pixel_counts"):
+                    game_mem.palette.update_pixel_counts(grid)
+            try:
+                from v10_agent.universal_invariants import propose_invariant_candidates
+                candidates = propose_invariant_candidates(planning_set)
+                for cand in candidates:
+                    self.invariant_registry.register_candidate(cand)
+                game_mem.migrate_legacy_invariants(level_index=self.levels_completed_observed)
+            except Exception as exc:
+                logger.warning(f"Failed to propose invariant candidates on initial frame: {exc}")
             if getattr(self, "pending_cross_level_re_evaluation", False):
                 self.pending_cross_level_re_evaluation = False
                 game_mem = self.memory_manager.get_game_memory("session")
@@ -646,6 +1065,39 @@ class GameSession:
         env_mem = self.memory_manager.get_env_spec_memory("session")
         syntax_mem = self.memory_manager.get_syntax_error_memory("session")
         ep_mem = self.memory_manager.get_epistemic_memory("session")
+
+        # 3.1. Clean State Reset (Takes absolute precedence to ensure clean board before probing/replan or after loop recovery)
+        if self.solver_reset_pending:
+            self.solver_reset_pending = False
+            # If resetting due to a detected action cycle, exit persistent fallback and clear fallback cycling history
+            if "cycle" in str(self.solver_reset_reason).lower() or "loop" in str(self.solver_reset_reason).lower():
+                self.in_persistent_fallback = False
+                if hasattr(self.fallback_engine, "clear_cycle_memory"):
+                    self.fallback_engine.clear_cycle_memory()
+            reset_action = {
+                "id": "RESET",
+                "action_id": "RESET",
+                "data": {},
+                "reasoning": {"source": self.solver_reset_reason or "solver_clean_state_reset"},
+            }
+            self.last_snapshot = snapshot
+            self.last_planning_set = planning_set
+            self.pending_action = reset_action
+            self.last_engine_action = "RESET"
+            self.last_engine_action_source = "solver_clean_reset"
+            if self.tracker is not None:
+                self.tracker.reset()
+            self.pending_step = None
+            self.level_executed_actions.clear()
+            self.audit_logger.log(
+                "action_emitted",
+                action="RESET",
+                data={},
+                strategy="solver_reset",
+                grid_hash=planning_set.grid_hash,
+                level_id=self.current_level_id,
+            )
+            return reset_action
 
         # 3.2. Fast path for persistent symbolic fallback (bypasses LLM, replans, and clean resets)
         if self.in_persistent_fallback:
@@ -690,34 +1142,6 @@ class GameSession:
             )
             return action_dict
 
-        # 3.5. Clean State Reset (Takes precedence to ensure clean board before probing/replan)
-        if self.solver_reset_pending:
-            self.solver_reset_pending = False
-            reset_action = {
-                "id": "RESET",
-                "action_id": "RESET",
-                "data": {},
-                "reasoning": {"source": self.solver_reset_reason or "solver_clean_state_reset"},
-            }
-            self.last_snapshot = snapshot
-            self.last_planning_set = planning_set
-            self.pending_action = reset_action
-            self.last_engine_action = "RESET"
-            self.last_engine_action_source = "solver_clean_reset"
-            if self.tracker is not None:
-                self.tracker.reset()
-            self.pending_step = None
-            self.level_executed_actions.clear()
-            self.audit_logger.log(
-                "action_emitted",
-                action="RESET",
-                data={},
-                strategy="solver_reset",
-                grid_hash=planning_set.grid_hash,
-                level_id=self.current_level_id,
-            )
-            return reset_action
-
         # 3.8. V10.1 Evidence-Seeking Blocking Dispatch
         if self.evidence_seeking_active:
             if self.probe_queue:
@@ -750,16 +1174,17 @@ class GameSession:
                 self.evidence_seeking_active = False
                 self.undecided_streak = 0
                 self.pending_step_snapshot = None
-                if self.active_pool and self.active_pool.active_candidate():
-                    self.active_pool.active_candidate().sever()
+                pending_cand = self.active_pool.peek_active_candidate() if self.active_pool else None
+                if pending_cand is not None:
+                    pending_cand.sever()
                 self.solver_reset_pending = True
-                self.solver_reset_reason = "evidence_probe_exhausted_null"
+                self.solver_reset_reason = "undecided_null_budget_exhausted:probe_queue_empty"
 
         # 4. Pipeline Determination & Probing Phase
         if self.probing_phase:
-            non_meta_actions = [a for a in available_actions if str(a).upper() not in ("RESET", "ACTION7")]
-            only_coords = all(str(a).upper() == "ACTION6" for a in non_meta_actions) and len(non_meta_actions) > 0
-            coord_quota = 5 if only_coords else 3
+            non_meta_actions = [a for a in available_actions if is_observable_move(a)]
+            only_coords = all(str(a).upper() == COORDINATE_ACTION_ID for a in non_meta_actions) and len(non_meta_actions) > 0
+            coord_quota = max(1, self.config.max_explorer_probe_steps)
 
             has_coords = "ACTION6" in planning_set.allowed_action_ids or any(
                 isinstance(a, str) and any(kw in a.lower() for kw in ("x", "y", "coord", "click"))
@@ -784,9 +1209,9 @@ class GameSession:
 
                 if not getattr(self.explorer.probe_manager, "_initial_sweep_planned", False):
                     if self.config.enable_primitive_probing:
-                        # 1. Plan discrete probes for initial sweep of ACTION1..ACTION5
+                        # 1. Plan discrete probes for initial sweep (test all available discrete actions)
                         discrete_probes = self.explorer.probe_manager.plan_discrete_probes(
-                            planning_set, memory=env_mem, max_probes=self.config.max_primitive_probes_per_level,
+                            planning_set, memory=env_mem, max_probes=self.explorer.probe_manager.max_probes,
                             known_actions=self.known_actions,
                         )
                         self.probe_queue.extend(discrete_probes)
@@ -820,28 +1245,66 @@ class GameSession:
                                 crop_offset=self.crop_offset,
                             )
                             self.explorer_attempts_this_level += 1
+                            max_exp_attempts = getattr(self.config, "max_explorer_attempts_per_level", 2)
                             logger.info(
                                 f"Explorer initial coordinate probes: attempt {self.explorer_attempts_this_level}/"
-                                f"{getattr(self.config, 'max_explorer_attempts_per_level', 5)} (quota={coord_quota})"
+                                f"{max_exp_attempts} (quota={coord_quota})"
                             )
-                            self.probe_queue.extend(coord_probes)
+                            self.probe_queue.extend(coord_probes[:coord_quota])
                     elif has_coords and "ACTION6" not in self.known_actions:
                         coord_probes = self.explorer.probe_manager.plan_targeted_coordinate_probes(
                             planning_set, available_actions, memory=env_mem, crop_offset=self.crop_offset,
                         )
-                        self.probe_queue.extend(coord_probes)
+                        self.probe_queue.extend(coord_probes[:coord_quota])
                     else:
                         self.probing_phase = False
                 else:
-                    # Initial sweep already executed: query combinatorial chaining for inactive actions
+                    # Initial sweep already executed
                     if self.config.enable_primitive_probing:
-                        next_chain = self.explorer.probe_manager.get_next_combinatorial_chain()
-                        if next_chain:
-                            self.probe_queue.extend(next_chain)
+                        # Check if >= 40% of available discrete actions remain unconfirmed
+                        unconfirmed_discrete = [
+                            a for a in sorted(self.explorer.probe_manager.available_discrete_actions)
+                            if a not in self.explorer.probe_manager.confirmed_effective_actions
+                        ]
+                        total_discrete = len(self.explorer.probe_manager.available_discrete_actions)
+                        unconfirmed_ratio = (len(unconfirmed_discrete) / total_discrete) if total_discrete > 0 else 0.0
+
+                        if (
+                            unconfirmed_ratio >= 0.4
+                            and not getattr(self.explorer.probe_manager, "_primitive_research_done", False)
+                            and self.explorer.probe_manager.total_probes_executed < self.explorer.probe_manager.max_probes
+                        ):
+                            # Invoke Explorer Primitive Research with raw_png + annotated_png
+                            explorer_mm = getattr(
+                                self.config, "explorer_multimodal_enabled",
+                                getattr(self.config, "multimodal_enabled", getattr(self.config, "qwen_multimodal_enabled", True))
+                            )
+                            raw_png = render_grid_png(grid) if explorer_mm else None
+                            annotated_png = render_annotated_frame_png(grid, planning_set) if explorer_mm else None
+                            research_images = [raw_png, annotated_png] if explorer_mm else None
+
+                            research_probes = self.explorer.research_unconfirmed_primitives(
+                                planning_set=planning_set,
+                                memory=env_mem,
+                                image_png=research_images,
+                                game_memory=self.memory_manager.get_game_memory("session"),
+                                unconfirmed_actions=unconfirmed_discrete,
+                            )
+                            if research_probes:
+                                rem_budget = self.explorer.probe_manager.max_probes - self.explorer.probe_manager.total_probes_executed
+                                self.probe_queue.extend(research_probes[:rem_budget])
+                                logger.info(f"Enqueued {len(research_probes[:rem_budget])} primitive research probes from Explorer.")
+
+                        # Combinatorial chaining if budget remains and queue is empty
+                        if not self.probe_queue and self.explorer.probe_manager.total_probes_executed < self.explorer.probe_manager.max_probes:
+                            next_chain = self.explorer.probe_manager.get_next_combinatorial_chain()
+                            if next_chain:
+                                rem_budget = self.explorer.probe_manager.max_probes - self.explorer.probe_manager.total_probes_executed
+                                self.probe_queue.extend(next_chain[:rem_budget])
 
                     # Continuous coordinate probing without reset if ACTION6 is unconfirmed
+                    max_exp_attempts = getattr(self.config, "max_explorer_attempts_per_level", 2)
                     if not self.probe_queue and has_coords and "ACTION6" not in self.explorer.probe_manager.confirmed_effective_actions:
-                        max_exp_attempts = getattr(self.config, "max_explorer_attempts_per_level", 5)
                         while not self.probe_queue and self.explorer_attempts_this_level < max_exp_attempts:
                             explorer_mm = getattr(
                                 self.config, "explorer_multimodal_enabled",
@@ -872,17 +1335,17 @@ class GameSession:
                                 f"{max_exp_attempts} (quota={coord_quota})"
                             )
                             if coord_probes:
-                                self.probe_queue.extend(coord_probes)
+                                self.probe_queue.extend(coord_probes[:coord_quota])
                                 break
 
             if self.active_pipeline == "dynamic" and not self.probe_queue and self.probing_phase:
-                new_actions = [a for a in available_actions if a not in self.known_actions and a not in ("RESET", "ACTION7")]
+                new_actions = [a for a in available_actions if a not in self.known_actions and is_observable_move(a)]
                 if new_actions:
                     new_probes = self.explorer.probe_manager.plan_discrete_probes(
-                        new_actions, memory=env_mem, max_probes=self.config.max_primitive_probes_per_level,
+                        new_actions, memory=env_mem, max_probes=coord_quota,
                         known_actions=self.known_actions,
                     )
-                    self.probe_queue.extend(new_probes)
+                    self.probe_queue.extend(new_probes[:coord_quota])
 
             if self.probe_queue:
                 probe_action_item = self.probe_queue.pop(0)
@@ -925,17 +1388,18 @@ class GameSession:
                 game_mem = self.memory_manager.get_game_memory("session")
                 has_effective = bool(self.explorer.probe_manager.confirmed_effective_actions) or bool(game_mem.confirmed_action_effects)
 
-                max_exp_attempts = getattr(self.config, "max_explorer_attempts_per_level", 5)
+                max_exp_attempts = getattr(self.config, "max_explorer_attempts_per_level", 2)
                 if not has_effective and has_coords and self.explorer_attempts_this_level >= max_exp_attempts:
-                    self.session_aborted = True
-                    logger.error(
-                        f"Explorer probe budget exhausted ({max_exp_attempts} attempts) on {self.current_level_id} "
-                        f"without discovering effective actions. Transitioning to next game without reset."
+                    logger.info(
+                        f"Explorer probe budget reached ({self.explorer_attempts_this_level}/{max_exp_attempts} attempts). "
+                        f"Yielding candidate invariants to Coder/Solver without further probing."
                     )
-                    raise LevelAttemptsExhaustedError(
-                        f"Explorer probe budget exhausted ({max_exp_attempts} attempts) on {self.current_level_id} "
-                        f"without discovering effective actions. Transitioning to next game without reset."
-                    )
+                    for a in available_actions:
+                        clean_a = str(a).upper()
+                        if is_observable_move(clean_a):
+                            self.known_actions.add(clean_a)
+                            if clean_a not in self.explorer.probe_manager.confirmed_effective_actions:
+                                self.explorer.probe_manager.confirmed_effective_actions[clean_a] = "unverified_invariant"
 
                 self.probing_phase = False
                 self.explorer_reprobe_pending = False
@@ -1090,7 +1554,7 @@ class GameSession:
             self.active_pool = None
             self.replan_requested = False
 
-        if not self.in_persistent_fallback and self.active_module is not None and (self.active_pool is None or self.active_pool.active_candidate() is None):
+        if not self.in_persistent_fallback and self.active_module is not None and (self.active_pool is None or self.active_pool.peek_active_candidate() is None):
             # Ironclad guarantee: before calling Solver, if board is dirty from prior execution, emit RESET first
             if self.level_initial_grid_hash is not None and planning_set.grid_hash != self.level_initial_grid_hash:
                 logger.info(
@@ -1162,8 +1626,8 @@ class GameSession:
                 )
                 max_att = max_attempts
                 rem_att = max(1, max_att - self.level_chain_attempts + 1)
-                rem_probes = getattr(self, "evidence_probes_remaining", 3)
-                max_probes = getattr(self.config, "max_evidence_probes_per_level", 3)
+                rem_probes = self.evidence_probes_remaining
+                max_probes = self.config.max_evidence_probes_per_level
                 pkg = self.solver.generate_trajectory_package(
                     manifest=self.active_manifest or {},
                     planning_set=planning_set,
@@ -1179,7 +1643,10 @@ class GameSession:
                 )
                 if pkg is not None:
                     self.active_pool = TrajectoryPool.from_package(pkg)
-                    c_summaries = [f"{c.trajectory_id}({len(c.steps)} steps: {[s.get('dsl_function') for s in c.steps[:6]]}...)" for c in self.active_pool.candidates]
+                    hyp = str(pkg.get("hypothesis") or pkg.get("invariant_evolution") or "")
+                    if hyp and game_mem is not None and hasattr(game_mem, "record_hypothesis"):
+                        game_mem.record_hypothesis(hyp, source_step_id=f"solver_attempt_{self.level_chain_attempts}")
+                    c_summaries = [f"{c.trajectory_id}({len(c.steps)} steps: {[s.get('dsl_function') for s in c.steps]})" for c in self.active_pool.candidates]
                     logger.info(f"Solver generated {len(self.active_pool.candidates)} candidates: {'; '.join(c_summaries)}")
                 else:
                     logger.warning(f"Solver trajectory proposal failed on attempt {self.level_chain_attempts}/{max_attempts}.")
@@ -1199,27 +1666,42 @@ class GameSession:
         grounded_step: GroundedStep | None = None
         strategy: str = "symbolic_fallback"
 
-        if not self.in_persistent_fallback and self.active_module is not None and self.active_pool is not None and self.active_pool.active_candidate() is not None:
+        if not self.in_persistent_fallback and self.active_module is not None and self.active_pool is not None and self.active_pool.peek_active_candidate() is not None:
             self.transition_to(SessionPhase.EXECUTING, "executing symbolic step")
-            exec_res = self.symbolic_executor.prepare_and_execute_step(
-                pool=self.active_pool,
-                planning_set=planning_set,
-                active_module=self.active_module,
-                epistemic_memory=ep_mem,
-                syntax_memory=syntax_mem,
-                game_memory=self.memory_manager.get_game_memory("session"),
-            )
+            captured_version = self.active_module_version
+            if captured_version != self.active_module_version or self.active_module is None:
+                effect = EffectDeclaration.circuit_break("module_invalidated")
+                exec_res = type("StepExecResult", (), {
+                    "circuit_broken": True,
+                    "error_message": "module_invalidated",
+                    "effect": effect,
+                    "grounded_step": None,
+                    "strategy": "circuit_break",
+                })()
+            else:
+                exec_res = self.symbolic_executor.prepare_and_execute_step(
+                    pool=self.active_pool,
+                    planning_set=planning_set,
+                    active_module=self.active_module,
+                    epistemic_memory=ep_mem,
+                    syntax_memory=syntax_mem,
+                    game_memory=self.memory_manager.get_game_memory("session"),
+                )
+                if captured_version != self.active_module_version:
+                    exec_res.circuit_broken = True
+                    exec_res.error_message = "module_invalidated"
+                    exec_res.effect = EffectDeclaration.circuit_break("module_invalidated")
 
             effect = exec_res.effect
             grounded_step = exec_res.grounded_step
             strategy = exec_res.strategy
 
             if exec_res.circuit_broken:
-                next_cand = self.active_pool.active_candidate() if self.active_pool else None
+                next_cand = self.active_pool.advance_to_next_candidate() if self.active_pool else None
                 if next_cand is None:
                     self._last_attempt_failed = True
                     self._last_failure_reason = f"Candidate pool exhausted; circuit breaker triggered: {exec_res.error_message}"
-                    executed_steps = [a for a in self.level_executed_actions if a and a.upper() not in ("RESET", "ACTION7")]
+                    executed_steps = [a for a in self.level_executed_actions if is_observable_move(a)]
                     self._last_failure_summary = (
                         f"{len(executed_steps)} actions executed before circuit break: {', '.join(executed_steps[:12])}"
                         if executed_steps
@@ -1314,7 +1796,7 @@ class GameSession:
 
     def _check_and_invalidate_dsl_for_new_action(self, action_id: str, effect_desc: str = "") -> bool:
         """Check if action_id is a confirmed action missing from active_manifest, and invalidate DSL if so."""
-        if not action_id or str(action_id).upper() in ("RESET", "ACTION7"):
+        if not is_observable_move(action_id):
             return False
         act_up = str(action_id).upper()
         active_fns: set[str] = set()
@@ -1331,10 +1813,8 @@ class GameSession:
                 f"Session: New confirmed action {act_up} discovered with effect '{effect_desc}'; "
                 f"invalidating active DSL module for re-synthesis."
             )
-            self.active_module = None
-            self.active_manifest = None
+            self._invalidate_active_module()
             self.coder_failed_for_level = False
-            self.replan_requested = True
 
             # Also ensure env_spec reflects the new action if specs exist
             env_mem = self.memory_manager.get_env_spec_memory("session")
@@ -1363,6 +1843,31 @@ class GameSession:
         )
         self.accepted_action_count += 1
         self.observed_transition_ingestions += 1
+        state_name = str(norm_after.get("state", "")).upper()
+
+        # Empirical invariant evaluation after each action
+        if self.last_snapshot is not None and norm_after.get("grid") is not None:
+            try:
+                from v10_agent.universal_invariants import evaluate_invariant_after_action
+                act_str = ""
+                if self.pending_action is not None:
+                    if isinstance(self.pending_action, dict):
+                        act_str = self.pending_action.get("action_id") or self.pending_action.get("id") or ""
+                    else:
+                        act_str = str(self.pending_action)
+                elif self.last_probe_action is not None:
+                    act_str = self.last_probe_action.get("action_id", "")
+
+                evaluate_invariant_after_action(
+                    registry=self.invariant_registry,
+                    before_snapshot=self.last_snapshot,
+                    after_snapshot=norm_after,
+                    planning_set=self.last_planning_set,
+                    action_id=act_str,
+                    level_index=self.levels_completed_observed,
+                )
+            except Exception as exc:
+                logger.warning(f"Error evaluating empirical invariants: {exc}")
 
         # A. If the action was a probe, record the effect in PrimitiveProbeManager
         if self.last_probe_action is not None:
@@ -1419,12 +1924,30 @@ class GameSession:
                 )
                 if is_effective_effect:
                     self._check_and_invalidate_dsl_for_new_action(action_id, rec.observed_effect)
+                    if action_id.upper() == "ACTION6":
+                        self.probe_queue = [
+                            p for p in self.probe_queue
+                            if (getattr(p, "action_id", None) or (p.get("action_id") if isinstance(p, dict) else None)) != "ACTION6"
+                        ]
 
                 # Trigger dynamic reprobes (max 2 steps) if this action altered state or toggled selection
-                reprobes = self.explorer.probe_manager.get_dynamic_reprobes(action_id, rec.observed_effect, max_steps=2)
+                reprobes = self.explorer.probe_manager.get_dynamic_reprobes(action_id, rec.observed_effect, max_steps=2, planning_set=self.last_planning_set)
                 if reprobes:
-                    for r in reversed(reprobes):
-                        self.probe_queue.insert(0, r)
+                    if getattr(self.explorer.probe_manager, "_initial_sweep_done", True):
+                        for r in reversed(reprobes):
+                            self.probe_queue.insert(0, r)
+                    else:
+                        self.probe_queue.extend(reprobes)
+
+            if self.last_probe_action is not None and state_name == "GAME_OVER":
+                # Не выполняем зонды после GAME_OVER
+                self.evidence_seeking_active = False
+                self.pending_step_snapshot = None
+                self.last_probe_action = None
+                self.pending_action = None
+                self.pending_step = None
+                # Переходим к обычной обработке GAME_OVER
+                return True
 
             if self.evidence_seeking_active and self.pending_step_snapshot is not None:
                 re_eval = self.symbolic_executor.evaluate_transition(
@@ -1439,26 +1962,24 @@ class GameSession:
                 )
                 if re_eval.verdict == Verdict.UNDECIDED or re_eval.evidence_needed:
                     self.undecided_streak += 1
-                    max_streak = getattr(self.config, "max_undecided_streak", 2)
-                    budget_rem = getattr(self.config, "max_actions_per_level", 250) - len(self.level_executed_actions)
-                    if self.evidence_probes_remaining > 0 and self.undecided_streak < max_streak and budget_rem >= 25:
-                        probe_act = {"id": "ACTION1", "action_id": "ACTION1", "data": {}, "reasoning": {"source": "evidence_seeking"}}
-                        if re_eval.evidence_hint and re_eval.evidence_hint.startswith("probe_ACTION"):
-                            act_str = re_eval.evidence_hint.replace("probe_", "").upper()
-                            if act_str in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"):
-                                probe_act = {"id": act_str, "action_id": act_str, "data": {}, "reasoning": {"source": "evidence_seeking"}}
+                    allowed, reason = self._authorize_evidence_probe(self.undecided_streak)
+                    if allowed:
+                        probe_act = self._build_evidence_probe_action(re_eval.evidence_hint)
                         self.probe_queue.insert(0, probe_act)
                         self.evidence_probes_remaining -= 1
                     else:
-                        logger.info(f"Session: UNDECIDED streak limit ({self.undecided_streak}) or budget exhausted. Treating as NULL.")
+                        logger.info(
+                            f"Session: UNDECIDED streak {self.undecided_streak} treated as NULL ({reason})."
+                        )
                         self.undecided_fallback_to_null += 1
                         self.evidence_seeking_active = False
                         self.undecided_streak = 0
                         self.pending_step_snapshot = None
-                        if self.active_pool and self.active_pool.active_candidate():
-                            self.active_pool.active_candidate().sever()
+                        streak_cand = self.active_pool.peek_active_candidate() if self.active_pool else None
+                        if streak_cand is not None:
+                            streak_cand.sever()
                         self.solver_reset_pending = True
-                        self.solver_reset_reason = "undecided_streak_exhausted_null"
+                        self.solver_reset_reason = f"undecided_null_budget_exhausted:{reason}"
                 else:
                     logger.info("Session: Epistemic ambiguity resolved by evidence probe.")
                     self.undecided_resolved_by_probe += 1
@@ -1494,7 +2015,7 @@ class GameSession:
                 (before_grid is not None and after_grid is not None and before_grid != after_grid)
                 or getattr(eval_res.judgment, "is_effective", False)
             )
-            if has_observable_delta and step_act_id and step_act_id not in ("RESET", "ACTION7"):
+            if has_observable_delta and is_observable_move(step_act_id):
                 self.known_actions.add(step_act_id)
                 if game_mem and step_act_id not in getattr(game_mem, "confirmed_action_effects", {}):
                     effect_desc = getattr(eval_res.judgment, "explanation", "") or "observable transition delta"
@@ -1503,31 +2024,26 @@ class GameSession:
 
             if eval_res.verdict == Verdict.UNDECIDED or eval_res.evidence_needed:
                 self.undecided_count += 1
-                self.undecided_streak = 1
-                max_streak = getattr(self.config, "max_undecided_streak", 2)
-                budget_rem = getattr(self.config, "max_actions_per_level", 250) - len(self.level_executed_actions)
-                if self.evidence_probes_remaining > 0 and self.undecided_streak <= max_streak and budget_rem >= 25:
+                self.undecided_streak += 1
+                allowed, reason = self._authorize_evidence_probe(self.undecided_streak)
+                if allowed:
                     self.evidence_seeking_active = True
                     self.pending_step_snapshot = self.pending_step
-                    probe_act = {"id": "ACTION1", "action_id": "ACTION1", "data": {}, "reasoning": {"source": "evidence_seeking"}}
-                    hint = eval_res.evidence_hint or ""
-                    if hint.startswith("probe_ACTION"):
-                        act_str = hint.replace("probe_", "").upper()
-                        if act_str in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"):
-                            probe_act = {"id": act_str, "action_id": act_str, "data": {}, "reasoning": {"source": "evidence_seeking"}}
+                    probe_act = self._build_evidence_probe_action(eval_res.evidence_hint)
                     self.probe_queue.insert(0, probe_act)
                     self.evidence_probes_remaining -= 1
                     logger.info(f"Session: Evidence seeking active on step {self.pending_step.step_id}. Enqueued probe {probe_act.get('id')}.")
                 else:
-                    logger.info(f"Session: Step {self.pending_step.step_id} UNDECIDED but probe budget exhausted. Treating as NULL.")
+                    logger.info(f"Session: Step {self.pending_step.step_id} UNDECIDED treated as NULL ({reason}).")
                     self.undecided_fallback_to_null += 1
                     self.evidence_seeking_active = False
                     self.undecided_streak = 0
                     self.pending_step_snapshot = None
-                    if self.active_pool and self.active_pool.active_candidate():
-                        self.active_pool.active_candidate().sever()
+                    budget_cand = self.active_pool.peek_active_candidate() if self.active_pool else None
+                    if budget_cand is not None:
+                        budget_cand.sever()
                     self.solver_reset_pending = True
-                    self.solver_reset_reason = "undecided_budget_exhausted_null"
+                    self.solver_reset_reason = f"undecided_null_budget_exhausted:{reason}"
 
             elif eval_res.falsification_detected:
                 falsified = eval_res.falsified_action or "initial_motion"
@@ -1535,13 +2051,11 @@ class GameSession:
                     f"Session: Действие {falsified} не валидно при текущих координатах объекта. "
                     f"Invalidating DSL and scheduling clean micro-reprobe cycle."
                 )
-                self.active_module = None
-                self.active_manifest = None
+                self._invalidate_active_module()
                 self.active_pool = None
-                self.replan_requested = True
                 self._last_attempt_failed = True
                 self._last_failure_reason = f"Transition falsification detected: action {falsified} invalid or produced unexpected transition."
-                executed_steps = [a for a in self.level_executed_actions if a and a.upper() not in ("RESET", "ACTION7")]
+                executed_steps = [a for a in self.level_executed_actions if is_observable_move(a)]
                 self._last_failure_summary = (
                     f"{len(executed_steps)} actions executed before falsification: {', '.join(executed_steps[:12])}"
                     if executed_steps
@@ -1568,12 +2082,12 @@ class GameSession:
                     self.probe_queue.clear()
                     self.probe_queue.extend(reprobes)
 
-            elif eval_res.replan_needed or (self.active_pool is not None and self.active_pool.active_candidate() is None):
+            elif eval_res.replan_needed or (self.active_pool is not None and self.active_pool.peek_active_candidate() is None):
                 self.replan_requested = True
                 self.active_pool = None
                 self._last_attempt_failed = True
                 self._last_failure_reason = "Candidate trajectory exhausted or diverged from expected intermediate states."
-                executed_steps = [a for a in self.level_executed_actions if a and a.upper() not in ("RESET", "ACTION7")]
+                executed_steps = [a for a in self.level_executed_actions if is_observable_move(a)]
                 self._last_failure_summary = (
                     f"{len(executed_steps)} actions executed before divergence: {', '.join(executed_steps[:12])}"
                     if executed_steps
@@ -1593,7 +2107,7 @@ class GameSession:
                 )
 
             if self.active_pool:
-                next_cand = self.active_pool.active_candidate()
+                next_cand = self.active_pool.peek_active_candidate()
                 if next_cand is not None:
                     self._last_trajectory_id = next_cand.trajectory_id
 
@@ -1606,7 +2120,7 @@ class GameSession:
             before_grid = getattr(self.last_snapshot, "grid", None)
             after_grid = norm_after.get("grid")
             if before_grid is not None and after_grid is not None and before_grid != after_grid:
-                if direct_act_id and direct_act_id not in ("RESET", "ACTION7"):
+                if is_observable_move(direct_act_id):
                     game_mem = self.memory_manager.get_game_memory("session")
                     self.known_actions.add(direct_act_id)
                     if game_mem and direct_act_id not in getattr(game_mem, "confirmed_action_effects", {}):
@@ -1615,9 +2129,7 @@ class GameSession:
 
         # C. Visible Cycle Detection (Flash Loop Recovery port)
         if (
-            getattr(self.config, "enable_cycle_detector", True)
-            and hasattr(self, "cycle_detector")
-            and self.cycle_detector is not None
+            self.cycle_detector is not None
             and self.last_snapshot is not None
             and self.pending_action is not None
         ):
@@ -1630,7 +2142,7 @@ class GameSession:
             after_grid = norm_after.get("grid")
             if before_grid is not None and after_grid is not None and act_name:
                 cycle_info = self.cycle_detector.observe(before_grid, act_name, after_grid)
-                per_level_limit = getattr(self.config, "cycle_detector_per_level_limit", 2)
+                per_level_limit = self.config.cycle_detector_per_level_limit
                 if cycle_info is not None and self.cycle_interventions_this_level < per_level_limit:
                     self.cycle_interventions_this_level += 1
                     logger.warning(
@@ -1641,8 +2153,8 @@ class GameSession:
                     # Sever active candidate if one exists
                     diff_summary = None
                     eff_steps = None
-                    if self.active_pool and self.active_pool.active_candidate():
-                        cand = self.active_pool.active_candidate()
+                    cand = self.active_pool.peek_active_candidate() if self.active_pool else None
+                    if cand is not None:
                         if cand.initial_grid is not None and after_grid is not None:
                             diff_summary = summarize_grid_diff(cand.initial_grid, after_grid)
                         eff_steps = list(cand.step_effects)

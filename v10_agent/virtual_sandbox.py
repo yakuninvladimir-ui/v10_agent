@@ -14,10 +14,18 @@ from __future__ import annotations
 
 import copy
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from v10_agent.action_semantics import (
+    ACTION_DIRECTION_NAMES,
+    ACTION_VECTORS,
+    contains_token,
+    normalize_action_id,
+    parse_displacement,
+    parse_object_displacements,
+    parse_object_ids_after_keywords,
+)
 from v10_agent.memory_contours import GameMemory
 from v10_agent.planning_set import PlanningObject, PlanningSet
 from v10_agent.universal_invariants import DiscoveredInvariant, discover_invariants, compute_invariant_distance
@@ -48,6 +56,13 @@ def translate_coords_to_raw(x: int, y: int, offset: int = 1) -> tuple[int, int]:
 
 ACTION7_BLOCKED_MSG = "ACTION7 (Undo) is hardware-blocked and excluded from the search space."
 
+#: Relational keywords that name the entity a selection mechanic acts on.
+_SELECTION_KEYWORDS: tuple[str, ...] = ("moved", "controlled", "active")
+
+#: Phrases that mark a selection mechanic as a state switch even when no
+#: entity token is available.
+_SELECTION_STATUS_KEYWORDS: tuple[str, ...] = ("toggle", "switch", "action5", "active entity toggled")
+
 
 @dataclass
 class SandboxEvaluationResult:
@@ -77,10 +92,8 @@ class VirtualKinematicSandbox:
     def _extract_kinematics(self) -> None:
         """Extract displacement vectors and mechanics from confirmed game memory."""
         self.action_vectors: dict[str, tuple[int, int]] = {
-            "action1": (-1, 0),  # default UP
-            "action2": (1, 0),   # default DOWN
-            "action3": (0, -1),  # default LEFT
-            "action4": (0, 1),   # default RIGHT
+            normalize_action_id(action_id): vector
+            for action_id, vector in ACTION_VECTORS.items()
         }
         self.object_action_vectors: dict[str, dict[str, tuple[int, int]]] = {}
         self.axis_actions: set[str] = set()
@@ -88,19 +101,32 @@ class VirtualKinematicSandbox:
 
         if self.game_memory and self.game_memory.confirmed_action_effects:
             for act_id, eff_str in self.game_memory.confirmed_action_effects.items():
-                act_lower = act_id.lower()
+                act_id = normalize_action_id(act_id)
+                has_motion = False
                 # Parse per-object motion: "moved obj_1 ... by dy=0, dx=-3"
-                for m in re.finditer(r"moved\s+(obj_[a-zA-Z0-9_]+)\s+.*?by\s+dy=([+-]?\d+),\s*dx=([+-]?\d+)", eff_str):
-                    oid = m.group(1)
-                    dy = int(m.group(2))
-                    dx = int(m.group(3))
-                    self.object_action_vectors.setdefault(oid, {})[act_lower] = (dy, dx)
+                for oid, displacement in parse_object_displacements(eff_str):
+                    self.object_action_vectors.setdefault(oid, {})[act_id] = displacement
+                    has_motion = True
 
                 # Fallback general vector
-                match_dy = re.search(r"dy=([+-]?\d+)", eff_str)
-                match_dx = re.search(r"dx=([+-]?\d+)", eff_str)
-                if match_dy and match_dx:
-                    self.action_vectors[act_lower] = (int(match_dy.group(1)), int(match_dx.group(1)))
+                displacement = parse_displacement(eff_str)
+                if displacement is not None:
+                    self.action_vectors[act_id] = displacement
+                    has_motion = True
+
+                # If an action had confirmed non-motion effects (e.g. palette transition, color change, toggle)
+                # but NO motion was observed (no dy/dx or moved), zero-out its default kinematic vector!
+                if not has_motion and any(kw in str(eff_str).lower() for kw in ("color", "palette", "transition", "swap", "cells changed", "toggle", "switch", "indicator")):
+                    self.action_vectors[act_id] = (0, 0)
+
+        # Zero-out displacement for actions confirmed as non-kinematic (palette, trigger, selection)
+        if self.game_memory and hasattr(self.game_memory, "action_affordances"):
+            for aff in getattr(self.game_memory, "action_affordances", []):
+                if isinstance(aff, dict):
+                    act_id = normalize_action_id(aff.get("action_id", ""))
+                    eff_cls = str(aff.get("effect_class", "")).upper()
+                    if eff_cls and eff_cls not in ("KINEMATIC", "UNKNOWN") and act_id in self.action_vectors:
+                        self.action_vectors[act_id] = (0, 0)
 
         # Pieces can move in all 4 directions by default
         self.piece_actions = set(self.action_vectors.keys())
@@ -127,45 +153,48 @@ class VirtualKinematicSandbox:
         if is_target or actor_type == "target":
             return (0, 0)
 
+        # Non-kinematic operations (palette swaps, triggers, clicks, rotations, selections) have no positional translation
+        if any(kw in doc_lower or kw in fn_lower for kw in (
+            "palette", "transition", "color", "toggle", "trigger", "select", "switch", "coord", "click"
+        )):
+            return (0, 0)
+
         dy, dx = (0, 0)
         # 2. Check object-specific kinematics from game memory
         if obj_id and obj_id in self.object_action_vectors:
             for act_id, vec in self.object_action_vectors[obj_id].items():
-                if act_id in fn_lower or fn_lower in act_id:
+                if act_id.lower() in fn_lower or fn_lower in act_id.lower():
                     dy, dx = vec
                     break
 
         # 3. Check general action_vectors
         if dy == 0 and dx == 0:
             for act_id, vec in self.action_vectors.items():
-                if act_id in fn_lower or fn_lower in act_id:
+                if act_id.lower() in fn_lower or fn_lower in act_id.lower():
                     dy, dx = vec
                     break
 
         # 4. Check keywords in docstring or function name
         if dy == 0 and dx == 0:
             if "up" in fn_lower or "up" in doc_lower:
-                dy, dx = self.action_vectors.get("action1", (-1, 0))
+                dy, dx = self.action_vectors.get("ACTION1", ACTION_VECTORS["ACTION1"])
             elif "down" in fn_lower or "down" in doc_lower:
-                dy, dx = self.action_vectors.get("action2", (1, 0))
+                dy, dx = self.action_vectors.get("ACTION2", ACTION_VECTORS["ACTION2"])
             elif "left" in fn_lower or "left" in doc_lower:
-                dy, dx = self.action_vectors.get("action3", (0, -1))
+                dy, dx = self.action_vectors.get("ACTION3", ACTION_VECTORS["ACTION3"])
             elif "right" in fn_lower or "right" in doc_lower:
-                dy, dx = self.action_vectors.get("action4", (0, 1))
+                dy, dx = self.action_vectors.get("ACTION4", ACTION_VECTORS["ACTION4"])
 
-        # 5. Actor isolation: elongated objects (aspect ratio > 3:1) are constrained
-        # to move only along their shorter axis (perpendicular to elongation).
-        if actor_type == "axis":
-            obj = self.planning_set.get_object(obj_id) if (obj_id and self.planning_set) else None
+        # 5. Actor isolation for symmetry axes:
+        # A vertical axis (height > width) shifts horizontally; motion along the axis (dy != 0) is constrained.
+        # A horizontal axis (width > height) shifts vertically; motion along the axis (dx != 0) is constrained.
+        if actor_type == "axis" and obj_id and self.planning_set:
+            obj = self.planning_set.get_object(obj_id)
             if obj:
-                aspect = max(obj.height, obj.width) / max(1, min(obj.height, obj.width))
-                if aspect >= 3.0:
-                    is_v = obj.height > obj.width
-                    is_h = obj.width > obj.height
-                    if is_v and dy != 0:
-                        return (0, 0)
-                    if is_h and dx != 0:
-                        return (0, 0)
+                if obj.height > obj.width and dy != 0:
+                    return (0, 0)
+                elif obj.width > obj.height and dx != 0:
+                    return (0, 0)
 
         return (dy, dx)
 
@@ -247,11 +276,9 @@ class VirtualKinematicSandbox:
         if self.planning_set:
             for o in self.planning_set.objects:
                 if o.id not in [a["id"] for a in selectable_actors]:
-                    aspect = max(o.height, o.width) / max(1, min(o.height, o.width))
-                    is_other_axis = aspect >= 3.0
-                    if is_other_axis:
+                    if axis_obj and o.id == axis_obj.id:
                         selectable_actors.append({"type": "axis", "id": o.id, "obj": o})
-                    elif o.area >= 4 and o.color != 0:
+                    elif o.area >= 1 and o.color != 0:
                         if target_obj and o.id == target_obj.id:
                             continue
                         selectable_actors.append({"type": "piece", "id": o.id, "obj": o})
@@ -263,24 +290,16 @@ class VirtualKinematicSandbox:
         if self.game_memory and self.game_memory.selection_mechanics:
             for note in self.game_memory.selection_mechanics:
                 # General actor identification from selection mechanics
-                m = re.search(r"(?:moved|controlled|active)\s+(?:from\s+)?(obj_[a-zA-Z0-9_]+)", note, re.IGNORECASE)
-                if m:
-                    src_id = m.group(1)
+                src_ids = [e for _, e in parse_object_ids_after_keywords(note, _SELECTION_KEYWORDS)]
+                if src_ids:
+                    src_id = src_ids[0]
                     if axis_obj and src_id == axis_obj.id:
                         active_actor = "axis"
                         break
-                    src_obj = self.planning_set.get_object(src_id) if self.planning_set else None
-                    if src_obj:
-                        aspect = max(src_obj.height, src_obj.width) / max(1, min(src_obj.height, src_obj.width))
-                        if aspect >= 3.0:
-                            active_actor = "axis"
-                            break
-                if any(kw in note.lower() for kw in ("toggle", "switch", "action5", "active entity toggled")):
+                if any(kw in note.lower() for kw in _SELECTION_STATUS_KEYWORDS):
                     if axis_obj:
-                        aspect = max(axis_obj.height, axis_obj.width) / max(1, min(axis_obj.height, axis_obj.width))
-                        if aspect >= 3.0:
-                            active_actor = "axis"
-                            break
+                        active_actor = "axis"
+                        break
 
         actor_idx = 0
         for i, a in enumerate(selectable_actors):
@@ -313,6 +332,16 @@ class VirtualKinematicSandbox:
             1 for s in steps if any(k in s.get("dsl_function", "").lower() for k in ("click", "coord", "action6", "toggle", "switch", "action5"))
         ) >= 1
 
+        # Track spatial simulation states to prune non-progressive cyclic loops
+        seen_states: dict[tuple[Any, ...], tuple[int, float]] = {}
+        initial_state_key = (
+            actor_idx,
+            int(round(sim_piece_r)),
+            int(round(sim_piece_c)),
+            int(round(sim_axis_coord)) if sim_axis_coord is not None else None,
+        )
+        seen_states[initial_state_key] = (0, initial_dist)
+
         has_boundary_violation = False
         has_collision = False
         collision_obj_id = ""
@@ -329,18 +358,30 @@ class VirtualKinematicSandbox:
                 active_actor = selectable_actors[actor_idx]["type"]
                 repaired_steps.append(step)
 
-            # 2. Coordinate Click (ACTION6)
+            # 2. Coordinate Click (ACTION6 / CLICK)
             elif any(k in fn_name.lower() or k in doc for k in ("click", "coord", "action6")):
-                if "x" in args and "y" in args:
-                    click_x = int(args["x"])
-                    click_y = int(args["y"])
+                if "target" in args and args["target"]:
+                    tgt_val = str(args["target"]).strip()
                     for i, a in enumerate(selectable_actors):
                         obj = a["obj"]
-                        if obj and (obj.bbox.min_col <= click_x <= obj.bbox.max_col and
-                                    obj.bbox.min_row <= click_y <= obj.bbox.max_row):
+                        alias = self.planning_set.object_real_to_alias.get(obj.id, obj.id)
+                        if tgt_val in (obj.id, alias):
                             actor_idx = i
                             active_actor = a["type"]
                             break
+                elif "x" in args and "y" in args and args["x"] is not None and args["y"] is not None:
+                    try:
+                        click_x = int(args["x"])
+                        click_y = int(args["y"])
+                        for i, a in enumerate(selectable_actors):
+                            obj = a["obj"]
+                            if obj and (obj.bbox.min_col <= click_x <= obj.bbox.max_col and
+                                        obj.bbox.min_row <= click_y <= obj.bbox.max_row):
+                                actor_idx = i
+                                active_actor = a["type"]
+                                break
+                    except (ValueError, TypeError):
+                        pass
                 repaired_steps.append(step)
 
             # 3. Kinematic Displacement
@@ -384,61 +425,104 @@ class VirtualKinematicSandbox:
                     repaired_steps.append(step)
 
                 else:
-                    curr_actor_meta = selectable_actors[actor_idx] if actor_idx < len(selectable_actors) else None
-                    curr_obj_id = curr_actor_meta["id"] if curr_actor_meta else (piece_obj.id if piece_obj else None)
-                    is_inv_subject = (piece_obj is None or curr_obj_id == piece_obj.id or len([a for a in selectable_actors if a["type"] == "piece"]) <= 1)
+                    # Check if step explicitly specifies an object target / subject
+                    step_target_obj = None
+                    target_arg = args.get("target") or args.get("subject")
+                    if target_arg:
+                        res_id = self.planning_set.resolve_object_id(str(target_arg))
+                        if res_id:
+                            step_target_obj = self.planning_set.get_object(res_id)
+                    if not step_target_obj:
+                        for p in step.get("expected_propositions", []):
+                            p_dict = dict(p) if isinstance(p, dict) else p.to_dict()
+                            if p_dict.get("predicate") in ("moved", "step_moved") or p_dict.get("family") == "metric_sign":
+                                s_id = p_dict.get("subject_id")
+                                if s_id:
+                                    res_id = self.planning_set.resolve_object_id(str(s_id))
+                                    if res_id:
+                                        step_target_obj = self.planning_set.get_object(res_id)
+                                        break
 
-                    dr_p, dc_p = self._get_displacement(piece_obj.id if piece_obj else None, fn_name, doc, is_target=False, actor_type="piece")
-                    dr_t, dc_t = self._get_displacement(target_obj.id if target_obj else None, fn_name, doc, is_target=True, actor_type="target")
+                    # Target object motion vs piece object motion
+                    is_target_moving = (target_obj is not None and step_target_obj is not None and step_target_obj.id == target_obj.id)
 
-                    if is_inv_subject and (dr_p != 0 or dc_p != 0):
-                        new_piece_r = sim_piece_r + dr_p
-                        new_piece_c = sim_piece_c + dc_p
-                        if piece_obj and (new_piece_r < 0 or new_piece_r >= self.grid_h or new_piece_c < 0 or new_piece_c >= self.grid_w):
-                            has_boundary_violation = True
-                            logger.warning(f"Sandbox: step {idx} ({fn_name}) pushes piece out of grid.")
-                        else:
-                            sim_piece_r = new_piece_r
-                            sim_piece_c = new_piece_c
+                    if is_target_moving:
+                        dr_t, dc_t = self._get_displacement(target_obj.id, fn_name, doc, is_target=True, actor_type="target")
+                        if dr_t != 0 or dc_t != 0:
+                            new_target_r = sim_target_r + dr_t
+                            new_target_c = sim_target_c + dc_t
+                            dr_total_t = int(round(new_target_r - target_obj.centroid.row))
+                            dc_total_t = int(round(new_target_c - target_obj.centroid.col))
+                            t_min_r = target_obj.bbox.min_row + dr_total_t
+                            t_max_r = target_obj.bbox.max_row + dr_total_t
+                            t_min_c = target_obj.bbox.min_col + dc_total_t
+                            t_max_c = target_obj.bbox.max_col + dc_total_t
+                            if t_min_r < 0 or t_max_r >= self.grid_h or t_min_c < 0 or t_max_c >= self.grid_w:
+                                has_boundary_violation = True
+                                logger.warning(f"Sandbox: step {idx} ({fn_name}) pushes target out of grid.")
+                            else:
+                                sim_target_r = new_target_r
+                                sim_target_c = new_target_c
+                    else:
+                        active_piece = step_target_obj or piece_obj
+                        curr_actor_meta = selectable_actors[actor_idx] if actor_idx < len(selectable_actors) else None
+                        curr_obj_id = curr_actor_meta["id"] if curr_actor_meta else (active_piece.id if active_piece else None)
+                        is_inv_subject = (step_target_obj is not None or piece_obj is None or curr_obj_id == (active_piece.id if active_piece else None) or len([a for a in selectable_actors if a["type"] == "piece"]) <= 1)
 
-                    if (dr_t != 0 or dc_t != 0):
-                        new_target_r = sim_target_r + dr_t
-                        new_target_c = sim_target_c + dc_t
-                        if target_obj and (new_target_r < 0 or new_target_r >= self.grid_h or new_target_c < 0 or new_target_c >= self.grid_w):
-                            has_boundary_violation = True
-                            logger.warning(f"Sandbox: step {idx} ({fn_name}) pushes target out of grid.")
-                        else:
-                            sim_target_r = new_target_r
-                            sim_target_c = new_target_c
+                        dr_p, dc_p = self._get_displacement(active_piece.id if active_piece else None, fn_name, doc, is_target=False, actor_type="piece")
 
-                    # Collision check for piece
-                    if not has_boundary_violation and piece_obj and (dr_p != 0 or dc_p != 0):
-                        dr_total = int(round(sim_piece_r - piece_obj.centroid.row))
-                        dc_total = int(round(sim_piece_c - piece_obj.centroid.col))
-                        p_min_r = piece_obj.bbox.min_row + dr_total
-                        p_max_r = piece_obj.bbox.max_row + dr_total
-                        p_min_c = piece_obj.bbox.min_col + dc_total
-                        p_max_c = piece_obj.bbox.max_col + dc_total
+                        if is_inv_subject and (dr_p != 0 or dc_p != 0):
+                            new_piece_r = sim_piece_r + dr_p
+                            new_piece_c = sim_piece_c + dc_p
+                            if active_piece:
+                                dr_total = int(round(new_piece_r - active_piece.centroid.row))
+                                dc_total = int(round(new_piece_c - active_piece.centroid.col))
+                                p_min_r = active_piece.bbox.min_row + dr_total
+                                p_max_r = active_piece.bbox.max_row + dr_total
+                                p_min_c = active_piece.bbox.min_col + dc_total
+                                p_max_c = active_piece.bbox.max_col + dc_total
+                                if p_min_r < 0 or p_max_r >= self.grid_h or p_min_c < 0 or p_max_c >= self.grid_w:
+                                    has_boundary_violation = True
+                                    logger.warning(f"Sandbox: step {idx} ({fn_name}) pushes piece out of grid.")
+                                else:
+                                    sim_piece_r = new_piece_r
+                                    sim_piece_c = new_piece_c
+                            else:
+                                if new_piece_r < 0 or new_piece_r >= self.grid_h or new_piece_c < 0 or new_piece_c >= self.grid_w:
+                                    has_boundary_violation = True
+                                    logger.warning(f"Sandbox: step {idx} ({fn_name}) pushes piece out of grid.")
+                                else:
+                                    sim_piece_r = new_piece_r
+                                    sim_piece_c = new_piece_c
 
-                        for other in self.planning_set.objects:
-                            if other.id == piece_obj.id or other.color == 0 or other.area <= 0:
-                                continue
-                            if inv_type == "socket_coverage" and target_obj and other.id == target_obj.id:
-                                continue
-                            if axis_obj and other.id == axis_obj.id:
-                                continue
-                            if target_obj and other.id == target_obj.id:
-                                continue
-                            # Exclude full or near-full height/width dividers and axes
-                            aspect = max(other.height, other.width) / max(1, min(other.height, other.width))
-                            if aspect >= 3.0:
-                                continue
-                            if not (p_max_r < other.bbox.min_row or p_min_r > other.bbox.max_row or
-                                    p_max_c < other.bbox.min_col or p_min_c > other.bbox.max_col):
-                                has_collision = True
-                                collision_obj_id = other.id
-                                logger.warning(f"Sandbox: step {idx} ({fn_name}) collides piece with {other.id}.")
-                                break
+                            # Pixel-level collision check for moving piece
+                            if not has_boundary_violation and active_piece:
+                                moved_pixels = {(r + dr_total, c + dc_total) for (r, c) in active_piece.pixels}
+                                for other in self.planning_set.objects:
+                                    if other.id == active_piece.id or other.color == 0 or other.area <= 0:
+                                        continue
+                                    if inv_type == "socket_coverage" and target_obj and other.id == target_obj.id:
+                                        continue
+                                    if axis_obj and other.id == axis_obj.id:
+                                        continue
+                                    if target_obj and other.id == target_obj.id:
+                                        continue
+                                    # Skip parent/child containers
+                                    if hasattr(active_piece, "child_ids") and other.id in getattr(active_piece, "child_ids", ()):
+                                        continue
+                                    if hasattr(other, "child_ids") and active_piece.id in getattr(other, "child_ids", ()):
+                                        continue
+                                    other_role = str(getattr(other, "role", "")).upper()
+                                    if any(kw in other_role for kw in ("GOAL", "TARGET", "SOCKET", "COLLECTIBLE", "RECEPTACLE", "TRIGGER")):
+                                        continue
+                                    # Fast AABB prune before pixel check
+                                    if not (p_max_r < other.bbox.min_row or p_min_r > other.bbox.max_row or
+                                            p_max_c < other.bbox.min_col or p_min_c > other.bbox.max_col):
+                                        if any(cell in other.pixels for cell in moved_pixels):
+                                            has_collision = True
+                                            collision_obj_id = other.id
+                                            logger.warning(f"Sandbox: step {idx} ({fn_name}) collides piece with {other.id}.")
+                                            break
 
                     repaired_steps.append(step)
 
@@ -451,6 +535,23 @@ class VirtualKinematicSandbox:
                 invariant_type=inv_type,
             )
             min_dist = min(min_dist, total_dist)
+
+            # Check logical cycle: if state was visited before without net progress or environmental mutation
+            state_key = (
+                actor_idx,
+                int(round(sim_piece_r)),
+                int(round(sim_piece_c)),
+                int(round(sim_axis_coord)) if sim_axis_coord is not None else None,
+            )
+            if state_key in seen_states and not has_multi_actor:
+                prev_idx, prev_dist = seen_states[state_key]
+                if total_dist >= prev_dist and (len(repaired_steps) - prev_idx) >= 2:
+                    logger.info(
+                        f"Sandbox: Pruned non-progressive circular trajectory loop between step {prev_idx} and {len(repaired_steps)}."
+                    )
+                    repaired_steps = repaired_steps[:prev_idx]
+            else:
+                seen_states[state_key] = (len(repaired_steps), total_dist)
 
             if not is_baseline_symmetry and total_dist <= TOLERANCE:
                 if goal_reached_idx < 0:
@@ -536,11 +637,22 @@ class VirtualKinematicSandbox:
             if subject_obj:
                 break
         if not subject_obj:
-            objs = [o for o in self.planning_set.objects if o.color != 0 and o.area > 0]
-            if objs:
-                # Find an object that matches any direction in functions
-                subject_obj = objs[0]
+            # Check confirmed actors from game memory
+            if self.game_memory and hasattr(self.game_memory, "confirmed_actors") and self.game_memory.confirmed_actors:
+                for act_id in self.game_memory.confirmed_actors:
+                    cand_act = self.planning_set.get_object(act_id)
+                    if cand_act:
+                        subject_obj = cand_act
+                        break
+            # Or inspect objects with distinct dynamic actor/player/piece roles
+            if not subject_obj:
+                for o in self.planning_set.objects:
+                    r_name = str(getattr(o, "role", "")).upper()
+                    if any(kw in r_name for kw in ("PLAYER", "PIECE", "DYNAMIC_ACTOR")):
+                        subject_obj = o
+                        break
 
+        # If no identifiable movable subject is present, actions are non-spatial/board-wide or ungrounded
         if not subject_obj:
             return False, False, None
 
@@ -567,9 +679,19 @@ class VirtualKinematicSandbox:
             for other in self.planning_set.objects:
                 if other.id == subject_obj.id or other.color == 0 or other.area <= 0:
                     continue
-                aspect = max(other.height, other.width) / max(1, min(other.height, other.width))
-                if aspect >= 3.0:
+                # Skip target objects and symmetry axes of active spatial invariants for subject collision check
+                if any((other.id == inv.target_id or other.id == inv.axis_id) for inv in self.invariants if inv.invariant_type in ("socket_coverage", "spatial_contact", "axial_symmetry_vertical", "axial_symmetry_horizontal")):
                     continue
+                # Skip targets, receptacles, and goal sockets from being treated as blocking collisions
+                other_role = str(getattr(other, "role", "")).upper()
+                if any(kw in other_role for kw in ("GOAL", "TARGET", "SOCKET", "COLLECTIBLE", "RECEPTACLE", "TRIGGER")):
+                    continue
+                # Skip parent or child objects of subject
+                if hasattr(subject_obj, "child_ids") and other.id in getattr(subject_obj, "child_ids", ()):
+                    continue
+                if hasattr(other, "child_ids") and subject_obj.id in getattr(other, "child_ids", ()):
+                    continue
+
                 if not (p_max_r < other.bbox.min_row or p_min_r > other.bbox.max_row or
                         p_max_c < other.bbox.min_col or p_min_c > other.bbox.max_col):
                     return False, True, other.id
@@ -619,11 +741,20 @@ class VirtualKinematicSandbox:
 
         if hypothesis:
             hypo_text = str(hypothesis).lower()
-            matched = [
-                inv for inv in candidate_invariants
-                if (inv.subject_id.lower() in hypo_text or inv.target_id.lower() in hypo_text)
-                or (inv.axis_id and inv.axis_id.lower() in hypo_text)
-            ]
+            matched = []
+            for inv in candidate_invariants:
+                s_id = inv.subject_id.lower()
+                t_id = inv.target_id.lower()
+                s_alias = (self.planning_set.object_real_to_alias.get(inv.subject_id) or "").lower()
+                t_alias = (self.planning_set.object_real_to_alias.get(inv.target_id) or "").lower()
+                axis_alias = (self.planning_set.object_real_to_alias.get(inv.axis_id) or "").lower() if inv.axis_id else ""
+
+                if s_id in hypo_text or contains_token(hypo_text, s_alias):
+                    matched.append(inv)
+                elif t_id in hypo_text or contains_token(hypo_text, t_alias):
+                    matched.append(inv)
+                elif inv.axis_id and (inv.axis_id.lower() in hypo_text or contains_token(hypo_text, axis_alias)):
+                    matched.append(inv)
             if matched:
                 candidate_invariants = matched
 
@@ -669,7 +800,7 @@ class VirtualKinematicSandbox:
         step_sz = max(1, magnitudes[0]) if magnitudes else 1
 
         has_directional_primitives = any(
-            f in manifest_functions for f in ("action1", "action2", "action3", "action4")
+            action_id.lower() in manifest_functions for action_id in ACTION_VECTORS
         ) or any(
             any(d in f.lower() or d in m.get("docstring", "").lower() for d in ("up", "down", "left", "right"))
             for f, m in manifest_functions.items()
@@ -678,10 +809,19 @@ class VirtualKinematicSandbox:
             return None
 
         # Directional and toggle primitives
-        up_fn = next((f for f, m in manifest_functions.items() if "up" in f.lower() or "up" in m.get("docstring", "").lower()), "action1")
-        down_fn = next((f for f, m in manifest_functions.items() if "down" in f.lower() or "down" in m.get("docstring", "").lower()), "action2")
-        left_fn = next((f for f, m in manifest_functions.items() if "left" in f.lower() or "left" in m.get("docstring", "").lower()), "action3")
-        right_fn = next((f for f, m in manifest_functions.items() if "right" in f.lower() or "right" in m.get("docstring", "").lower()), "action4")
+        def _find_directional(action_id: str) -> str:
+            name = action_id.lower()
+            keyword = ACTION_DIRECTION_NAMES[action_id].lower()
+            return next(
+                (f for f, m in manifest_functions.items()
+                 if name in f.lower() or keyword in f.lower() or keyword in m.get("docstring", "").lower()),
+                name,
+            )
+
+        up_fn = _find_directional("ACTION1")
+        down_fn = _find_directional("ACTION2")
+        left_fn = _find_directional("ACTION3")
+        right_fn = _find_directional("ACTION4")
 
         has_selection_toggle = bool(
             self.game_memory and any(
@@ -707,18 +847,16 @@ class VirtualKinematicSandbox:
         init_actor = "piece"
         if self.game_memory and self.game_memory.selection_mechanics:
             for note in self.game_memory.selection_mechanics:
-                m = re.search(r"(?:moved|controlled|active)\s+(?:from\s+)?(obj_[a-zA-Z0-9_]+)", note, re.IGNORECASE)
-                if m:
-                    src_id = m.group(1)
+                src_ids = [e for _, e in parse_object_ids_after_keywords(note, _SELECTION_KEYWORDS)]
+                if src_ids:
+                    src_id = src_ids[0]
                     if axis and src_id == axis.id:
                         init_actor = "axis"
                         break
-                if any(kw in note.lower() for kw in ("toggle", "switch", "action5", "active entity toggled")):
+                if any(kw in note.lower() for kw in _SELECTION_STATUS_KEYWORDS):
                     if axis:
-                        aspect = max(axis.height, axis.width) / max(1, min(axis.height, axis.width))
-                        if aspect >= 3.0:
-                            init_actor = "axis"
-                            break
+                        init_actor = "axis"
+                        break
 
         init_act_idx = 0
         for i, obj in enumerate(controllable_objects):
@@ -813,4 +951,228 @@ class VirtualKinematicSandbox:
                     heapq.heappush(open_set, (new_g + h, new_g, counter, curr_pos, next_act_idx, path + [toggle_fn]))
 
         return None
+
+    def _find_path_astar(
+        self,
+        subject: PlanningObject,
+        start_pos: tuple[float, float],
+        goal_pos: tuple[float, float],
+        manifest_functions: dict[str, Any],
+        allowed_target_id: str | None = None,
+        avoid_hazard_colors: set[int] | None = None,
+        max_nodes: int = 2000,
+    ) -> list[tuple[str, int, int]] | None:
+        """A* pathfinding for subject object from start_pos to goal_pos.
+
+        Returns list of (function_name, dy, dx) tuples, or None if no path found.
+        """
+        import heapq
+
+        if avoid_hazard_colors is None:
+            avoid_hazard_colors = set()
+            if self.game_memory and hasattr(self.game_memory, "palette_role_map"):
+                from v10_agent.types import EntityRole
+                hazards = self.game_memory.palette_role_map.get_colors_by_role(EntityRole.HAZARD)
+                avoid_hazard_colors = {h.color_id for h in hazards}
+
+        start_r = int(round(start_pos[0]))
+        start_c = int(round(start_pos[1]))
+        goal_r = int(round(goal_pos[0]))
+        goal_c = int(round(goal_pos[1]))
+
+        if (start_r, start_c) == (goal_r, goal_c):
+            return []
+
+        # Available directional actions from manifest. Direction geometry comes
+        # from the canonical vocabulary; only the mapping onto DSL function names
+        # is discovered here.
+        dir_actions = []
+        for action_id, (dy, dx) in ACTION_VECTORS.items():
+            name = action_id.lower()
+            keyword = ACTION_DIRECTION_NAMES[action_id].lower()
+            fn_name = next(
+                (f for f, m in manifest_functions.items() if f.lower() == name or name in f.lower()
+                 or keyword in f.lower() or keyword in m.get("docstring", "").lower()),
+                name,
+            )
+            dir_actions.append((fn_name, dy, dx))
+
+        # Check collision with static objects and boundaries
+        def is_valid_placement(r: int, c: int) -> bool:
+            dr = r - int(round(subject.centroid.row))
+            dc = c - int(round(subject.centroid.col))
+
+            p_min_r = subject.bbox.min_row + dr
+            p_max_r = subject.bbox.max_row + dr
+            p_min_c = subject.bbox.min_col + dc
+            p_max_c = subject.bbox.max_col + dc
+
+            if p_min_r < 0 or p_max_r >= self.grid_h or p_min_c < 0 or p_max_c >= self.grid_w:
+                return False
+
+            for other in self.planning_set.objects:
+                if other.id == subject.id or other.color == 0 or other.area <= 0:
+                    continue
+                if allowed_target_id and other.id == allowed_target_id:
+                    continue
+                # Hazard check
+                if other.color in avoid_hazard_colors:
+                    if not (p_max_r < other.bbox.min_row - 1 or p_min_r > other.bbox.max_row + 1 or
+                            p_max_c < other.bbox.min_col - 1 or p_min_c > other.bbox.max_col + 1):
+                        return False
+                # Solid obstacle check
+                if not (p_max_r < other.bbox.min_row or p_min_r > other.bbox.max_row or
+                        p_max_c < other.bbox.min_col or p_min_c > other.bbox.max_col):
+                    return False
+
+            return True
+
+        h_start = abs(start_r - goal_r) + abs(start_c - goal_c)
+        counter = 0
+        open_set = [(h_start, 0, counter, (start_r, start_c), [])]
+        visited: set[tuple[int, int]] = {(start_r, start_c)}
+
+        nodes_expanded = 0
+        while open_set and nodes_expanded < max_nodes:
+            _, g, _, curr, path = heapq.heappop(open_set)
+            nodes_expanded += 1
+
+            if curr == (goal_r, goal_c):
+                return path
+
+            for fn_name, dy, dx in dir_actions:
+                nxt = (curr[0] + dy, curr[1] + dx)
+                if nxt not in visited:
+                    if nxt == (goal_r, goal_c) or is_valid_placement(nxt[0], nxt[1]):
+                        visited.add(nxt)
+                        h = abs(nxt[0] - goal_r) + abs(nxt[1] - goal_c)
+                        counter += 1
+                        heapq.heappush(open_set, (g + 1 + h, g + 1, counter, nxt, path + [(fn_name, dy, dx)]))
+
+        return None
+
+    def expand_waypoints_to_trajectory(
+        self,
+        waypoints: list[dict[str, Any]],
+        manifest_functions: dict[str, Any],
+    ) -> list[dict[str, Any]] | None:
+        """Expand high-level strategic waypoints into executable steps with typed EXPECT clauses."""
+        if not waypoints or not self.planning_set:
+            return None
+
+        expanded_steps: list[dict[str, Any]] = []
+        simulated_positions: dict[str, tuple[float, float]] = {
+            obj.id: (float(obj.centroid.row), float(obj.centroid.col))
+            for obj in self.planning_set.objects
+        }
+
+        # Resolve subject object (default to primary actor if not specified)
+        default_subject = None
+        actors = getattr(self.game_memory, "confirmed_actors", set()) if self.game_memory else set()
+        for act_id in actors:
+            obj = self.planning_set.get_object(act_id)
+            if obj:
+                default_subject = obj
+                break
+        if not default_subject:
+            objs = [o for o in self.planning_set.objects if o.color != 0 and o.area > 0]
+            if objs:
+                default_subject = objs[0]
+
+        for wp in waypoints:
+            wp_type = str(wp.get("type", "")).upper()
+            subj_key = wp.get("subject") or wp.get("actor")
+            subject = (
+                self.planning_set.get_object(self.planning_set.resolve_object_id(str(subj_key)) or "")
+                if subj_key
+                else default_subject
+            )
+            if not subject:
+                continue
+
+            curr_pos = simulated_positions.get(subject.id, (float(subject.centroid.row), float(subject.centroid.col)))
+
+            if wp_type in ("NAVIGATE_TO", "NAVIGATE", "MOVE_TO"):
+                target_key = wp.get("target") or wp.get("destination") or wp.get("arg_0")
+                target_pos = None
+                target_obj_id = None
+                if target_key:
+                    res_id = self.planning_set.resolve_object_id(str(target_key))
+                    t_obj = self.planning_set.get_object(res_id or "") if res_id else None
+                    if t_obj:
+                        target_pos = simulated_positions.get(t_obj.id, (float(t_obj.centroid.row), float(t_obj.centroid.col)))
+                        target_obj_id = t_obj.id
+                if target_pos is None and "r" in wp and "c" in wp:
+                    try:
+                        target_pos = (float(wp["r"]), float(wp["c"]))
+                    except (ValueError, TypeError):
+                        pass
+
+                if target_pos is not None:
+                    path = self._find_path_astar(
+                        subject, curr_pos, target_pos, manifest_functions, allowed_target_id=target_obj_id
+                    )
+                    if path:
+                        for fn_name, dy, dx in path:
+                            curr_pos = (curr_pos[0] + dy, curr_pos[1] + dx)
+                            simulated_positions[subject.id] = curr_pos
+                            expanded_steps.append({
+                                "dsl_function": fn_name,
+                                "arguments": {},
+                                "expected_propositions": [
+                                    {"family": "metric_sign", "subject_id": subject.id, "predicate": "moved", "value": (dy, dx)},
+                                    {"family": "metric_sign", "subject_id": subject.id, "predicate": "step_moved", "value": (dy, dx)},
+                                ],
+                            })
+
+            elif wp_type in ("COLLECT_TARGET", "COLLECT"):
+                color_val = wp.get("target_color") or wp.get("color")
+                target_color = int(color_val) if color_val is not None and str(color_val).isdigit() else None
+                targets = [
+                    o for o in self.planning_set.objects
+                    if o.id != subject.id and (target_color is None or o.color == target_color) and o.area <= 4
+                ]
+                targets.sort(key=lambda t: abs(t.centroid.row - curr_pos[0]) + abs(t.centroid.col - curr_pos[1]))
+
+                for tgt in targets:
+                    t_pos = simulated_positions.get(tgt.id, (float(tgt.centroid.row), float(tgt.centroid.col)))
+                    path = self._find_path_astar(subject, curr_pos, t_pos, manifest_functions, allowed_target_id=tgt.id)
+                    if path:
+                        for idx, (fn_name, dy, dx) in enumerate(path):
+                            curr_pos = (curr_pos[0] + dy, curr_pos[1] + dx)
+                            simulated_positions[subject.id] = curr_pos
+                            props = [
+                                {"family": "metric_sign", "subject_id": subject.id, "predicate": "moved", "value": (dy, dx)},
+                                {"family": "metric_sign", "subject_id": subject.id, "predicate": "step_moved", "value": (dy, dx)},
+                            ]
+                            if idx == len(path) - 1:
+                                props.append({"family": "object_identity", "subject_id": tgt.id, "predicate": "gone"})
+                            expanded_steps.append({
+                                "dsl_function": fn_name,
+                                "arguments": {},
+                                "expected_propositions": props,
+                            })
+
+            elif wp_type in ("ACTIVATE_TRIGGER", "TRIGGER"):
+                trig_key = wp.get("trigger") or wp.get("target")
+                trig_id = self.planning_set.resolve_object_id(str(trig_key)) if trig_key else None
+                trig_obj = self.planning_set.get_object(trig_id or "") if trig_id else None
+                if trig_obj:
+                    t_pos = simulated_positions.get(trig_obj.id, (float(trig_obj.centroid.row), float(trig_obj.centroid.col)))
+                    path = self._find_path_astar(subject, curr_pos, t_pos, manifest_functions, allowed_target_id=trig_obj.id)
+                    if path:
+                        for fn_name, dy, dx in path:
+                            curr_pos = (curr_pos[0] + dy, curr_pos[1] + dx)
+                            simulated_positions[subject.id] = curr_pos
+                            expanded_steps.append({
+                                "dsl_function": fn_name,
+                                "arguments": {},
+                                "expected_propositions": [
+                                    {"family": "metric_sign", "subject_id": subject.id, "predicate": "moved", "value": (dy, dx)},
+                                    {"family": "metric_sign", "subject_id": subject.id, "predicate": "step_moved", "value": (dy, dx)},
+                                ],
+                            })
+
+        return expanded_steps if expanded_steps else None
+
 

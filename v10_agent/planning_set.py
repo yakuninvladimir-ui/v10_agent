@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -170,43 +171,32 @@ def build_planning_set(
         if obj not in ordered_objs:
             ordered_objs.append(obj)
 
-    # Centroids of all ordered objects first
+    # Strictly ONE canonical interaction point (centroid) per object with spatial NMS deduplication
+    min_separation = 2.5
     for obj in ordered_objs:
-        alias = real_to_alias[obj.id]
+        col = int(round(obj.centroid.col))
+        row = int(round(obj.centroid.row))
+        if not (0 <= col < width and 0 <= row < height):
+            continue
+
+        # Spatial NMS: do not add candidate if an existing candidate is within min_separation cells
+        is_duplicate = any(math.hypot(c.x - col, c.y - row) < min_separation for c in coords)
+        if is_duplicate:
+            continue
+
+        alias = real_to_alias.get(obj.id, obj.id)
         coords.append(
             CoordinateCandidate(
                 candidate_id=f"coord_c_{obj.id}",
-                x=int(round(obj.centroid.col)),
-                y=int(round(obj.centroid.row)),
+                x=col,
+                y=row,
                 source_type="object_centroid",
                 object_id=obj.id,
-                label=f"{alias}_centroid",
+                label=alias,
             )
         )
-
-    # Top-left and bottom-right corners
-    for obj in ordered_objs:
-        alias = real_to_alias[obj.id]
-        coords.append(
-            CoordinateCandidate(
-                candidate_id=f"coord_tl_{obj.id}",
-                x=obj.bbox.min_col,
-                y=obj.bbox.min_row,
-                source_type="object_corner_tl",
-                object_id=obj.id,
-                label=f"{alias}_TL",
-            )
-        )
-        coords.append(
-            CoordinateCandidate(
-                candidate_id=f"coord_br_{obj.id}",
-                x=obj.bbox.max_col,
-                y=obj.bbox.max_row,
-                source_type="object_corner_br",
-                object_id=obj.id,
-                label=f"{alias}_BR",
-            )
-        )
+        if len(coords) >= 12:
+            break
 
     coordinate_candidates = tuple(coords)
     allowed_coord_ids = tuple(c.candidate_id for c in coordinate_candidates)

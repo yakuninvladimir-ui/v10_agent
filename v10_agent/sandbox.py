@@ -215,6 +215,74 @@ class SandboxAPI:
             confidence=confidence,
         )
 
+    def click_object(
+        self,
+        target: str = "",
+        reasoning: dict[str, Any] | None = None,
+        expected_metric_deltas: dict[str, int | float] | None = None,
+        x: int | None = None,
+        y: int | None = None,
+    ) -> EffectDeclaration:
+        """Pure declaration of clicking on an object alias or identifier by resolving its centroid or explicit (x, y)."""
+        target_str = str(target).strip()
+        obj = None
+        if target_str:
+            obj = self.get_object(target_str)
+            if obj is None:
+                resolved_id = self._planning_set.resolve_object_id(target_str)
+                if resolved_id:
+                    obj = self.get_object(resolved_id)
+
+        has_explicit_coords = x is not None and y is not None
+        explicit_col = 0
+        explicit_row = 0
+        if has_explicit_coords:
+            try:
+                explicit_col = int(round(float(x)))
+                explicit_row = int(round(float(y)))
+            except (ValueError, TypeError):
+                has_explicit_coords = False
+
+        if obj is None:
+            if has_explicit_coords:
+                return self.declare_environment_action(
+                    action_id="ACTION6",
+                    data={"x": explicit_col, "y": explicit_row},
+                    reasoning=reasoning or {"source": "click_explicit_coords"},
+                    expected_metric_deltas=expected_metric_deltas or {"interaction": 1},
+                )
+            if self._planning_set.objects:
+                obj = self._planning_set.objects[0]
+            else:
+                h, w = self._planning_set.grid_dims
+                return self.declare_environment_action(
+                    action_id="ACTION6",
+                    data={"x": w // 2, "y": h // 2},
+                    reasoning=reasoning or {"source": "click_grid_center_fallback"},
+                    expected_metric_deltas=expected_metric_deltas,
+                )
+
+        col = explicit_col if has_explicit_coords else int(round(obj.centroid.col))
+        row = explicit_row if has_explicit_coords else int(round(obj.centroid.row))
+        alias = self._planning_set.object_real_to_alias.get(obj.id, obj.id)
+
+        click_reasoning = dict(reasoning or {})
+        click_reasoning.update({
+            "target_alias": alias,
+            "target_id": obj.id,
+            "centroid": [int(round(obj.centroid.col)), int(round(obj.centroid.row))],
+            "source": "click_object_explicit_coords" if has_explicit_coords else "click_object_centroid",
+        })
+
+        return self.declare_environment_action(
+            action_id="ACTION6",
+            data={"x": col, "y": row},
+            reasoning=click_reasoning,
+            expected_metric_deltas=expected_metric_deltas or {"interaction": 1},
+            target_object_ids=[obj.id],
+        )
+
+
 
 @dataclass
 class SandboxedModule:
@@ -341,24 +409,31 @@ class SandboxExecutor:
             if not callable(func):
                 return False, f"Function {name!r} is not callable in module namespace"
 
-            # Prepare dummy arguments based on parameter declarations
-            kwargs: dict[str, Any] = {}
-            for param in func_meta.get("parameters", []):
-                p_name = param["name"]
-                p_type = param.get("type", "str")
-
-                if p_name == "api":
-                    continue
-                if p_type == "planning_object_id":
-                    kwargs[p_name] = planning_set.object_ids[0] if planning_set.object_ids else "obj_0"
-                elif p_type == "metric_id":
-                    kwargs[p_name] = param.get("default", "centroid_distance")
-                elif p_type == "int":
-                    kwargs[p_name] = int(param.get("default", 0))
-                else:
-                    kwargs[p_name] = param.get("default", "val")
-
             try:
+                # Prepare dummy arguments based on parameter declarations
+                kwargs: dict[str, Any] = {}
+                for param in func_meta.get("parameters", []):
+                    p_name = param.get("name", "")
+                    p_type = param.get("type", "str")
+                    def_val = param.get("default")
+
+                    if p_name == "api":
+                        continue
+                    if p_type == "planning_object_id":
+                        kwargs[p_name] = planning_set.object_ids[0] if (planning_set and planning_set.object_ids) else "obj_0"
+                    elif p_type == "metric_id":
+                        kwargs[p_name] = def_val if def_val else "centroid_distance"
+                    elif p_type in ("int", "float"):
+                        if def_val is not None and def_val != "":
+                            try:
+                                kwargs[p_name] = int(def_val)
+                            except (ValueError, TypeError):
+                                kwargs[p_name] = 0
+                        else:
+                            kwargs[p_name] = 0
+                    else:
+                        kwargs[p_name] = def_val if def_val is not None else "val"
+
                 # Try calling with api as kwarg or first positional arg if accepted
                 import inspect
                 sig = inspect.signature(func)
@@ -411,7 +486,7 @@ class SandboxExecutor:
                     call_args["y"] = int(planning_set.coordinate_candidates[0].y) if planning_set.coordinate_candidates else 0
                 elif param.annotation == int or p_name in ("count", "step", "idx"):
                     call_args[p_name] = 0
-                elif p_name in ("obj_id", "target_id", "subject_id"):
+                elif p_name in ("obj_id", "target_id", "subject_id", "target"):
                     call_args[p_name] = planning_set.object_ids[0] if planning_set.object_ids else "obj_0"
                 else:
                     call_args[p_name] = 0
@@ -419,6 +494,20 @@ class SandboxExecutor:
         result = self._execute_with_timeout(func, call_args)
 
         if isinstance(result, EffectDeclaration):
+            if (
+                result.declared_action.action_id == "ACTION6"
+                and arguments.get("x") is not None
+                and arguments.get("y") is not None
+            ):
+                try:
+                    exp_x = int(round(float(arguments["x"])))
+                    exp_y = int(round(float(arguments["y"])))
+                    new_data = dict(result.declared_action.data or {})
+                    new_data["x"] = exp_x
+                    new_data["y"] = exp_y
+                    result.declared_action.data = new_data
+                except (ValueError, TypeError):
+                    pass
             return result
         if isinstance(result, dict):
             # Parse into EffectDeclaration

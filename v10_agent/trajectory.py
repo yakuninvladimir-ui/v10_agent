@@ -77,10 +77,32 @@ class TrajectoryPool:
             )
         return cls(proposal_id=prop_id, candidates=cands)
 
-    def active_candidate(self) -> CandidateTrajectory | None:
+    def peek_active_candidate(self) -> CandidateTrajectory | None:
+        """Return the first runnable candidate at or after the cursor WITHOUT moving it.
+
+        Inspection must never change pool position: logging, predicates and
+        circuit-breaker gates all read this method, and a reader that advances
+        makes behaviour depend on how often it is called.
+        """
+        for index in range(self.active_candidate_index, len(self.candidates)):
+            cand = self.candidates[index]
+            if cand.active and not cand.is_finished():
+                return cand
+        return None
+
+    def advance_to_next_candidate(self) -> CandidateTrajectory | None:
+        """Move the cursor forward to the next runnable candidate and return it."""
         while self.active_candidate_index < len(self.candidates):
             cand = self.candidates[self.active_candidate_index]
             if cand.active and not cand.is_finished():
                 return cand
             self.active_candidate_index += 1
         return None
+
+    def active_candidate(self) -> CandidateTrajectory | None:
+        """Return the next runnable candidate, advancing past exhausted ones.
+
+        Retained as the traversal-with-progress entry point used when the caller
+        genuinely wants to move to the next candidate.
+        """
+        return self.advance_to_next_candidate()

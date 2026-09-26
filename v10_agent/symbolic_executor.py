@@ -11,11 +11,23 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from v10_agent.action_semantics import (
+    is_non_vector_move,
+    is_observable_move,
+    is_vector_action,
+    parse_referenced_action_id,
+)
 from v10_agent.brusentsov_logic import BrusentsovJudgment, Ternary, Verdict
 from v10_agent.config import V10Config
-from v10_agent.judge import LayeredVerifier
+from v10_agent.judge import (
+    LayeredVerifier,
+    is_bbox_absorbed_by_contact,
+    is_bbox_pinned_to_field_edge,
+)
 from v10_agent.memory_contours import (
+    ROLE_ALIASES,
     BranchSignature,
+    EntityRole,
     EpistemicMemory,
     SyntaxErrorRecord,
     SyntaxErrorMemory,
@@ -48,6 +60,70 @@ def format_sequence_signature(steps: list[dict[str, Any]]) -> str:
 def get_trajectory_signature_tuple(steps: list[dict[str, Any]]) -> tuple[str, ...]:
     """Format sequence of steps into a tuple of canonical step signatures."""
     return tuple(format_step_signature(s) for s in steps)
+
+
+def _resolve_field_dims(planning_set: Any, before_grid: Any) -> tuple[int, int] | None:
+    """Return the (height, width) of the observed field, or None when unknown.
+
+    The observation that was actually received wins over the planning set, because
+    the planning set may be a stand-in whose dimensions were never populated; the
+    grid is the ground truth the player saw.
+    """
+    if isinstance(before_grid, (list, tuple)) and len(before_grid) > 0:
+        first_row = before_grid[0]
+        if isinstance(first_row, (list, tuple)) and len(first_row) > 0:
+            return (len(before_grid), len(first_row))
+    dims = getattr(planning_set, "grid_dims", None)
+    if isinstance(dims, (tuple, list)) and len(dims) == 2:
+        try:
+            height, width = int(dims[0]), int(dims[1])
+        except (TypeError, ValueError):
+            return None
+        if height > 0 and width > 0:
+            return (height, width)
+    return None
+
+
+def _candidate_subject_bboxes(planning_set: Any, pending_step: GroundedStep) -> list[Any]:
+    """Collect the bounding boxes that could be the subject of the pending step.
+
+    The subject named by the step is preferred. When it is not named - or cannot be
+    resolved - the actor-role entities are used, and failing that every perceived
+    entity, because a blocked move is a property of the mover and reporting it for
+    the wrong sprite is harmless while missing it would discard a valid soft stop.
+    """
+    objects = getattr(planning_set, "objects", None)
+    if not isinstance(objects, (list, tuple)) or len(objects) == 0:
+        return []
+
+    def bbox_of(entry: Any) -> Any:
+        return getattr(entry, "bbox", None)
+
+    wanted_ids: set[str] = set()
+    for prop in getattr(pending_step, "expected_propositions", None) or []:
+        subject = getattr(prop, "subject_id", None)
+        if subject:
+            wanted_ids.add(str(subject))
+
+    matched: list[Any] = []
+    actors: list[Any] = []
+    everything: list[Any] = []
+    for entry in objects:
+        bbox = bbox_of(entry)
+        if bbox is None:
+            continue
+        everything.append(bbox)
+        entry_id = getattr(entry, "object_id", None) or getattr(entry, "obj_id", None) or getattr(entry, "id", None)
+        if entry_id is not None and str(entry_id) in wanted_ids:
+            matched.append(bbox)
+        role_name = getattr(entry, "role", None)
+        if isinstance(role_name, str) and ROLE_ALIASES.get(role_name.strip().lower()) is EntityRole.ACTOR:
+            actors.append(bbox)
+
+    for group in (matched, actors, everything):
+        if group:
+            return group
+    return []
 
 
 class StepExecutionVerdict(Enum):
@@ -169,7 +245,7 @@ class SymbolicTrajectoryExecutor:
         if pool is None or active_module is None:
             return StepExecutionResult(verdict=StepExecutionVerdict.NO_CANDIDATE)
 
-        candidate = pool.active_candidate()
+        candidate = pool.advance_to_next_candidate()
         if candidate is None:
             return StepExecutionResult(verdict=StepExecutionVerdict.NO_CANDIDATE)
 
@@ -361,10 +437,7 @@ class SymbolicTrajectoryExecutor:
                 pass
 
             if not act_id:
-                import re
-                m = re.search(r"action(\d+)", pending_step.dsl_function, re.IGNORECASE)
-                if m:
-                    act_id = f"ACTION{m.group(1)}"
+                act_id = parse_referenced_action_id(pending_step.dsl_function)
 
         before_grid = getattr(before_snapshot, "grid", None)
         if before_grid is None and hasattr(planning_set, "grid"):
@@ -398,27 +471,26 @@ class SymbolicTrajectoryExecutor:
         falsified_action = None
 
         if is_initial_step and zero_grid_delta and is_confirmed_motion:
-            # Check if this zero delta is due to boundary collision or multi-entity modal selection
+            # Check if this zero delta is due to boundary collision or multi-entity modal selection.
+            # Geometry is delegated to the verifier's shared predicates so the executor and the
+            # judge can never disagree about where the field ends or what blocks the motion.
             is_blocked_by_boundary = False
-            if planning_set and hasattr(planning_set, "objects"):
-                h = len(before_grid) if before_grid else 64
-                w = len(before_grid[0]) if before_grid and len(before_grid) > 0 else 64
-                for o in planning_set.objects:
-                    if getattr(o, "role", None) in ("ACTOR", "PRIMARY", "DYNAMIC"):
-                        bbox = getattr(o, "bbox", None)
-                        if bbox:
-                            min_r = getattr(bbox, "min_row", 0)
-                            max_r = getattr(bbox, "max_row", h - 1)
-                            min_c = getattr(bbox, "min_col", 0)
-                            max_c = getattr(bbox, "max_col", w - 1)
-                            if "UP" in confirmed_eff and min_r <= 0:
-                                is_blocked_by_boundary = True
-                            if "DOWN" in confirmed_eff and max_r >= h - 1:
-                                is_blocked_by_boundary = True
-                            if "LEFT" in confirmed_eff and min_c <= 0:
-                                is_blocked_by_boundary = True
-                            if "RIGHT" in confirmed_eff and max_c >= w - 1:
-                                is_blocked_by_boundary = True
+            field_dims = _resolve_field_dims(planning_set, before_grid)
+            crop_offset = 0
+            try:
+                crop_offset = int(getattr(planning_set, "crop_offset", 0) or 0)
+            except (TypeError, ValueError):
+                crop_offset = 0
+            subject_bboxes = _candidate_subject_bboxes(planning_set, pending_step)
+            for candidate_bbox in subject_bboxes:
+                if field_dims and is_bbox_pinned_to_field_edge(
+                    candidate_bbox, field_dims, act_id, crop_offset
+                ):
+                    is_blocked_by_boundary = True
+                    break
+                if is_bbox_absorbed_by_contact(candidate_bbox, act_id, before_grid):
+                    is_blocked_by_boundary = True
+                    break
 
             # Extract available action surface
             allowed_acts: list[str] = []
@@ -432,7 +504,7 @@ class SymbolicTrajectoryExecutor:
             # Potential modal switch actions: ACTION5, ACTION6 or confirmed selection/toggle actions
             modal_switch_actions = [
                 act for act in allowed_acts
-                if act in ("ACTION5", "ACTION6")
+                if is_non_vector_move(act)
                 or (game_memory and any(kw in getattr(game_memory, "confirmed_action_effects", {}).get(act, "").lower() for kw in ("selection", "toggle", "indicator", "active entity", "modal")))
                 or (game_memory and any(isinstance(aff, dict) and str(aff.get("action_id", "")).upper() == act and aff.get("effect_class") == "MODAL_SELECTION" for aff in getattr(game_memory, "action_affordances", [])))
             ]
@@ -441,7 +513,7 @@ class SymbolicTrajectoryExecutor:
             # Unconfirmed / unexplored discrete actions that could be modal switches
             unconfirmed_actions = [
                 act for act in allowed_acts
-                if act not in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "RESET", "ACTION7")
+                if is_observable_move(act) and not is_vector_action(act)
                 and (not game_memory or act not in getattr(game_memory, "confirmed_action_effects", {}))
             ]
             has_unexplored = bool(unconfirmed_actions)
@@ -595,6 +667,14 @@ class SymbolicTrajectoryExecutor:
             cand_severed = False
             cand_finished = (active_cand is None or active_cand.is_finished()) if active_pool else True
 
+        if cand_advanced and not cand_finished and active_cand is not None and not zero_grid_delta:
+            self._remap_remaining_candidate_steps(
+                candidate=active_cand,
+                before_snapshot=before_snapshot,
+                after_obs=after_obs,
+                planning_set=planning_set,
+            )
+
         if cand_finished and not (is_won or level_completed) and active_cand is not None:
             if epistemic_memory is not None and hasattr(epistemic_memory, "record_attempt_feedback"):
                 steps_repr = []
@@ -690,6 +770,90 @@ class SymbolicTrajectoryExecutor:
             falsification_detected=falsification_detected,
             falsified_action=falsified_action,
         )
+
+    def _remap_remaining_candidate_steps(
+        self,
+        candidate: CandidateTrajectory,
+        before_snapshot: Any,
+        after_obs: dict[str, Any],
+        planning_set: PlanningSet | None,
+    ) -> None:
+        """Remap object IDs and aliases in remaining candidate steps when connected components shift sort order."""
+        try:
+            from v10_agent.arga_lite import ARGALiteSnapshot, extract_arga_snapshot
+            from v10_agent.planning_set import generate_alias_sequence
+
+            after_grid = after_obs.get("grid") if isinstance(after_obs, dict) else None
+            if not after_grid:
+                return
+            if not isinstance(before_snapshot, ARGALiteSnapshot):
+                b_grid = getattr(before_snapshot, "grid", None)
+                if b_grid is None and isinstance(before_snapshot, (list, tuple)):
+                    b_grid = before_snapshot
+                if not b_grid:
+                    return
+                before_snapshot = extract_arga_snapshot(b_grid)
+            after_snapshot = extract_arga_snapshot(after_grid)
+
+            if not hasattr(self.verifier, "match_objects_between_snapshots"):
+                return
+            matched_pairs, _ = self.verifier.match_objects_between_snapshots(
+                before_snapshot, after_snapshot, planning_set
+            )
+            if not matched_pairs:
+                return
+
+            b_aliases_list = generate_alias_sequence(len(before_snapshot.objects))
+            b_id_to_alias = {
+                obj.id: alias for obj, alias in zip(before_snapshot.objects, b_aliases_list)
+            }
+            if planning_set and hasattr(planning_set, "object_real_to_alias"):
+                b_id_to_alias.update(planning_set.object_real_to_alias)
+
+            a_aliases_list = generate_alias_sequence(len(after_snapshot.objects))
+            a_id_to_alias = {
+                obj.id: alias for obj, alias in zip(after_snapshot.objects, a_aliases_list)
+            }
+
+            id_map: dict[str, str] = {}
+            alias_map: dict[str, str] = {}
+            has_reindexing = False
+            for b_id, a_obj in matched_pairs:
+                a_id = a_obj.id
+                id_map[b_id] = a_id
+                if b_id != a_id:
+                    has_reindexing = True
+                b_alias = b_id_to_alias.get(b_id)
+                a_alias = a_id_to_alias.get(a_id)
+                if b_alias and a_alias:
+                    alias_map[b_alias] = a_alias
+                    if b_alias != a_alias:
+                        has_reindexing = True
+
+            if not has_reindexing:
+                return
+
+            combined_map = {**alias_map, **id_map}
+            for step_dict in candidate.steps[candidate.cursor:]:
+                if not isinstance(step_dict, dict):
+                    continue
+                raw_args = step_dict.get("arguments")
+                if isinstance(raw_args, dict):
+                    for k, v in list(raw_args.items()):
+                        if isinstance(v, str) and v in combined_map:
+                            raw_args[k] = combined_map[v]
+                raw_props = step_dict.get("expected_propositions")
+                if isinstance(raw_props, list):
+                    for p in raw_props:
+                        if isinstance(p, dict):
+                            subj = p.get("subject_id")
+                            if isinstance(subj, str) and subj in combined_map:
+                                p["subject_id"] = combined_map[subj]
+                            sec = p.get("secondary_id")
+                            if isinstance(sec, str) and sec in combined_map:
+                                p["secondary_id"] = combined_map[sec]
+        except Exception as exc:
+            logger.debug(f"SymbolicExecutor: _remap_remaining_candidate_steps skipped ({exc})")
 
     def _build_step_contradiction_diagnostic(
         self,

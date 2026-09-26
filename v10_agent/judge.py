@@ -3,16 +3,232 @@
 from __future__ import annotations
 
 import math
-import re
 from typing import Any
 
-from v10_agent.arga_lite import ARGALiteSnapshot, extract_arga_snapshot
+from v10_agent.action_semantics import (
+    action_vector,
+    is_non_vector_move,
+    is_observable_move,
+    is_vector_action,
+    parse_referenced_action_id,
+)
+from v10_agent.arga_lite import ARGALiteSnapshot, detect_background_color, extract_arga_snapshot
 from v10_agent.brusentsov_logic import BrusentsovJudgment, Ternary, Verdict, contradicts, implies_brusentsov
 from v10_agent.config import V10Config
 from v10_agent.observe import compute_grid_hash
 from v10_agent.planning_set import PlanningSet
 from v10_agent.types import AtomicProposition, PropositionSet
 from v10_agent.verification import GroundedStep
+
+
+def _cell_value(grid: Any, row: int, col: int) -> int | None:
+    """Read a single grid cell, returning None when the coordinate is out of range.
+
+    The guards matter: a planning set may be a test double whose ``grid`` is not a
+    nested sequence at all, and a comparison against a non-numeric sentinel would
+    silently decide the verdict.
+    """
+    if not isinstance(grid, (list, tuple)) or not (0 <= row < len(grid)):
+        return None
+    line = grid[row]
+    if not isinstance(line, (list, tuple)) or not (0 <= col < len(line)):
+        return None
+    value = line[col]
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def is_bbox_pinned_to_field_edge(
+    bbox: Any,
+    grid_dims: Any,
+    action_id: str,
+    crop_offset: int = 0,
+) -> bool:
+    """True when ``bbox`` already occupies the outermost reachable cell on its axis.
+
+    The outer border pixels are removed by the observation crop, so the first
+    reachable cell sits ``crop_offset`` pixels in from each edge. Taking the offset
+    as an argument instead of assuming one crop pixel keeps the predicate exact for
+    any crop width, and the extent is read from the caller rather than assumed.
+    """
+    if bbox is None:
+        return False
+    if not isinstance(grid_dims, (tuple, list)) or len(grid_dims) < 2:
+        return False
+    try:
+        grid_h, grid_w = int(grid_dims[0]), int(grid_dims[1])
+    except (TypeError, ValueError):
+        return False
+    if grid_h <= 0 or grid_w <= 0:
+        return False
+    try:
+        offset = int(crop_offset or 0)
+        action = str(action_id).upper()
+        if action == "ACTION1":  # UP
+            return int(bbox.min_row) <= offset
+        if action == "ACTION2":  # DOWN
+            return int(bbox.max_row) >= grid_h - 1 - offset
+        if action == "ACTION3":  # LEFT
+            return int(bbox.min_col) <= offset
+        if action == "ACTION4":  # RIGHT
+            return int(bbox.max_col) >= grid_w - 1 - offset
+    except (TypeError, ValueError):
+        return False
+    return False
+
+
+def is_bbox_absorbed_by_contact(bbox: Any, action_id: str, grid: Any) -> bool:
+    """True when a solid, non-background entity fills the cells ahead of ``bbox``.
+
+    This is the second soft-stop mechanism: the subject is not at the field edge,
+    yet it cannot move because something physical occupies the destination. Only
+    the cells immediately beyond the bounding box are inspected, spanning the full
+    cross-axis extent of the subject, so a subject resting on a floor - or pressed
+    against any other solid body - is recognised without knowing what that body is.
+
+    The check is deliberately conservative: every probed cell must be occupied.
+    A single free cell anywhere along the contact face means the motion was
+    geometrically possible, so the zero delta remains a genuine contradiction.
+    """
+    if bbox is None:
+        return False
+    vector = action_vector(action_id)
+    if vector is None:
+        return False
+    if not isinstance(grid, (list, tuple)) or len(grid) == 0:
+        return False
+    if not isinstance(grid[0], (list, tuple)) or len(grid[0]) == 0:
+        return False
+    try:
+        dy, dx = int(vector[0]), int(vector[1])
+    except (TypeError, ValueError):
+        return False
+
+    background = detect_background_color(grid)
+
+    # Shift the whole bounding box by one step; the resulting face is exactly the
+    # set of cells the subject would occupy if the motion had succeeded.
+    try:
+        row_lo = int(bbox.min_row) + dy
+        row_hi = int(bbox.max_row) + dy
+        col_lo = int(bbox.min_col) + dx
+        col_hi = int(bbox.max_col) + dx
+    except (TypeError, ValueError):
+        return False
+
+    probed = 0
+    for row in range(row_lo, row_hi + 1):
+        for col in range(col_lo, col_hi + 1):
+            value = _cell_value(grid, row, col)
+            if value is None:
+                # Off-field destinations are handled by the field-edge predicate.
+                continue
+            probed += 1
+            if value == background:
+                # A free cell exists along the contact face, so the motion was
+                # physically available and the zero delta is a real contradiction.
+                return False
+    return probed > 0
+
+
+def is_blocked_by_boundary(
+    planning_set: Any,
+    action_id: str,
+    subject_id: str | None = None,
+    before_grid: Any = None,
+) -> bool:
+    """Detect a soft stop: the subject cannot advance one cell along ``action_id``.
+
+    Two independent physical causes produce an identical zero grid delta, and both
+    must be reported as an omit rather than a nullity:
+
+    * **Field edge** - the subject already touches the outermost reachable cell, so
+      the motion has nowhere to go. This is resolved purely from geometry.
+    * **Solid contact** - a non-background entity occupies the cell immediately
+      beyond the subject, so the motion was absorbed. This needs the observation
+      that preceded the step, because the extent of the subject alone cannot reveal
+      what lies ahead of it.
+
+    Both arms are expressed through the canonical action vector and the perceived
+    background colour, so nothing here depends on a particular field size, on the
+    position of the subject inside it, or on which colours a game happens to use.
+    """
+    if not subject_id or not planning_set:
+        return False
+    if not hasattr(planning_set, "get_object"):
+        return False
+    obj = planning_set.get_object(subject_id)
+    bbox = getattr(obj, "bbox", None) if obj is not None else None
+    if bbox is None:
+        return False
+    if is_bbox_pinned_to_field_edge(
+        bbox,
+        getattr(planning_set, "grid_dims", None),
+        action_id,
+        int(getattr(planning_set, "crop_offset", 0) or 0),
+    ):
+        return True
+    grid = before_grid
+    if not isinstance(grid, (list, tuple)):
+        grid = getattr(planning_set, "grid", None)
+    return is_bbox_absorbed_by_contact(bbox, action_id, grid)
+
+
+def _safe_get_grid_dims(planning_set: Any, snapshot: Any | None = None) -> tuple[int, int]:
+    grid_dims = getattr(planning_set, "grid_dims", None)
+    if isinstance(grid_dims, (tuple, list)) and len(grid_dims) == 2:
+        try:
+            gh, gw = int(grid_dims[0]), int(grid_dims[1])
+            if gh > 0 and gw > 0:
+                return gh, gw
+        except (ValueError, TypeError):
+            pass
+    if snapshot is not None:
+        snap_dims = getattr(snapshot, "grid_dims", None)
+        if isinstance(snap_dims, (tuple, list)) and len(snap_dims) == 2:
+            try:
+                gh, gw = int(snap_dims[0]), int(snap_dims[1])
+                if gh > 0 and gw > 0:
+                    return gh, gw
+            except (ValueError, TypeError):
+                pass
+        grid = getattr(snapshot, "grid", None)
+        if isinstance(grid, (tuple, list)) and len(grid) > 0 and isinstance(grid[0], (tuple, list)):
+            return len(grid), len(grid[0])
+    # Neither source published an extent. Report "unknown" rather than inventing
+    # a field size: callers scale this value into a proximity radius, so zero
+    # degrades to the tightest search window instead of a fabricated one.
+    return (0, 0)
+
+
+class SpatialIndex:
+    """Simple grid-based spatial bucket index for accelerating nearest-neighbor queries."""
+    def __init__(self, cell_size: int = 4):
+        self.cell_size = max(1, cell_size)
+        self.buckets: dict[tuple[int, int], list[Any]] = {}
+
+    def build(self, objects: Sequence[Any]) -> None:
+        self.buckets.clear()
+        for obj in objects:
+            c_row = getattr(obj.centroid, "row", 0) if hasattr(obj, "centroid") else 0
+            c_col = getattr(obj.centroid, "col", 0) if hasattr(obj, "centroid") else 0
+            cell = (int(c_row) // self.cell_size, int(c_col) // self.cell_size)
+            self.buckets.setdefault(cell, []).append(obj)
+
+    def find_nearby(self, row: float, col: float, radius_cells: int = 2) -> list[Any]:
+        candidates: list[Any] = []
+        center_cell = (int(row) // self.cell_size, int(col) // self.cell_size)
+        for dr in range(-radius_cells, radius_cells + 1):
+            for dc in range(-radius_cells, radius_cells + 1):
+                cell = (center_cell[0] + dr, center_cell[1] + dc)
+                if cell in self.buckets:
+                    candidates.extend(self.buckets[cell])
+        return candidates
 
 
 class LayeredVerifier:
@@ -34,6 +250,8 @@ class LayeredVerifier:
         """Find matching object in snapshot by color and spatial proximity with topological fallback."""
         best = None
         best_d = float("inf")
+        grid_h, grid_w = _safe_get_grid_dims(None, snapshot)
+        adaptive_proximity = max(grid_h, grid_w) * 0.08
         # Pass 1: exact color match
         for o in snapshot.objects:
             if o.color == obj.color:
@@ -41,23 +259,125 @@ class LayeredVerifier:
                 if d < best_d:
                     best_d = d
                     best = o
-        if best is not None and best_d <= max(3.5, obj.bbox.height + 2, obj.bbox.width + 2):
+        if best is not None and best_d <= max(adaptive_proximity, obj.bbox.height + 2, obj.bbox.width + 2):
             return best
 
         # Pass 2: topological fallback (in-place color transition or small displacement)
         fallback_best = None
         fallback_d = float("inf")
-        perc = getattr(self.config, "perception", None)
+        perc = self.config.resolve("perception")
         area_tol = getattr(perc, "object_match_area_tolerance", 0.15) if perc else 0.15
         for o in snapshot.objects:
             d = math.hypot(o.centroid.row - obj.centroid.row, o.centroid.col - obj.centroid.col)
-            is_close = d <= max(2.5, min(obj.bbox.height, obj.bbox.width) + 1)
+            is_close = d <= max(adaptive_proximity, min(obj.bbox.height, obj.bbox.width) + 1)
             is_shape_similar = abs(o.area - obj.area) <= max(2, int(round(obj.area * area_tol))) and o.color == obj.color
-            if (is_close or is_shape_similar) and d <= max(3.0, obj.bbox.height + 1, obj.bbox.width + 1):
+            if (is_close or is_shape_similar) and d <= max(adaptive_proximity + 0.5, obj.bbox.height + 1, obj.bbox.width + 1):
                 if d < fallback_d:
                     fallback_d = d
                     fallback_best = o
         return fallback_best
+
+    def match_objects_between_snapshots(
+        self,
+        before_snapshot: ARGALiteSnapshot,
+        after_snapshot: ARGALiteSnapshot,
+        planning_set: Any = None,
+    ) -> tuple[list[tuple[str, Any]], list[Any]]:
+        """Match objects between before and after snapshots using parent-coherent two-pass matching."""
+        matched_pairs: list[tuple[str, Any]] = []
+        matched_after_ids: set[str] = set()
+
+        grid_h, grid_w = _safe_get_grid_dims(planning_set, before_snapshot)
+        adaptive_proximity = max(grid_h, grid_w) * 0.08
+
+        perc = self.config.resolve("perception")
+        area_tol = getattr(perc, "object_match_area_tolerance", 0.15) if perc else 0.15
+
+        spatial_idx = SpatialIndex(cell_size=max(2, int(adaptive_proximity)))
+        spatial_idx.build(after_snapshot.objects)
+
+        # Match parent / larger objects before enclosed child objects so child search centers can shift coherently
+        sorted_before = sorted(
+            before_snapshot.objects,
+            key=lambda o: (getattr(o, "parent_id", None) is not None, -o.area),
+        )
+        parent_deltas: dict[str, tuple[float, float]] = {}
+
+        # Pass 1: Exact color matching with parent-coherent offset and area similarity preference
+        unmatched_before = []
+        for b_obj in sorted_before:
+            p_id = getattr(b_obj, "parent_id", None)
+            if p_id and p_id in parent_deltas:
+                p_dr, p_dc = parent_deltas[p_id]
+                exp_r = b_obj.centroid.row + p_dr
+                exp_c = b_obj.centroid.col + p_dc
+            else:
+                exp_r = b_obj.centroid.row
+                exp_c = b_obj.centroid.col
+
+            max_search_dist = max(adaptive_proximity * 2.5, b_obj.bbox.height * 2, b_obj.bbox.width * 2)
+            radius_cells = max(2, int(math.ceil(max_search_dist / spatial_idx.cell_size)))
+            candidates = spatial_idx.find_nearby(exp_r, exp_c, radius_cells=radius_cells)
+
+            best_match = None
+            best_dist = float("inf")
+            fallback_match = None
+            fallback_dist = float("inf")
+            fallback_limit = max(adaptive_proximity, b_obj.bbox.height, b_obj.bbox.width)
+
+            for a_obj in candidates:
+                if a_obj.id in matched_after_ids:
+                    continue
+                if a_obj.color == b_obj.color:
+                    d_exp = math.hypot(exp_r - a_obj.centroid.row, exp_c - a_obj.centroid.col)
+                    area_diff = abs(a_obj.area - b_obj.area)
+                    area_similar = area_diff <= max(2, int(round(b_obj.area * max(area_tol, 0.25))))
+                    if area_similar and d_exp <= max_search_dist and d_exp < best_dist:
+                        best_dist = d_exp
+                        best_match = a_obj
+                    d_orig = math.hypot(b_obj.centroid.row - a_obj.centroid.row, b_obj.centroid.col - a_obj.centroid.col)
+                    if d_orig <= fallback_limit and d_orig < fallback_dist:
+                        fallback_dist = d_orig
+                        fallback_match = a_obj
+
+            chosen = best_match if best_match is not None else fallback_match
+            if chosen is not None:
+                matched_pairs.append((b_obj.id, chosen))
+                matched_after_ids.add(chosen.id)
+                parent_deltas[b_obj.id] = (
+                    chosen.centroid.row - b_obj.centroid.row,
+                    chosen.centroid.col - b_obj.centroid.col,
+                )
+            else:
+                unmatched_before.append(b_obj)
+
+        # Pass 2: Topological matching fallback for objects undergoing in-place color/area transition
+        still_unmatched = []
+        for b_obj in unmatched_before:
+            best_match = None
+            best_dist = float("inf")
+            max_search_dist = max(adaptive_proximity + 0.5, b_obj.bbox.height + 1, b_obj.bbox.width + 1)
+            radius_cells = max(2, int(math.ceil(max_search_dist / spatial_idx.cell_size)))
+            candidates = spatial_idx.find_nearby(b_obj.centroid.row, b_obj.centroid.col, radius_cells=radius_cells)
+            for a_obj in candidates:
+                if a_obj.id in matched_after_ids:
+                    continue
+                d = math.hypot(b_obj.centroid.row - a_obj.centroid.row, b_obj.centroid.col - a_obj.centroid.col)
+                area_compatible = abs(a_obj.area - b_obj.area) <= max(4, int(round(b_obj.area * max(area_tol, 0.5))))
+                is_close = d <= max(adaptive_proximity, min(b_obj.bbox.height, b_obj.bbox.width) + 1) and area_compatible
+                is_shape_similar = abs(a_obj.area - b_obj.area) <= max(2, int(round(b_obj.area * area_tol))) and a_obj.color == b_obj.color
+                if (is_close or is_shape_similar) and d <= max_search_dist:
+                    if d < best_dist:
+                        best_dist = d
+                        best_match = a_obj
+
+            if best_match is not None:
+                matched_pairs.append((b_obj.id, best_match))
+                matched_after_ids.add(best_match.id)
+            else:
+                still_unmatched.append(b_obj)
+
+        return matched_pairs, still_unmatched
 
     def extract_observed_propositions(
         self,
@@ -73,57 +393,19 @@ class LayeredVerifier:
         props: list[AtomicProposition] = []
 
         # 1. Match objects between before and after snapshots (two-pass with topological fallback)
-        matched_pairs: list[tuple[str, Any]] = []
-        matched_after_ids: set[str] = set()
+        matched_pairs, still_unmatched = self.match_objects_between_snapshots(
+            before_snapshot, after_snapshot, planning_set
+        )
 
-        # Pass 1: Exact color matching with proximity
-        unmatched_before = []
-        for b_obj in before_snapshot.objects:
-            best_match = None
-            best_dist = float("inf")
-            for a_obj in after_snapshot.objects:
-                if a_obj.id in matched_after_ids:
-                    continue
-                if a_obj.color == b_obj.color:
-                    d = math.hypot(b_obj.centroid.row - a_obj.centroid.row, b_obj.centroid.col - a_obj.centroid.col)
-                    if d < best_dist:
-                        best_dist = d
-                        best_match = a_obj
-
-            if best_match is not None and best_dist <= max(2.5, b_obj.bbox.height, b_obj.bbox.width):
-                matched_pairs.append((b_obj.id, best_match))
-                matched_after_ids.add(best_match.id)
-            else:
-                unmatched_before.append(b_obj)
-
-        perc = getattr(self.config, "perception", None)
-        area_tol = getattr(perc, "object_match_area_tolerance", 0.15) if perc else 0.15
+        perc = self.config.resolve("perception")
         move_thresh = getattr(perc, "movement_detection_threshold", 1.0) if perc else 1.0
 
-        # Pass 2: Topological matching fallback for objects undergoing in-place color/area transition
-        for b_obj in unmatched_before:
-            best_match = None
-            best_dist = float("inf")
-            for a_obj in after_snapshot.objects:
-                if a_obj.id in matched_after_ids:
-                    continue
-                d = math.hypot(b_obj.centroid.row - a_obj.centroid.row, b_obj.centroid.col - a_obj.centroid.col)
-                is_close = d <= max(2.5, min(b_obj.bbox.height, b_obj.bbox.width) + 1)
-                is_shape_similar = abs(a_obj.area - b_obj.area) <= max(2, int(round(b_obj.area * area_tol))) and a_obj.color == b_obj.color
-                if (is_close or is_shape_similar) and d <= max(3.0, b_obj.bbox.height + 1, b_obj.bbox.width + 1):
-                    if d < best_dist:
-                        best_dist = d
-                        best_match = a_obj
-
-            if best_match is not None:
-                matched_pairs.append((b_obj.id, best_match))
-                matched_after_ids.add(best_match.id)
-            else:
-                # Object destroyed or disappeared
-                props.append(AtomicProposition(family="object_identity", subject_id=b_obj.id, predicate="destroyed"))
-                alias = planning_set.object_real_to_alias.get(b_obj.id) if planning_set and hasattr(planning_set, "object_real_to_alias") else None
-                if alias and alias != b_obj.id:
-                    props.append(AtomicProposition(family="object_identity", subject_id=alias, predicate="destroyed"))
+        for b_obj in still_unmatched:
+            # Object destroyed or disappeared
+            props.append(AtomicProposition(family="object_identity", subject_id=b_obj.id, predicate="destroyed"))
+            alias = planning_set.object_real_to_alias.get(b_obj.id) if planning_set and hasattr(planning_set, "object_real_to_alias") else None
+            if alias and alias != b_obj.id:
+                props.append(AtomicProposition(family="object_identity", subject_id=alias, predicate="destroyed"))
 
         # Process matched pairs
         for b_id, best_match in matched_pairs:
@@ -136,11 +418,13 @@ class LayeredVerifier:
             if alias and alias != b_obj.id:
                 subjects.append(alias)
 
-            # Positional metric signs
+            # Positional metric signs and exact integer displacements
             dr = best_match.centroid.row - b_obj.centroid.row
             dc = best_match.centroid.col - b_obj.centroid.col
             r_sign = 1 if dr >= move_thresh else (-1 if dr <= -move_thresh else 0)
             c_sign = 1 if dc >= move_thresh else (-1 if dc <= -move_thresh else 0)
+            int_dr = int(round(dr)) if r_sign != 0 else 0
+            int_dc = int(round(dc)) if c_sign != 0 else 0
 
             for s_id in subjects:
                 # Object identity preserved
@@ -149,14 +433,25 @@ class LayeredVerifier:
                 props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="row_delta", value=r_sign))
                 props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="delta_r", value=r_sign))
                 props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="dy", value=r_sign))
+                if int_dr != r_sign:
+                    props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="row_delta", value=int_dr))
+                    props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="delta_r", value=int_dr))
+                    props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="dy", value=int_dr))
 
                 props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="col_delta", value=c_sign))
                 props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="delta_c", value=c_sign))
                 props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="dx", value=c_sign))
+                if int_dc != c_sign:
+                    props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="col_delta", value=int_dc))
+                    props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="delta_c", value=int_dc))
+                    props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="dx", value=int_dc))
 
                 # Step-level and cumulative motion tuples
                 props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="step_moved", value=(r_sign, c_sign)))
                 props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="moved", value=(r_sign, c_sign)))
+                if (int_dr, int_dc) != (r_sign, c_sign):
+                    props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="step_moved", value=(int_dr, int_dc)))
+                    props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="moved", value=(int_dr, int_dc)))
                 if r_sign == 0 and c_sign == 0:
                     props.append(AtomicProposition(family="metric_sign", subject_id=s_id, predicate="unchanged", value=(0, 0)))
 
@@ -315,9 +610,7 @@ class LayeredVerifier:
         if action_dict:
             act_id = str(action_dict.get("action_id") or action_dict.get("id") or "").upper()
         if not act_id:
-            m = re.search(r"action(\d+)", step.dsl_function, re.IGNORECASE)
-            if m:
-                act_id = f"ACTION{m.group(1)}"
+            act_id = parse_referenced_action_id(step.dsl_function)
 
         confirmed_eff = ""
         if game_memory is not None and hasattr(game_memory, "confirmed_action_effects"):
@@ -325,7 +618,7 @@ class LayeredVerifier:
 
         eff_lower = confirmed_eff.lower()
         is_modal_selection = (
-            act_id in ("ACTION5", "ACTION6")
+            is_non_vector_move(act_id)
             or any(k in eff_lower for k in ("selection", "toggle", "indicator", "modal", "active entity"))
             or any(k in step.dsl_function.lower() for k in ("selection", "toggle", "switch", "modal"))
         )
@@ -373,14 +666,22 @@ class LayeredVerifier:
         # Wall collision is a soft stop — the trajectory step failed to advance,
         # but no physical law was violated. The actor simply cannot pass through obstacles.
         if zero_delta and is_confirmed_motion and act_id not in ("ACTION5", "ACTION6", "RESET"):
-            # Check if this could be a boundary/obstacle collision (soft stop)
-            is_boundary_collision = False
-            if game_memory is not None:
-                inv_rules = getattr(game_memory, "invariant_rules", [])
-                is_boundary_collision = any(
-                    re.search(r"\b(?:wall|blocked|boundary|obstacle|barrier|collision|impassable)\b", r, re.IGNORECASE)
-                    for r in inv_rules
-                )
+            # Check if this could be a boundary collision geometrically (soft stop)
+            subject_id_from_step = None
+            if step and step.expected_propositions:
+                for p in step.expected_propositions:
+                    if getattr(p, "family", None) == "metric_sign" and getattr(p, "subject_id", None):
+                        subject_id_from_step = p.subject_id
+                        break
+                if not subject_id_from_step:
+                    for p in step.expected_propositions:
+                        if getattr(p, "subject_id", None):
+                            subject_id_from_step = p.subject_id
+                            break
+
+            is_boundary_collision = is_blocked_by_boundary(
+                planning_set, act_id, subject_id_from_step, before_grid
+            )
             if is_boundary_collision:
                 return BrusentsovJudgment(
                     trajectory_id=step.step_id,
@@ -407,12 +708,12 @@ class LayeredVerifier:
             has_selection_mechanics = bool(game_memory and getattr(game_memory, "selection_mechanics", None))
             modal_switch_actions = [
                 act for act in allowed_acts
-                if act in ("ACTION5", "ACTION6")
+                if is_non_vector_move(act)
                 or (game_memory and any(kw in getattr(game_memory, "confirmed_action_effects", {}).get(act, "").lower() for kw in ("selection", "toggle", "indicator")))
             ]
             unconfirmed_actions = [
                 act for act in allowed_acts
-                if act not in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "RESET", "ACTION7")
+                if is_observable_move(act) and not is_vector_action(act)
                 and (not game_memory or act not in getattr(game_memory, "confirmed_action_effects", {}))
             ]
             if modal_switch_actions or has_selection_mechanics or unconfirmed_actions:
@@ -501,10 +802,18 @@ class LayeredVerifier:
 
                 if before_snapshot and after_snapshot:
                     matched_after_ids: set[str] = set()
+                    grid_h, grid_w = _safe_get_grid_dims(planning_set, before_snapshot)
+                    adaptive_proximity = max(grid_h, grid_w) * 0.08
+                    spatial_idx = SpatialIndex(cell_size=max(2, int(adaptive_proximity)))
+                    spatial_idx.build(after_snapshot.objects)
+
                     for b_obj in before_snapshot.objects:
                         best_match = None
                         best_dist = float("inf")
-                        for a_obj in after_snapshot.objects:
+                        max_search_dist = max(adaptive_proximity, b_obj.bbox.height, b_obj.bbox.width)
+                        radius_cells = max(2, int(math.ceil(max_search_dist / spatial_idx.cell_size)))
+                        candidates = spatial_idx.find_nearby(b_obj.centroid.row, b_obj.centroid.col, radius_cells=radius_cells)
+                        for a_obj in candidates:
                             if a_obj.id in matched_after_ids:
                                 continue
                             if a_obj.color == b_obj.color:
@@ -512,12 +821,13 @@ class LayeredVerifier:
                                 if d < best_dist:
                                     best_dist = d
                                     best_match = a_obj
-                        if best_match is not None and best_dist <= max(2.5, b_obj.bbox.height, b_obj.bbox.width):
+                        if best_match is not None and best_dist <= max_search_dist:
                             matched_after_ids.add(best_match.id)
-                            # 1. Area preservation: an object that lost >25% area was occluded/overlapped
+                            # 1. Area preservation: adaptive occlusion threshold
                             area_max = max(b_obj.area, best_match.area)
                             area_min = min(b_obj.area, best_match.area)
-                            if area_max > 0 and (area_min / area_max) < 0.75:
+                            area_occlusion_threshold = 0.5 + 0.2 * (1.0 - min(b_obj.area, 50) / 50.0)
+                            if area_max > 0 and (area_min / area_max) < area_occlusion_threshold:
                                 continue
                             # 2. Rigid translation: bounding box boundaries must shift uniformly
                             dr_min = best_match.bbox.min_row - b_obj.bbox.min_row

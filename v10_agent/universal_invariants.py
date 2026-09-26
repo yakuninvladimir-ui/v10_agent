@@ -11,6 +11,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from v10_agent.action_semantics import replace_object_tokens
+from v10_agent.memory_contours import CoreInvariantRegistry, EmpiricalInvariant
 from v10_agent.planning_set import PlanningObject, PlanningSet
 
 logger = logging.getLogger("v10_agent.universal_invariants")
@@ -51,7 +53,7 @@ class ConnectedComponentConservation:
     subject_id: str
     component_count: int = 1
     area: int = 1
-    confidence: float = 0.95
+    confidence: float = 0.3
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -69,7 +71,7 @@ class GravitySettling:
     subject_id: str
     direction: tuple[int, int]  # (dy, dx), e.g. (1, 0) for down
     support_id: str | None = None
-    confidence: float = 0.85
+    confidence: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,7 +89,7 @@ class ContactTrigger:
     subject_id: str
     trigger_id: str
     consequence: str  # e.g., 'barrier_toggle', 'portal_teleport', 'color_change'
-    confidence: float = 0.85
+    confidence: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,13 +106,85 @@ class AreaConservation:
     """Geometric invariant: object pixel area is conserved across state transformations."""
     subject_id: str
     area: int
-    confidence: float = 0.95
+    confidence: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": "area_conservation",
             "subject": self.subject_id,
             "area": self.area,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass(frozen=True)
+class SlidingKinematics:
+    """Physics invariant: continuous translation along direction until obstacle or border collision."""
+    subject_id: str
+    direction: tuple[int, int]
+    obstacle_id: str | None = None
+    confidence: float = 0.5
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "sliding_kinematics",
+            "subject": self.subject_id,
+            "direction": self.direction,
+            "obstacle": self.obstacle_id,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass(frozen=True)
+class SokobanPush:
+    """Physics invariant: actor movement into adjacent entity displaces it in same direction."""
+    actor_id: str
+    pushed_id: str
+    direction: tuple[int, int]
+    confidence: float = 0.5
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "sokoban_push",
+            "actor": self.actor_id,
+            "pushed": self.pushed_id,
+            "direction": self.direction,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass(frozen=True)
+class MarkerCollection:
+    """Task invariant: agent contact with target role entities removes them from state."""
+    collector_id: str
+    target_role_color: int
+    target_id: str | None = None
+    confidence: float = 0.5
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "marker_collection",
+            "collector": self.collector_id,
+            "target_role_color": self.target_role_color,
+            "target_id": self.target_id,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass(frozen=True)
+class ToggleTrigger:
+    """Interaction invariant: agent visiting trigger alters remote barrier passability/color."""
+    trigger_id: str
+    barrier_id: str
+    toggle_state: str = "open"
+    confidence: float = 0.5
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "toggle_trigger",
+            "trigger": self.trigger_id,
+            "barrier": self.barrier_id,
+            "toggle_state": self.toggle_state,
             "confidence": self.confidence,
         }
 
@@ -203,9 +277,10 @@ def discover_invariants(
         if sub and tgt and sub.area > 1 and tgt.area > 1:
             midpoint_c = (sub.centroid.col + tgt.centroid.col) / 2.0
             axis_candidate = None
+            elongation_threshold = 1.5 + 0.5 * (min(grid_h, grid_w) / 64.0)
             for obj in objects:
                 if obj.id not in (sub_id, tgt_id):
-                    is_vert_elongated = (obj.height / max(1, obj.width) >= 2.0) and (obj.height >= max(3, int(round(grid_h * 0.2))))
+                    is_vert_elongated = (obj.height / max(1, obj.width) >= elongation_threshold) and (obj.height >= max(3, int(round(grid_h * 0.2))))
                     is_near_midpoint = (abs(obj.centroid.col - midpoint_c) <= max(1.5, grid_w * 0.08)) and (obj.height >= obj.width)
                     if is_vert_elongated or is_near_midpoint:
                         axis_candidate = obj
@@ -238,9 +313,10 @@ def discover_invariants(
         if sub and tgt and sub.area > 1 and tgt.area > 1:
             midpoint_r = (sub.centroid.row + tgt.centroid.row) / 2.0
             axis_candidate = None
+            elongation_threshold = 1.5 + 0.5 * (min(grid_h, grid_w) / 64.0)
             for obj in objects:
                 if obj.id not in (sub_id, tgt_id):
-                    is_horiz_elongated = (obj.width / max(1, obj.height) >= 2.0) and (obj.width >= max(3, int(round(grid_w * 0.2))))
+                    is_horiz_elongated = (obj.width / max(1, obj.height) >= elongation_threshold) and (obj.width >= max(3, int(round(grid_w * 0.2))))
                     is_near_midpoint = (abs(obj.centroid.row - midpoint_r) <= max(1.5, grid_h * 0.08)) and (obj.width >= obj.height)
                     if is_horiz_elongated or is_near_midpoint:
                         axis_candidate = obj
@@ -332,14 +408,14 @@ def discover_invariants(
             invariants.append(DiscoveredInvariant(
                 invariant_type="area_conservation",
                 subject_id=obj.id, target_id=obj.id,
-                confidence=0.95,
+                confidence=0.3,
                 description=f"Area conservation: {obj.id} maintains area {obj.area}",
             ))
             # Connected component conservation
             invariants.append(DiscoveredInvariant(
                 invariant_type="connected_component_conservation",
                 subject_id=obj.id, target_id=obj.id,
-                confidence=0.95,
+                confidence=0.3,
                 description=f"Connected component conservation: {obj.id} maintains topological unity",
             ))
 
@@ -410,8 +486,6 @@ def compare_invariants_across_levels(
     curr_invariants: list[DiscoveredInvariant],
 ) -> dict[str, list[DiscoveredInvariant]]:
     """Detect persistent, new, and disappeared invariants between levels."""
-    import re
-    from collections import defaultdict
 
     def _sig(inv: DiscoveredInvariant) -> str:
         parts = [inv.invariant_type]
@@ -419,7 +493,7 @@ def compare_invariants_across_levels(
             parts.append(f"axis_{round(inv.axis_coordinate, 1)}")
         if inv.target_position is not None:
             parts.append(f"tgt_{round(inv.target_position[0], 1)}_{round(inv.target_position[1], 1)}")
-        norm_desc = re.sub(r"obj_\w+", "[OBJ]", inv.description)
+        norm_desc = replace_object_tokens(inv.description, lambda _token: "[OBJ]")
         parts.append(norm_desc)
         return ":".join(parts)
 
@@ -451,3 +525,393 @@ def compare_invariants_across_levels(
         "new": new_invs,
         "disappeared": disappeared,
     }
+
+
+def propose_invariant_candidates(planning_set: PlanningSet) -> list[EmpiricalInvariant]:
+    """Extract prioritized empirical invariant hypotheses starting with confidence=0.0."""
+    candidates: list[EmpiricalInvariant] = []
+    if not planning_set or not planning_set.objects:
+        return candidates
+
+    # 1. Global Core Game Laws (conserve area and connectivity)
+    candidates.append(
+        EmpiricalInvariant(
+            invariant_id="emp_area_conservation_global",
+            invariant_type="area_conservation",
+            abstract_description="Objects conserve their pixel area across transitions",
+            subject_pattern="all_objects",
+            expected_value="conserved",
+            scope="CORE_GAME_LAW",
+            confidence=0.0,
+        )
+    )
+    candidates.append(
+        EmpiricalInvariant(
+            invariant_id="emp_topology_conservation_global",
+            invariant_type="connected_component_conservation",
+            abstract_description="Objects retain topological connectivity across transitions",
+            subject_pattern="all_objects",
+            expected_value="conserved",
+            scope="CORE_GAME_LAW",
+            confidence=0.0,
+        )
+    )
+
+    # 2. Per-object area and topology conservation
+    for obj in planning_set.objects:
+        if obj.area > 0 and obj.color != 0:
+            candidates.append(
+                EmpiricalInvariant(
+                    invariant_id=f"emp_area_{obj.id}",
+                    invariant_type="area_conservation",
+                    abstract_description=f"Object {obj.id} maintains area {obj.area}",
+                    subject_pattern=f"id=={obj.id}",
+                    expected_value=obj.area,
+                    scope="LEVEL_SPECIFIC",
+                    confidence=0.0,
+                )
+            )
+            candidates.append(
+                EmpiricalInvariant(
+                    invariant_id=f"emp_topo_{obj.id}",
+                    invariant_type="connected_component_conservation",
+                    abstract_description=f"Object {obj.id} maintains topological unity",
+                    subject_pattern=f"id=={obj.id}",
+                    expected_value=1,
+                    scope="LEVEL_SPECIFIC",
+                    confidence=0.0,
+                )
+            )
+
+    # 3. Discovered relational symmetries and socket coverage
+    discovered = discover_invariants(planning_set)
+    for inv in discovered:
+        if inv.invariant_type in ("axial_symmetry_vertical", "axial_symmetry_horizontal"):
+            candidates.append(
+                EmpiricalInvariant(
+                    invariant_id=f"emp_sym_{inv.subject_id}_{inv.target_id}_{inv.invariant_type}",
+                    invariant_type=inv.invariant_type,
+                    abstract_description=inv.description,
+                    subject_pattern=f"pair=={inv.subject_id}:{inv.target_id}",
+                    expected_value={"axis_coord": inv.axis_coordinate, "target_pos": inv.target_position},
+                    scope="DOMAIN_PATTERN",
+                    confidence=0.0,
+                )
+            )
+        elif inv.invariant_type == "socket_coverage":
+            candidates.append(
+                EmpiricalInvariant(
+                    invariant_id=f"emp_socket_{inv.subject_id}_{inv.target_id}",
+                    invariant_type="socket_coverage",
+                    abstract_description=inv.description,
+                    subject_pattern=f"pair=={inv.subject_id}:{inv.target_id}",
+                    expected_value=inv.target_position,
+                    scope="DOMAIN_PATTERN",
+                    confidence=0.0,
+                )
+            )
+
+    # 4. Contact triggers
+    for rel in getattr(planning_set, "relations", []):
+        if rel.relation_type in ("touches", "adjacent_to"):
+            candidates.append(
+                EmpiricalInvariant(
+                    invariant_id=f"emp_contact_{rel.subject_id}_{rel.target_id}",
+                    invariant_type="contact_trigger",
+                    abstract_description=f"Contact trigger between {rel.subject_id} and {rel.target_id}",
+                    subject_pattern=f"pair=={rel.subject_id}:{rel.target_id}",
+                    expected_value="contact",
+                    scope="DOMAIN_PATTERN",
+                    confidence=0.0,
+                )
+            )
+
+    # 5. Sliding kinematics and marker collection candidates
+    for obj in planning_set.objects:
+        if obj.area > 0 and obj.color != 0:
+            candidates.append(
+                EmpiricalInvariant(
+                    invariant_id=f"emp_slide_{obj.id}",
+                    invariant_type="sliding_kinematics",
+                    abstract_description=f"Object {obj.id} undergoes sliding translation until obstacle",
+                    subject_pattern=f"id=={obj.id}",
+                    expected_value="sliding",
+                    scope="DOMAIN_PATTERN",
+                    confidence=0.0,
+                )
+            )
+            if obj.area <= 4:
+                candidates.append(
+                    EmpiricalInvariant(
+                        invariant_id=f"emp_collect_{obj.id}",
+                        invariant_type="marker_collection",
+                        abstract_description=f"Consumable target marker {obj.id}",
+                        subject_pattern=f"id=={obj.id}",
+                        expected_value="collected",
+                        scope="DOMAIN_PATTERN",
+                        confidence=0.0,
+                    )
+                )
+
+    # 6. Push mechanics and toggle trigger candidates for object pairs
+    for rel in getattr(planning_set, "relations", []):
+        if rel.relation_type in ("touches", "adjacent_to"):
+            candidates.append(
+                EmpiricalInvariant(
+                    invariant_id=f"emp_push_{rel.subject_id}_{rel.target_id}",
+                    invariant_type="sokoban_push",
+                    abstract_description=f"Pushing interaction between {rel.subject_id} and {rel.target_id}",
+                    subject_pattern=f"pair=={rel.subject_id}:{rel.target_id}",
+                    expected_value="push",
+                    scope="DOMAIN_PATTERN",
+                    confidence=0.0,
+                )
+            )
+            candidates.append(
+                EmpiricalInvariant(
+                    invariant_id=f"emp_toggle_{rel.subject_id}_{rel.target_id}",
+                    invariant_type="toggle_trigger",
+                    abstract_description=f"Switch trigger {rel.subject_id} toggles {rel.target_id}",
+                    subject_pattern=f"pair=={rel.subject_id}:{rel.target_id}",
+                    expected_value="toggled",
+                    scope="DOMAIN_PATTERN",
+                    confidence=0.0,
+                )
+            )
+
+    # Deduplicate candidates by invariant_id
+    unique_candidates: list[EmpiricalInvariant] = []
+    seen: set[str] = set()
+    for c in candidates:
+        if c.invariant_id not in seen:
+            seen.add(c.invariant_id)
+            unique_candidates.append(c)
+
+    return unique_candidates
+
+
+def extract_observed_value_for(
+    inv: EmpiricalInvariant,
+    before_snapshot: Any,
+    after_snapshot: Any,
+) -> Any:
+    """Extract observed metric or property corresponding to the invariant."""
+    if not before_snapshot or not after_snapshot:
+        return None
+
+    before_objects = getattr(before_snapshot, "objects", [])
+    after_objects = getattr(after_snapshot, "objects", [])
+
+    if not before_objects or not after_objects:
+        return None
+
+    # Global invariants
+    if inv.subject_pattern == "all_objects":
+        if inv.invariant_type == "area_conservation":
+            conserved = True
+            for b_obj in before_objects:
+                if b_obj.color == 0 or b_obj.area == 0:
+                    continue
+                matched = next((a for a in after_objects if a.id == b_obj.id), None)
+                if matched is None:
+                    best_d = float("inf")
+                    for a in after_objects:
+                        if a.color == b_obj.color:
+                            d = (b_obj.centroid.row - a.centroid.row) ** 2 + (b_obj.centroid.col - a.centroid.col) ** 2
+                            if d < best_d:
+                                best_d = d
+                                matched = a
+                if matched is not None:
+                    if matched.area != b_obj.area:
+                        conserved = False
+                        break
+                else:
+                    # Object disappeared
+                    conserved = False
+                    break
+            return "conserved" if conserved else "violated"
+
+        elif inv.invariant_type == "connected_component_conservation":
+            return "conserved"
+
+    # Specific object invariants: id==<oid>
+    if inv.subject_pattern.startswith("id=="):
+        target_id = inv.subject_pattern.split("==", 1)[1]
+        b_obj = next((o for o in before_objects if o.id == target_id), None)
+        if b_obj is None:
+            return None
+
+        a_obj = next((o for o in after_objects if o.id == target_id), None)
+        if a_obj is None:
+            best_d = float("inf")
+            for a in after_objects:
+                if a.color == b_obj.color:
+                    d = (b_obj.centroid.row - a.centroid.row) ** 2 + (b_obj.centroid.col - a.centroid.col) ** 2
+                    if d < best_d:
+                        best_d = d
+                        a_obj = a
+
+        if inv.invariant_type == "area_conservation":
+            return a_obj.area if a_obj is not None else 0
+        elif inv.invariant_type == "connected_component_conservation":
+            return 1 if a_obj is not None else 0
+        elif inv.invariant_type == "sliding_kinematics":
+            if a_obj is not None:
+                dy = abs(a_obj.centroid.row - b_obj.centroid.row)
+                dx = abs(a_obj.centroid.col - b_obj.centroid.col)
+                disp = max(dy, dx)
+                if disp > 1.0:
+                    return "sliding"
+                elif disp > 0.0:
+                    return "step_moved"
+                else:
+                    return "stationary"
+            return None
+        elif inv.invariant_type == "marker_collection":
+            if a_obj is None or a_obj.area < b_obj.area:
+                return "collected"
+            return "preserved"
+
+    # Pair invariants: pair==<sub_id>:<tgt_id>
+    if inv.subject_pattern.startswith("pair=="):
+        pair_part = inv.subject_pattern.split("==", 1)[1]
+        if ":" not in pair_part:
+            return None
+        sub_id, tgt_id = pair_part.split(":", 1)
+        sub_after = next((o for o in after_objects if o.id == sub_id), None)
+        tgt_after = next((o for o in after_objects if o.id == tgt_id), None)
+
+        if inv.invariant_type == "contact_trigger":
+            if sub_after and tgt_after:
+                dist = abs(sub_after.centroid.row - tgt_after.centroid.row) + abs(sub_after.centroid.col - tgt_after.centroid.col)
+                if dist <= 1.5:
+                    return "contact"
+            return None
+
+        elif inv.invariant_type == "sokoban_push":
+            sub_before = next((o for o in before_objects if o.id == sub_id), None)
+            tgt_before = next((o for o in before_objects if o.id == tgt_id), None)
+            if sub_before and sub_after and tgt_before and tgt_after:
+                s_dy = sub_after.centroid.row - sub_before.centroid.row
+                s_dx = sub_after.centroid.col - sub_before.centroid.col
+                t_dy = tgt_after.centroid.row - tgt_before.centroid.row
+                t_dx = tgt_after.centroid.col - tgt_before.centroid.col
+                if (abs(s_dy) > 0 or abs(s_dx) > 0) and (abs(t_dy) > 0 or abs(t_dx) > 0):
+                    if (s_dy * t_dy >= 0) and (s_dx * t_dx >= 0):
+                        return "push"
+            return "no_push"
+
+        elif inv.invariant_type == "toggle_trigger":
+            tgt_before = next((o for o in before_objects if o.id == tgt_id), None)
+            if sub_after and tgt_before:
+                if tgt_after is None or tgt_after.area != tgt_before.area or tgt_after.color != tgt_before.color:
+                    return "toggled"
+            return "untoggled"
+
+        elif inv.invariant_type == "socket_coverage":
+            if sub_after:
+                if tgt_after:
+                    dist = abs(sub_after.centroid.row - tgt_after.centroid.row) + abs(sub_after.centroid.col - tgt_after.centroid.col)
+                    if dist <= 0.5:
+                        return (round(sub_after.centroid.row, 1), round(sub_after.centroid.col, 1))
+                elif isinstance(inv.expected_value, (list, tuple)):
+                    exp_r, exp_c = inv.expected_value
+                    dist = abs(sub_after.centroid.row - exp_r) + abs(sub_after.centroid.col - exp_c)
+                    if dist <= 0.5:
+                        return (round(sub_after.centroid.row, 1), round(sub_after.centroid.col, 1))
+            return None
+
+        elif inv.invariant_type in ("axial_symmetry_vertical", "axial_symmetry_horizontal"):
+            if sub_after and tgt_after:
+                if isinstance(inv.expected_value, dict):
+                    axis_coord = inv.expected_value.get("axis_coord")
+                    if axis_coord is not None:
+                        d = compute_invariant_distance(
+                            sub_after.centroid.row, sub_after.centroid.col,
+                            axis_coord,
+                            tgt_after.centroid.row, tgt_after.centroid.col,
+                            inv.invariant_type,
+                        )
+                        if d <= 1.0:
+                            return "symmetric"
+            return None
+
+    return None
+
+
+def values_match(expected: Any, observed: Any, invariant_type: str) -> bool:
+    """Check whether observed property matches the expected invariant value."""
+    if observed is None:
+        return False
+    if invariant_type == "area_conservation":
+        return expected == observed
+    if invariant_type == "connected_component_conservation":
+        return expected == observed
+    if invariant_type in ("axial_symmetry_vertical", "axial_symmetry_horizontal"):
+        return observed == "symmetric" or expected == observed
+    if invariant_type == "socket_coverage":
+        if isinstance(expected, (tuple, list)) and isinstance(observed, (tuple, list)):
+            return abs(expected[0] - observed[0]) <= 0.5 and abs(expected[1] - observed[1]) <= 0.5
+        return expected == observed
+    if invariant_type == "contact_trigger":
+        return expected == observed
+    if invariant_type == "sliding_kinematics":
+        return observed == "sliding" or expected == observed
+    if invariant_type == "sokoban_push":
+        return observed == "push" or expected == observed
+    if invariant_type == "marker_collection":
+        return observed == "collected" or expected == observed
+    if invariant_type == "toggle_trigger":
+        return observed == "toggled" or expected == observed
+    return expected == observed
+
+
+def evaluate_invariant_after_action(
+    registry: CoreInvariantRegistry,
+    before_snapshot: Any,
+    after_snapshot: Any,
+    planning_set: PlanningSet | None = None,
+    action_id: str | int = "",
+    level_index: int = 0,
+) -> None:
+    """Evaluate empirical invariants after an action transition.
+    
+    Observes whether candidate invariants hold or are contradicted.
+    Active candidates start at confidence 0.0 and gain confidence upon confirmation.
+    """
+    if not registry or before_snapshot is None or after_snapshot is None:
+        return
+
+    # Normalize snapshots if grid dicts were passed
+    if isinstance(before_snapshot, dict):
+        b_grid = before_snapshot.get("grid")
+        if b_grid is not None:
+            from v10_agent.arga_lite import extract_arga_snapshot
+            before_snapshot = extract_arga_snapshot(b_grid)
+        else:
+            return
+
+    if isinstance(after_snapshot, dict):
+        a_grid = after_snapshot.get("grid")
+        if a_grid is not None:
+            from v10_agent.arga_lite import extract_arga_snapshot
+            after_snapshot = extract_arga_snapshot(a_grid)
+        else:
+            return
+
+    for inv in list(registry.invariants):
+        # Skip completely dead/falsified candidates that have 0 confidence
+        if inv.times_falsified > 0 and inv.confidence == 0.0:
+            continue
+
+        observed = extract_observed_value_for(inv, before_snapshot, after_snapshot)
+        if observed is None:
+            continue
+
+        if values_match(inv.expected_value, observed, inv.invariant_type):
+            inv.confirm(level_index, observed)
+        else:
+            inv.falsify(level_index, observed)
+
+    registry._prune()
+

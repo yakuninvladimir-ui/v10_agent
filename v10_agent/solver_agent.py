@@ -12,6 +12,7 @@ import logging
 import re
 from typing import Any
 
+from v10_agent.action_semantics import LEGAL_ACTION_IDS, is_forbidden_action, is_legal_action, is_object_token
 from v10_agent.config import V10Config
 from v10_agent.explorer_agent import extract_json_block
 from v10_agent.llm_advisor import (
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_fn_call_args(call_str: str) -> tuple[str, dict]:
-    """Parse 'action6(x=10, y=20)' into ('action6', {'x': 10, 'y': 20})."""
+    """Parse 'action6(x=10, y=20)' or 'click(target=C)' into ('action6', {'target': 'C'})."""
     import ast as _ast
     call_str = call_str.strip().rstrip(';')
     try:
@@ -42,9 +43,12 @@ def _parse_fn_call_args(call_str: str) -> tuple[str, dict]:
                 try:
                     kwargs[kw.arg] = _ast.literal_eval(kw.value)
                 except (ValueError, TypeError):
-                    kwargs[kw.arg] = str(_ast.dump(kw.value))
-            # Positional args are handled by the manifest-aware fallback below (L223-238)
-            # Only return keyword args here
+                    if isinstance(kw.value, _ast.Name):
+                        kwargs[kw.arg] = kw.value.id
+                    elif isinstance(kw.value, _ast.Constant):
+                        kwargs[kw.arg] = kw.value.value
+                    else:
+                        kwargs[kw.arg] = str(_ast.dump(kw.value))
             return name, kwargs
     except Exception:
         pass
@@ -56,7 +60,8 @@ def _parse_fn_call_args(call_str: str) -> tuple[str, dict]:
         if not arg_str:
             return name, {}
         pairs = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^,]+)', arg_str)
-        return name, {k: v.strip() for k, v in pairs}
+        return name, {k: v.strip().strip("'\"") for k, v in pairs}
+    return call_str, {}
 def parse_expect_grammar_str(exp_str: str, planning_set: Any = None) -> list[dict[str, Any]]:
     """Parse typed EXPECT grammar clauses into AtomicProposition dictionaries."""
     props: list[dict[str, Any]] = []
@@ -83,22 +88,78 @@ def parse_expect_grammar_str(exp_str: str, planning_set: Any = None) -> list[dic
         if not item:
             continue
 
-        # 1. moved(ALIAS, dy, dx)
-        m_moved = re.match(r"^moved\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*([+-]?\d+)\s*,\s*([+-]?\d+)\s*\)$", item, re.IGNORECASE)
-        if m_moved:
-            alias, dy, dx = m_moved.group(1), int(m_moved.group(2)), int(m_moved.group(3))
-            subj_id = alias
-            if planning_set is not None and hasattr(planning_set, "resolve_object_id"):
-                resolved = planning_set.resolve_object_id(alias)
-                if resolved:
-                    subj_id = resolved
-            s_dy = 1 if dy > 0 else (-1 if dy < 0 else 0)
-            s_dx = 1 if dx > 0 else (-1 if dx < 0 else 0)
-            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "moved", "value": (dy, dx)})
-            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "step_moved", "value": (s_dy, s_dx)})
-            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "dy", "value": dy})
-            props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "dx", "value": dx})
-            continue
+        # 1. moved(ALIAS, dy, dx) including relational syntax e.g. moved(AF, dy<0, dx<0)
+        item_stripped = item.strip()
+        if item_stripped.lower().startswith("moved") and "(" in item_stripped and item_stripped.endswith(")"):
+            open_idx = item_stripped.find("(")
+            prefix_word = item_stripped[:open_idx].strip().lower()
+            if prefix_word == "moved":
+                inner_moved = item_stripped[open_idx + 1 : -1].strip()
+                parts_moved = [p.strip() for p in inner_moved.split(",") if p.strip()]
+                if len(parts_moved) == 3:
+                    raw_alias = parts_moved[0]
+                    if "=" in raw_alias:
+                        raw_alias = raw_alias.split("=", 1)[1].strip()
+                    alias = raw_alias.strip("'\"")
+
+                    def _parse_delta_component(tok: str) -> int | None:
+                        t = tok.strip().lower()
+                        for k_pref in ("dy", "dx", "dr", "dc", "row_delta", "col_delta"):
+                            if t.startswith(k_pref):
+                                t = t[len(k_pref):].strip()
+                                break
+                        if t.startswith("=="):
+                            t = t[2:].strip()
+                        elif t.startswith("="):
+                            t = t[1:].strip()
+                        elif t.startswith("<="):
+                            v_p = t[2:].strip()
+                            try:
+                                v_i = int(v_p)
+                                return -1 if v_i <= 0 else v_i
+                            except ValueError:
+                                return -1
+                        elif t.startswith(">="):
+                            v_p = t[2:].strip()
+                            try:
+                                v_i = int(v_p)
+                                return 1 if v_i >= 0 else v_i
+                            except ValueError:
+                                return 1
+                        elif t.startswith("<"):
+                            v_p = t[1:].strip()
+                            try:
+                                v_i = int(v_p)
+                                return -1 if v_i <= 0 else v_i - 1
+                            except ValueError:
+                                return -1
+                        elif t.startswith(">"):
+                            v_p = t[1:].strip()
+                            try:
+                                v_i = int(v_p)
+                                return 1 if v_i >= 0 else v_i + 1
+                            except ValueError:
+                                return 1
+                        try:
+                            return int(t)
+                        except ValueError:
+                            return None
+
+                    dy_val = _parse_delta_component(parts_moved[1])
+                    dx_val = _parse_delta_component(parts_moved[2])
+                    if alias and dy_val is not None and dx_val is not None:
+                        subj_id = alias
+                        if planning_set is not None and hasattr(planning_set, "resolve_object_id"):
+                            resolved = planning_set.resolve_object_id(alias)
+                            if resolved:
+                                subj_id = resolved
+                        s_dy = 1 if dy_val > 0 else (-1 if dy_val < 0 else 0)
+                        s_dx = 1 if dx_val > 0 else (-1 if dx_val < 0 else 0)
+                        props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "moved", "value": (dy_val, dx_val)})
+                        props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "step_moved", "value": (s_dy, s_dx)})
+                        props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "dy", "value": dy_val})
+                        props.append({"family": "metric_sign", "subject_id": subj_id, "predicate": "dx", "value": dx_val})
+                        continue
 
         # 2. color(ALIAS)=C
         m_color = re.match(r"^color\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*=\s*([0-9]+)$", item, re.IGNORECASE)
@@ -279,6 +340,46 @@ def _decompose_expected_propositions_for_substep(
     return dedup
 
 
+def parse_waypoints_block(text: str, planning_set: PlanningSet | None = None) -> list[dict[str, Any]]:
+    """Parse <waypoints> or <subgoals> XML block into structured sub-goal milestones."""
+    waypoints: list[dict[str, Any]] = []
+    m = re.search(
+        r"<(?:waypoints|subgoals|sub_goals)>(.*?)</(?:waypoints|subgoals|sub_goals)>",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    content = m.group(1) if m else text
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^(?:\d+[\.\)]|\-|\*|•)\s*", "", line).strip().strip("`'\"")
+        if line.upper().startswith("WAYPOINT:"):
+            line = line[len("WAYPOINT:"):].strip().strip("`'\"")
+
+        # Match WAYPOINT_TYPE(args...) e.g. NAVIGATE_TO(subject=A, target=B)
+        m_call = re.match(r"^([A-Z_]+)\s*\((.*)\)\s*$", line)
+        if not m_call:
+            continue
+        wp_type = m_call.group(1).upper()
+        arg_str = m_call.group(2).strip()
+
+        kwargs: dict[str, Any] = {}
+        for part in arg_str.split(","):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                kwargs[k.strip().lower()] = v.strip().strip("\"'")
+            elif part:
+                kwargs[f"arg_{len(kwargs)}"] = part.strip().strip("\"'")
+
+        if wp_type:
+            waypoints.append({"type": wp_type, **kwargs})
+
+    return waypoints
+
+
 def parse_text_trajectory(
     text: str,
     manifest_or_funcs: Any = None,
@@ -309,17 +410,32 @@ def parse_text_trajectory(
     lower_manifest_map = {k.lower(): v for k, v in manifest_map.items()}
     lower_valid_funcs = {name.lower(): name for name in valid_func_names}
 
+    _engine_primitives = {a.lower() for a in LEGAL_ACTION_IDS} | {"click", "click_object"}
+
     def canonicalize_func_name(name: str) -> str:
         if name in valid_func_names:
             return name
         nl = name.lower()
         if nl in lower_valid_funcs:
             return lower_valid_funcs[nl]
-        if re.match(r"^action\d+$", name, re.IGNORECASE):
-            if nl in lower_valid_funcs:
-                return lower_valid_funcs[nl]
+        if nl in ("click", "click_object"):
+            if "click" in lower_valid_funcs:
+                return lower_valid_funcs["click"]
+            if "action6" in lower_valid_funcs:
+                return lower_valid_funcs["action6"]
+            return "click"
+        if nl in _engine_primitives:
             return nl
         return name
+
+    def is_allowed_func(fn_name: str | None) -> bool:
+        if not fn_name:
+            return False
+        if is_forbidden_action(fn_name):
+            return False
+        if not valid_func_names:
+            return True
+        return fn_name in valid_func_names or fn_name.lower() in lower_valid_funcs or fn_name.lower() in _engine_primitives
 
     # 0. Invariant / Hypothesis extraction (supports XML <analysis>, <invariant_analysis> and markdown [HYPOTHESIS])
     inv_evo_text = ""
@@ -416,7 +532,7 @@ def parse_text_trajectory(
                             args = parsed_json
                     except Exception:
                         pass
-                if not valid_func_names or fn in valid_func_names:
+                if is_allowed_func(fn):
                     cand_steps.append({
                         "step_id": f"s{step_idx}",
                         "dsl_function": fn,
@@ -435,7 +551,7 @@ def parse_text_trajectory(
                         for item in parsed_arr:
                             raw_fn = item.get("dsl_function") or item.get("action") or item.get("name") or "step"
                             fn = canonicalize_func_name(raw_fn)
-                            if not valid_func_names or fn in valid_func_names:
+                            if is_allowed_func(fn):
                                 item_args = item.get("arguments") or item.get("params") or {}
                                 item_exp = item.get("expected_propositions") or []
                                 count = item_args.pop("count", 1) if isinstance(item_args, dict) else 1
@@ -492,16 +608,49 @@ def parse_text_trajectory(
                         exp_props.extend(parse_expect_grammar_str(exp_str, planning_set=planning_set))
 
                 m = re.search(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\)", line_s)
+                fn = None
+                args = {}
+                arg_str = ""
                 if m:
                     call_match = m.group(0)
                     fn, args = _parse_fn_call_args(call_match)
                     fn = canonicalize_func_name(fn)
                     arg_str = m.group(2)
-                    if not valid_func_names or fn in valid_func_names:
-                        if not args and arg_str.strip():
-                            pos_vals = [x.strip().strip("\"'") for x in arg_str.split(",") if x.strip()]
-                            fn_meta = manifest_map.get(fn) or lower_manifest_map.get(fn.lower(), {})
-                            fn_params = [p for p in fn_meta.get("parameters", []) if p.get("name") != "api"]
+                else:
+                    pre_expect = line_s.split("EXPECT:")[0].split("#")[0].strip()
+                    m_bare = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(.*))?$", pre_expect)
+                    if m_bare:
+                        cand_fn = m_bare.group(1)
+                        can_cand = canonicalize_func_name(cand_fn)
+                        if (can_cand in valid_func_names or
+                            is_legal_action(can_cand) or
+                            can_cand in ("click", "click_object")):
+                            fn = can_cand
+                            trailing_args = m_bare.group(2) or ""
+                            if "=" in trailing_args:
+                                for part in trailing_args.split(","):
+                                    if "=" in part:
+                                        k, v = part.split("=", 1)
+                                        try:
+                                            args[k.strip()] = int(v.strip())
+                                        except ValueError:
+                                            args[k.strip()] = v.strip().strip("\"'")
+
+                if fn and is_allowed_func(fn):
+                    if not args and arg_str.strip():
+                        pos_vals = [x.strip().strip("\"'") for x in arg_str.split(",") if x.strip()]
+                        fn_meta = manifest_map.get(fn) or lower_manifest_map.get(fn.lower(), {})
+                        fn_params = [p for p in fn_meta.get("parameters", []) if p.get("name") != "api"]
+                        param_names = [p.get("name") for p in fn_params]
+                        if (
+                            len(pos_vals) == 2
+                            and pos_vals[0].lstrip("-").isdigit()
+                            and pos_vals[1].lstrip("-").isdigit()
+                            and (("x" in param_names and "y" in param_names) or fn.lower() in ("action6", "click", "click_object"))
+                        ):
+                            args["x"] = int(pos_vals[0])
+                            args["y"] = int(pos_vals[1])
+                        else:
                             for p_idx, val in enumerate(pos_vals):
                                 if p_idx < len(fn_params):
                                     p_name = fn_params[p_idx]["name"]
@@ -515,28 +664,28 @@ def parse_text_trajectory(
                                     elif p_idx == 1:
                                         args["y"] = int(val) if val.lstrip("-").isdigit() else val
 
-                        count = args.pop("count", 1)
-                        if isinstance(count, int) and count > 1:
-                            actual_count = min(count, 30)
-                            for i in range(actual_count):
-                                sub_exp = _decompose_expected_propositions_for_substep(exp_props, i, actual_count)
-                                cand_steps.append({
-                                    "step_id": f"s{step_idx}",
-                                    "dsl_function": fn,
-                                    "arguments": copy.deepcopy(args),
-                                    "expected_propositions": sub_exp,
-                                    "repeat_index": i,
-                                    "repeat_total": actual_count,
-                                })
-                                step_idx += 1
-                        else:
+                    count = args.pop("count", 1)
+                    if isinstance(count, int) and count > 1:
+                        actual_count = min(count, 30)
+                        for i in range(actual_count):
+                            sub_exp = _decompose_expected_propositions_for_substep(exp_props, i, actual_count)
                             cand_steps.append({
                                 "step_id": f"s{step_idx}",
                                 "dsl_function": fn,
-                                "arguments": args,
-                                "expected_propositions": exp_props,
+                                "arguments": copy.deepcopy(args),
+                                "expected_propositions": sub_exp,
+                                "repeat_index": i,
+                                "repeat_total": actual_count,
                             })
                             step_idx += 1
+                    else:
+                        cand_steps.append({
+                            "step_id": f"s{step_idx}",
+                            "dsl_function": fn,
+                            "arguments": args,
+                            "expected_propositions": exp_props,
+                        })
+                        step_idx += 1
 
         if cand_steps:
             candidates.append({
@@ -618,11 +767,17 @@ class SolverAgent:
 
         retries = max(1, getattr(self.config, "max_solver_retries_per_level", 5))
         for attempt in range(1, retries + 1):
+            call_config = self.config
+            if attempt > 1:
+                call_config = copy.copy(self.config)
+                base_temp = getattr(self.config, "solver_temperature", 0.7)
+                call_config.solver_temperature = max(0.2, round(base_temp - 0.2 * (attempt - 1), 2))
+
             try:
                 response = self.advisor.generate(
                     system_prompt=sys_prompt,
                     user_prompt=user_prompt,
-                    config=self.config,
+                    config=call_config,
                     image_bytes=effective_image,
                     agent_role="solver",
                 )
@@ -642,8 +797,17 @@ class SolverAgent:
                     logger.info(f"Solver parsed trajectory from clean text ({len(text_pkg['candidates'][0]['steps'])} steps).")
 
             if not package or not isinstance(package, dict):
-                logger.warning(f"Solver failed to return a valid JSON object or text trajectory (attempt {attempt}/{retries})")
-                continue
+                wp_check = parse_waypoints_block(response, planning_set)
+                if wp_check:
+                    package = {
+                        "schema_version": "v10.trajectory_package.1",
+                        "proposal_id": "waypoint_proposal",
+                        "hypothesis": "Waypoint-driven strategic plan",
+                        "candidates": [],
+                    }
+                else:
+                    logger.warning(f"Solver failed to return a valid JSON object or text trajectory (attempt {attempt}/{retries})")
+                    continue
 
             # Preserve conversation history for Turn 2 reflection on win
             role_vision_enabled = is_role_vision_enabled(self.config, "solver")
@@ -661,9 +825,8 @@ class SolverAgent:
 
             # Verify schema version and candidates
             candidates = package.get("candidates", [])
-            if not candidates or not isinstance(candidates, list):
-                logger.warning(f"Solver trajectory package contains no candidates (attempt {attempt}/{retries})")
-                continue
+            if not isinstance(candidates, list):
+                candidates = []
 
             # Validate function names and arguments against PlanningSet
             valid_candidates: list[dict[str, Any]] = []
@@ -679,7 +842,7 @@ class SolverAgent:
 
                     args = step.get("arguments", {})
                     for k, v in args.items():
-                        if isinstance(v, str) and (v.startswith("obj_") or v in planning_set.object_alias_to_real):
+                        if isinstance(v, str) and (is_object_token(v) or v in planning_set.object_alias_to_real):
                             resolved = planning_set.resolve_object_id(v)
                             if resolved is None:
                                 logger.warning(f"Argument {k}={v!r} not found in PlanningSet")
@@ -689,15 +852,33 @@ class SolverAgent:
                 if cand_valid and steps:
                     valid_candidates.append(cand)
 
-            if not valid_candidates:
-                logger.warning(f"None of the proposed Solver candidates satisfied grounding checks (attempt {attempt}/{retries})")
-                continue
-
-            # Route through Virtual Kinematic Sandbox for optional optimization and auto-repair
+            # Route through Virtual Kinematic Sandbox for optional optimization, auto-repair, and waypoint expansion
             sandbox = VirtualKinematicSandbox(planning_set, game_memory)
             manifest_map = {f["name"]: f for f in manifest.get("functions", []) if "name" in f}
 
-            candidates_to_use: list[dict[str, Any]] = []
+            # Check for high-level waypoints/subgoals and expand via A* pathfinder
+            waypoints = parse_waypoints_block(response, planning_set)
+            waypoint_candidates: list[dict[str, Any]] = []
+            if waypoints:
+                logger.info(f"Solver extracted {len(waypoints)} strategic waypoints: {waypoints}")
+                wp_steps = sandbox.expand_waypoints_to_trajectory(waypoints, manifest_map)
+                if wp_steps:
+                    cand_wp = {
+                        "trajectory_id": "traj_waypoint_01",
+                        "confidence": 0.95,
+                        "steps": wp_steps,
+                        "sandbox_verdict": "APPROVED",
+                        "sandbox_goal_reached": True,
+                        "strategy": "hierarchical_waypoint_planner",
+                    }
+                    logger.info(f"Synthesized hierarchical waypoint trajectory ({len(wp_steps)} steps).")
+                    waypoint_candidates.append(cand_wp)
+
+            if not valid_candidates and not waypoint_candidates:
+                logger.warning(f"None of the proposed Solver candidates satisfied grounding checks (attempt {attempt}/{retries})")
+                continue
+
+            candidates_to_use: list[dict[str, Any]] = list(waypoint_candidates)
             for cand in valid_candidates:
                 steps = cand.get("steps", [])
                 try:
@@ -752,11 +933,12 @@ class SolverAgent:
                             candidates_to_use.append(cand_synth)
                             break
 
-            # Prioritize candidates by goal satisfaction first, then approved/repaired by sandbox
-            def cand_priority(c: dict[str, Any]) -> tuple[int, int]:
+            # Prioritize candidates: waypoints first, then goal satisfaction, then approved/repaired by sandbox
+            def cand_priority(c: dict[str, Any]) -> tuple[int, int, int]:
+                wp_score = 0 if c.get("strategy") == "hierarchical_waypoint_planner" else 1
                 goal_score = 0 if c.get("sandbox_goal_reached") else 1
                 verdict_score = 0 if c.get("sandbox_verdict") in ("APPROVED", "REPAIRED") else 1
-                return (goal_score, verdict_score)
+                return (wp_score, goal_score, verdict_score)
 
             candidates_to_use.sort(key=cand_priority)
 

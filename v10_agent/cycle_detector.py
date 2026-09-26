@@ -13,18 +13,26 @@ import math
 from typing import Any
 
 
-def _hash_grid(grid: Any) -> str:
-    """Compute a fast deterministic hash of a 2D grid structure."""
+def _deterministic_grid_hash(grid: Any) -> str:
+    """Stable hash independent of PYTHONHASHSEED."""
     if grid is None:
         return "none"
     if isinstance(grid, str):
         return grid
     try:
-        # Fast row string encoding
-        flat = ";".join("".join(str(c) for c in row) for row in grid)
-        return hashlib.md5(flat.encode("ascii")).hexdigest()[:16]
+        row_hashes = []
+        for row in grid:
+            row_bytes = bytes(int(c) % 256 for c in row)  # ints 0..15 -> bytes
+            row_hashes.append(hashlib.md5(row_bytes).hexdigest()[:8])
+        return "|".join(row_hashes)
     except Exception:
-        return str(hash(str(grid)))
+        flat = str(grid).encode("utf-8")
+        return hashlib.md5(flat).hexdigest()[:16]
+
+
+def _hash_grid(grid: Any) -> str:
+    """Compute a fast deterministic hash of a 2D grid structure."""
+    return _deterministic_grid_hash(grid)
 
 
 class VisibleCycle:
@@ -32,9 +40,9 @@ class VisibleCycle:
 
     def __init__(
         self,
-        min_actions: int = 24,
+        min_actions: int = 8,
         max_period: int = 8,
-        min_cycles: int = 4,
+        min_cycles: int = 2,
     ) -> None:
         if not (8 <= min_actions <= 128 and 1 <= max_period <= 16 and 2 <= min_cycles <= 16):
             raise ValueError(f"Invalid VisibleCycle thresholds: min_actions={min_actions}, max_period={max_period}, min_cycles={min_cycles}")

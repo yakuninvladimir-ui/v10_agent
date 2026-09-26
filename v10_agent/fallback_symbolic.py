@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import collections
 import logging
-import re
 from typing import Any
 
+from v10_agent.action_semantics import effect_vectors
 from v10_agent.config import V10Config
 from v10_agent.planning_set import PlanningSet
 from v10_agent.types import ActionDeclaration, EffectDeclaration
@@ -20,6 +20,7 @@ class SymbolicFallbackEngine:
     def __init__(self, config: V10Config):
         self.config = config
         self.step_counter = 0
+        self._clicked_candidate_ids: set[str] = set()
 
     def _find_bfs_path(
         self,
@@ -31,26 +32,7 @@ class SymbolicFallbackEngine:
             return None
 
         allowed = planning_set.allowed_action_ids
-        action_vectors: dict[str, tuple[int, int]] = {}
-        defaults = {
-            "ACTION1": (-1, 0),  # UP
-            "ACTION2": (1, 0),   # DOWN
-            "ACTION3": (0, -1),  # LEFT
-            "ACTION4": (0, 1),   # RIGHT
-        }
-        for act_id, vec in defaults.items():
-            if act_id in allowed:
-                action_vectors[act_id] = vec
-
-        # Refine action vectors from game_memory if confirmed
-        if game_memory and getattr(game_memory, "confirmed_action_effects", None):
-            for act_id, eff_str in game_memory.confirmed_action_effects.items():
-                act_norm = act_id.upper()
-                if act_norm in allowed:
-                    match_dy = re.search(r"dy=([+-]?\d+)", eff_str)
-                    match_dx = re.search(r"dx=([+-]?\d+)", eff_str)
-                    if match_dy and match_dx:
-                        action_vectors[act_norm] = (int(match_dy.group(1)), int(match_dx.group(1)))
+        action_vectors = effect_vectors(allowed, getattr(game_memory, "confirmed_action_effects", None))
 
         if not action_vectors:
             return None
@@ -219,8 +201,37 @@ class SymbolicFallbackEngine:
                 target_object_ids=list(planning_set.object_ids[:1]),
             )
 
-        # Heuristic 1: Try directional motions (ACTION1..ACTION4) if available
+        # Heuristic 1: If ACTION6 (coordinate action) is available and there are unclicked candidates,
+        # click unique deduplicated object centroids
         directional_allowed = [act for act in ("ACTION1", "ACTION2", "ACTION3", "ACTION4") if act in allowed]
+
+        if "ACTION6" in allowed and planning_set.coordinate_candidates:
+            unclicked = [c for c in planning_set.coordinate_candidates if c.candidate_id not in self._clicked_candidate_ids]
+            if not unclicked:
+                self._clicked_candidate_ids.clear()
+                unclicked = list(planning_set.coordinate_candidates)
+
+            # Prioritize unclicked candidates or interleave with directional movement to test unlock
+            if unclicked and (not directional_allowed or self.step_counter % 2 == 1):
+                target_cand = unclicked[0]
+                self._clicked_candidate_ids.add(target_cand.candidate_id)
+                alias = target_cand.label or (target_cand.object_id or "target")
+                return EffectDeclaration(
+                    declared_action=ActionDeclaration(
+                        action_id="ACTION6",
+                        data={"x": target_cand.x, "y": target_cand.y, "target": alias},
+                        reasoning={
+                            "source": "symbolic_fallback",
+                            "strategy": "click_unclicked_canonical_candidate",
+                            "target_id": target_cand.object_id,
+                            "target_alias": alias,
+                        },
+                    ),
+                    expected_metric_deltas={"interaction": 1},
+                    target_object_ids=[target_cand.object_id] if target_cand.object_id else [],
+                )
+
+        # Heuristic 2: Try directional motions (ACTION1..ACTION4) if available
         if directional_allowed:
             # If ACTION5 (switch entity) is available, cycle entity periodically
             if "ACTION5" in allowed and (self.step_counter % 6 == 0):
@@ -243,24 +254,6 @@ class SymbolicFallbackEngine:
                 target_object_ids=list(planning_set.object_ids[:1]),
             )
 
-        # Heuristic 2: If ACTION6 (coordinate action) is available, click object centroids
-        if "ACTION6" in allowed and planning_set.objects:
-            # Cycle through object centroids
-            obj_idx = (self.step_counter - 1) % len(planning_set.objects)
-            target_obj = planning_set.objects[obj_idx]
-            coord_x = int(round(target_obj.centroid.col))
-            coord_y = int(round(target_obj.centroid.row))
-
-            return EffectDeclaration(
-                declared_action=ActionDeclaration(
-                    action_id="ACTION6",
-                    data={"x": coord_x, "y": coord_y},
-                    reasoning={"source": "symbolic_fallback", "strategy": "click_centroid", "target_id": target_obj.id},
-                ),
-                expected_metric_deltas={"interaction": 1},
-                target_object_ids=[target_obj.id],
-            )
-
         # Heuristic 3: Default allowed action
         fallback_action = allowed[0] if allowed else "RESET"
         return EffectDeclaration(
@@ -269,3 +262,8 @@ class SymbolicFallbackEngine:
                 reasoning={"source": "symbolic_fallback", "strategy": "default_allowed"},
             )
         )
+
+    def clear_cycle_memory(self) -> None:
+        """Clear clicked cache and offset counter phase to break loop synchronization."""
+        self._clicked_candidate_ids.clear()
+        self.step_counter += 3

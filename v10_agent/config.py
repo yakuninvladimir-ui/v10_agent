@@ -5,10 +5,26 @@ Provides V10Config with environment variable resolution and competition ceilings
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
+
+logger = logging.getLogger(__name__)
+
+
+#: Harness-facing configuration names accepted as aliases for canonical fields.
+#: The competition harness round-trips its own vocabulary through the config
+#: mapping, so the names must resolve back to the fields they configure.
+FIELD_ALIASES: dict[str, str] = {
+    "qwen_backend": "llm_advisor_backend",
+    "qwen_vllm_model": "qwen_model_path",
+    "game_concurrency": "concurrency",
+    "max_coder_retries": "max_coder_retries_per_level",
+    "max_solver_retries": "max_solver_retries_per_level",
+    "max_explorer_probes": "max_explorer_probe_actions_per_level",
+}
 
 
 @dataclass
@@ -43,6 +59,9 @@ class V10Config:
     qwen_max_output_tokens: int = 32000
     temperature: float = 1.0
     qwen_temperature: float = 1.0
+    solver_temperature: float = 0.7
+    coder_temperature: float = 0.5
+    explorer_temperature: float = 0.9
     top_p: float = 0.95
     qwen_top_p: float = 0.95
     top_k: int = 20
@@ -67,15 +86,24 @@ class V10Config:
     reasoning_strength: str = "xhigh"  # "low" | "medium" | "high" | "xhigh"
     reasoning_budget_tokens: int = 32000
     qwen_reasoning_budget_tokens: int = 32000
+    solver_reasoning_budget_tokens: int = 24576
+    coder_reasoning_budget_tokens: int = 8192
+    explorer_reasoning_budget_tokens: int = 8192
+    #: Per-role response ceilings. The reasoning budget bounds deliberation; these
+    #: bound the emitted answer, so a code-generating role needs more room than a
+    #: role that only names a coordinate.
+    solver_max_output_tokens: int = 8192
+    coder_max_output_tokens: int = 8192
+    explorer_max_output_tokens: int = 2048
 
-    # Tri-Agent Retries & Budgets (Normative Ceilings)
     max_chain_attempts_per_level: int = 5  # Unified 5-attempt budget per level for entire chain
     max_coder_retries_per_level: int = 5
     max_solver_retries_per_level: int = 5
-    max_explorer_attempts_per_level: int = 5
+    max_explorer_attempts_per_level: int = 2
+    max_explorer_probe_steps: int = 2
+    max_invariant_verification_probes: int = 3
+    max_invariant_probe_steps: int = 2
     max_explorer_probe_actions_per_level: int = 30
-    max_total_llm_calls_per_level: int = 20
-    level_wall_clock_limit_seconds: float = 1200.0  # 20-minute soft level budget
 
     # Trajectory & Solver Package Limits
     max_candidates_per_solver_package: int = 4
@@ -103,19 +131,22 @@ class V10Config:
     solver_exhaustion_forces_fallback: bool = True
     abort_on_dsl_exhaustion: bool = False
     max_primitive_probes_per_level: int = 16
-    enable_primitive_probing: bool = False
+    #: Primitive probing is a competition-legal exploration channel and is on by
+    #: default in both resolution paths: this dataclass default must stay in step
+    #: with `config_from_env()` and ENGINEERING_SPECIFICATION_V10.0.md, otherwise
+    #: `V10Config()` and `config_from_env()` describe different agents.
+    enable_primitive_probing: bool = True
     probe_reset_after_discrete: bool = False
 
     # Competition Execution Limits
-    max_actions_per_game: int = 250
-    max_actions_per_level: int = 250
-    max_game_over_resets_per_game: int = 5
+    max_actions_per_game: int = 500
+    max_actions_per_level: int = 80
     max_game_over_resets_per_level: int = 5
     reset_on_game_over: bool = True
     game_wall_clock_limit_seconds: float = 5000.0
     competition_wall_clock_limit_seconds: float = 30600.0
-    concurrency: int = 4
-    vllm_max_num_seqs: int = 4
+    concurrency: int = 6
+    vllm_max_num_seqs: int = 6
     vllm_startup_timeout_seconds: int = 900
 
     # vLLM Speculative Decoding & Multi-Token Prediction (MTP=3 normative settings)
@@ -127,7 +158,7 @@ class V10Config:
     vllm_speculative_cli_format: str = "auto"  # "auto" | "config_json" | "spec_tokens" | "speculative_model"
 
     # vLLM Server Launch Configuration (Unified Phase A / Phase B serving runtime)
-    vllm_enable_prefix_caching: bool = False
+    vllm_enable_prefix_caching: bool = True
     vllm_enable_chunked_prefill: bool = True
     vllm_async_scheduling: bool = True
     vllm_no_enable_log_requests: bool = True
@@ -145,23 +176,57 @@ class V10Config:
     enable_undecided_verdict: bool = True
     max_undecided_streak: int = 2
     max_evidence_probes_per_level: int = 3
+    #: Actions that must remain on the current level's budget before another
+    #: evidence probe is worth issuing. A probe is a speculative move, so it is
+    #: only affordable while enough of the level budget is still unspent.
+    min_remaining_actions_for_probe: int = 25
 
     # Deadline reserve & Time budgeting (Flash Loop Recovery port)
     deadline_reserve_seconds: float = 15.0
-    notebook_reserve_seconds: float = 600.0
-    _deadline_time: float | None = None
+    #: Absolute monotonic instant of the competition deadline. Declared private
+    #: so `to_dict()` never hands it to the harness: a `None` in a merged config
+    #: mapping used to wipe an already armed deadline (see update_runtime).
+    _deadline_time: float | None = field(default=None, repr=False, compare=False)
+
+    def set_deadline(self, wall_clock_seconds: float) -> None:
+        """Arm the absolute monotonic deadline from a wall-clock duration.
+
+        Every call re-derives the instant: the harness reports the *remaining*
+        wall clock, so a later call with a smaller value legitimately means
+        less time left. A non-positive duration would arm an already-expired
+        deadline and is therefore ignored.
+        """
+        if wall_clock_seconds <= 0:
+            return
+        self._deadline_time = time.monotonic() + wall_clock_seconds
 
     # Visible Cycle Detection (Flash Loop Recovery port)
     enable_cycle_detector: bool = True
-    cycle_detector_min_actions: int = 24
+    cycle_detector_min_actions: int = 8
     cycle_detector_max_period: int = 8
-    cycle_detector_min_cycles: int = 4
+    cycle_detector_min_cycles: int = 2
     cycle_detector_per_level_limit: int = 2
 
-    def set_deadline(self, wall_clock_seconds: float) -> None:
-        """Set absolute monotonic deadline from duration."""
-        if wall_clock_seconds > 0:
-            self._deadline_time = time.monotonic() + wall_clock_seconds
+    #: Smallest object area the persistent tracker will follow. Declared here so
+    #: the threshold is a controllable knob rather than a literal buried in the
+    #: tracker (dimension-invariant: 1 pixel is valid even on a 2x2 field).
+    track_min_area: int = 1
+
+    def resolve(self, key: str, default: Any = None) -> Any:
+        """Return a live configuration value for ``key``.
+
+        Call sites used to embed their own fallback literals in
+        ``getattr(config, key, literal)``. Those literals silently drift from the
+        dataclass defaults (and in some cases named fields that never existed),
+        so the effective setting changed whenever a field was renamed. Reading
+        through this accessor keeps a single source of truth: the dataclass
+        itself. A genuinely unknown key is reported, never silently substituted.
+        """
+        canonical = FIELD_ALIASES.get(key, key)
+        if hasattr(self, canonical):
+            return getattr(self, canonical)
+        logger.warning("V10Config.resolve: unknown configuration key %r, using default %r", key, default)
+        return default
 
     def remaining_time_seconds(self) -> float | None:
         """Return remaining seconds until deadline, or None if unconfigured."""
@@ -189,24 +254,46 @@ class V10Config:
         return build_vllm_speculative_args(self, model_path=model_path)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert configuration to dictionary."""
-        return asdict(self)
+        """Convert configuration to a transferable dictionary.
+
+        Service fields (leading underscore) are omitted: they hold live process
+        state such as the armed monotonic deadline and must never travel through
+        a harness configuration mapping.
+        """
+        return {k: v for k, v in asdict(self).items() if not k.startswith("_")}
 
     def update_runtime(self, updates: Mapping[str, Any]) -> None:
-        """Update mutable configuration settings at runtime."""
-        for key, value in updates.items():
-            if hasattr(self, key):
-                field_type = type(getattr(self, key))
-                if value is not None and field_type is not type(None):
-                    try:
-                        if field_type is bool and isinstance(value, str):
-                            setattr(self, key, value.strip().lower() in {"1", "true", "yes", "on"})
-                        else:
-                            setattr(self, key, field_type(value))
-                    except (ValueError, TypeError):
-                        setattr(self, key, value)
-                else:
+        """Update mutable configuration settings at runtime.
+
+        A merged harness configuration is only advisory: it must not be able to
+        revoke live apparatus state. Keys that are unknown, private, or carrying
+        ``None`` are therefore skipped rather than applied — a ``None`` reaching
+        a live field silently disables the feature it configures.
+        """
+        unknown: list[str] = []
+        for raw_key, value in updates.items():
+            key = FIELD_ALIASES.get(raw_key, raw_key)
+            if key.startswith("_"):
+                continue
+            if not hasattr(self, key):
+                unknown.append(raw_key)
+                continue
+            if value is None:
+                continue
+            field_type = type(getattr(self, key))
+            try:
+                if field_type is bool and isinstance(value, str):
+                    setattr(self, key, value.strip().lower() in {"1", "true", "yes", "on"})
+                elif field_type is type(None):
                     setattr(self, key, value)
+                else:
+                    setattr(self, key, field_type(value))
+            except (ValueError, TypeError):
+                setattr(self, key, value)
+        if unknown:
+            logger.warning(
+                "update_runtime ignored unknown configuration keys: %s", ", ".join(sorted(unknown))
+            )
 
 
 def _bool_from_env(key: str, default: bool) -> bool:
@@ -256,6 +343,9 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         or "EMPTY"
     )
     resolved_temp = _float_from_env("ARC_TEMPERATURE", _float_from_env("ARC_QWEN_TEMPERATURE", 1.0))
+    resolved_solver_temp = _float_from_env("ARC_SOLVER_TEMPERATURE", 0.7)
+    resolved_coder_temp = _float_from_env("ARC_CODER_TEMPERATURE", 0.5)
+    resolved_explorer_temp = _float_from_env("ARC_EXPLORER_TEMPERATURE", 0.9)
     resolved_top_p = _float_from_env("ARC_TOP_P", _float_from_env("ARC_QWEN_TOP_P", 0.95))
     resolved_top_k = _int_from_env("ARC_TOP_K", _int_from_env("ARC_QWEN_TOP_K", 20))
     resolved_min_p = _float_from_env("ARC_MIN_P", _float_from_env("ARC_QWEN_MIN_P", 0.0))
@@ -316,6 +406,9 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         qwen_max_output_tokens=resolved_output,
         temperature=resolved_temp,
         qwen_temperature=resolved_temp,
+        solver_temperature=resolved_solver_temp,
+        coder_temperature=resolved_coder_temp,
+        explorer_temperature=resolved_explorer_temp,
         top_p=resolved_top_p,
         qwen_top_p=resolved_top_p,
         top_k=resolved_top_k,
@@ -340,11 +433,20 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         reasoning_strength=resolved_strength,
         reasoning_budget_tokens=resolved_budget,
         qwen_reasoning_budget_tokens=resolved_budget,
+        solver_reasoning_budget_tokens=_int_from_env("ARC_SOLVER_REASONING_BUDGET", 24576),
+        coder_reasoning_budget_tokens=_int_from_env("ARC_CODER_REASONING_BUDGET", 8192),
+        explorer_reasoning_budget_tokens=_int_from_env("ARC_EXPLORER_REASONING_BUDGET", 8192),
+        solver_max_output_tokens=_int_from_env("ARC_SOLVER_MAX_OUTPUT_TOKENS", 8192),
+        coder_max_output_tokens=_int_from_env("ARC_CODER_MAX_OUTPUT_TOKENS", 8192),
+        explorer_max_output_tokens=_int_from_env("ARC_EXPLORER_MAX_OUTPUT_TOKENS", 2048),
         max_chain_attempts_per_level=_int_from_env("ARC_MAX_CHAIN_ATTEMPTS", 5),
         max_coder_retries_per_level=_int_from_env("ARC_MAX_CODER_RETRIES", 5),
         max_solver_retries_per_level=_int_from_env("ARC_MAX_SOLVER_RETRIES", 5),
+        max_explorer_attempts_per_level=_int_from_env("ARC_MAX_EXPLORER_ATTEMPTS", 2),
+        max_explorer_probe_steps=_int_from_env("ARC_MAX_EXPLORER_PROBE_STEPS", 2),
+        max_invariant_verification_probes=_int_from_env("ARC_MAX_INVARIANT_PROBES", 3),
+        max_invariant_probe_steps=_int_from_env("ARC_MAX_INVARIANT_PROBE_STEPS", 2),
         max_explorer_probe_actions_per_level=_int_from_env("ARC_MAX_EXPLORER_PROBES", 30),
-        max_total_llm_calls_per_level=_int_from_env("ARC_MAX_TOTAL_LLM_CALLS_PER_LEVEL", 15),
         max_candidates_per_solver_package=_int_from_env("ARC_MAX_CANDIDATES_PER_PACKAGE", 4),
         max_steps_per_candidate=_int_from_env("ARC_MAX_STEPS_PER_CANDIDATE", 30),
         execute_one_step_at_a_time=_bool_from_env("ARC_EXECUTE_ONE_STEP_AT_A_TIME", True),
@@ -362,15 +464,14 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         max_primitive_probes_per_level=_int_from_env("ARC_MAX_PRIMITIVE_PROBES", 16),
         enable_primitive_probing=_bool_from_env("ARC_ENABLE_PRIMITIVE_PROBING", True),
         probe_reset_after_discrete=_bool_from_env("ARC_PROBE_RESET_AFTER_DISCRETE", False),
-        max_actions_per_game=_int_from_env("LCLD_MAX_ACTIONS_PER_GAME", 250),
-        max_actions_per_level=_int_from_env("LCLD_MAX_ACTIONS_PER_LEVEL", 250),
-        max_game_over_resets_per_game=_int_from_env("ARC_MAX_GAME_OVER_RESETS_PER_GAME", 5),
+        max_actions_per_game=_int_from_env("LCLD_MAX_ACTIONS_PER_GAME", 500),
+        max_actions_per_level=_int_from_env("LCLD_MAX_ACTIONS_PER_LEVEL", 80),
         max_game_over_resets_per_level=_int_from_env("ARC_MAX_GAME_OVER_RESETS_PER_LEVEL", 5),
         reset_on_game_over=_bool_from_env("ARC_RESET_ON_GAME_OVER", True),
         game_wall_clock_limit_seconds=_float_from_env("LCLD_GAME_WALL_CLOCK_LIMIT_SECONDS", 5000.0),
         competition_wall_clock_limit_seconds=_float_from_env("LCLD_COMPETITION_WALL_CLOCK_LIMIT_SECONDS", 30600.0),
-        concurrency=_int_from_env("LCLD_GAME_CONCURRENCY", 4),
-        vllm_max_num_seqs=_int_from_env("LCLD_VLLM_MAX_NUM_SEQS", 4),
+        concurrency=_int_from_env("LCLD_GAME_CONCURRENCY", 6),
+        vllm_max_num_seqs=_int_from_env("LCLD_VLLM_MAX_NUM_SEQS", 6),
         vllm_startup_timeout_seconds=_int_from_env("VLLM_STARTUP_TIMEOUT_SECONDS", 900),
         vllm_mtp_enabled=resolved_mtp_enabled,
         vllm_mtp_tokens=resolved_mtp_tokens,
@@ -378,7 +479,7 @@ def config_from_env(overrides: Mapping[str, Any] | None = None) -> V10Config:
         vllm_speculative_model=resolved_spec_model,
         vllm_speculative_config=resolved_spec_config,
         vllm_speculative_cli_format=resolved_spec_format,
-        vllm_enable_prefix_caching=_bool_from_env("ARC_VLLM_ENABLE_PREFIX_CACHING", False),
+        vllm_enable_prefix_caching=_bool_from_env("ARC_VLLM_ENABLE_PREFIX_CACHING", True),
         vllm_enable_chunked_prefill=_bool_from_env("ARC_VLLM_ENABLE_CHUNKED_PREFILL", True),
         vllm_async_scheduling=_bool_from_env("ARC_VLLM_ASYNC_SCHEDULING", True),
         vllm_no_enable_log_requests=_bool_from_env("ARC_VLLM_NO_ENABLE_LOG_REQUESTS", True),
