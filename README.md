@@ -88,8 +88,8 @@ The repository includes complete, self-contained specifications reflecting the e
 
 ```
 .
-├── ARCHITECTURAL_SPECIFICATION_V10.0.md   # Authoritative system architecture specification (v10.5)
-├── ENGINEERING_SPECIFICATION_V10.0.md     # Authoritative engineering implementation specification (v10.5)
+├── ARCHITECTURAL_SPECIFICATION_V10.5.md   # Authoritative system architecture specification (v10.5)
+├── ENGINEERING_SPECIFICATION_V10.5.md     # Authoritative engineering implementation specification (v10.5)
 ├── README.md                              # This documentation
 ├── .gitignore                             # Clean repository exclusion rules
 │
